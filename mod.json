@@ -3,9 +3,10 @@
 	"gd": {
 		"win": "2.2081",
 		"android": "2.2081",
-		"mac": "2.2081"
+		"mac": "2.2081",
+		"ios": "2.2081"
 	},
-	"version": "v2.98.0",
+	"version": "v2.99.1",
 	"id": "basu.input-buffer",
 	"name": "Click Before Frames",
 	"developer": "BASU",

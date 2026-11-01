@@ -5118,7 +5118,7 @@ private:
         shine->setPosition({ -40.f, H - TITLE });
         clip->addChild(shine, 5);
         shine->runAction(CCRepeatForever::create(CCSequence::create(CCDelayTime::create(2.5f),
-            CCEaseSineInOut::create(CCMoveBy::create(1.6f, { W + 40.f, 0.f })), CCPlace::create({ -40.f, H - TITLE }), nullptr)));
+            CCEaseSineInOut::create(CCMoveBy::create(1.6f, { W + 40.f, 0.f })), CCMoveTo::create(0.f, { -40.f, H - TITLE }), nullptr)));
         m_sky = clip;
 
         // edge, the sidebar's darker panel, the title's accent line
@@ -5696,7 +5696,19 @@ class $modify(BufPauseLayer, PauseLayer) {
     }
 };
 
+// v2.99.1: startup checkpoints in the Geode log (each written once), to find where a phone
+// that crashes on start stops
+#define CBF_STEP(name)                                  \
+    do {                                                \
+        static bool cbfStepDone = false;                \
+        if (!cbfStepDone) {                             \
+            cbfStepDone = true;                         \
+            geode::log::info("startup step: {}", name); \
+        }                                               \
+    } while (false)
+
 $on_mod(Loaded) {
+    CBF_STEP("loaded: reading settings");
     buf.console = Mod::get()->getSettingValue<bool>("debug-console");
     buf.showPath = Mod::get()->getSettingValue<bool>("show-path");
     recoverGlobals();
@@ -5712,8 +5724,10 @@ $on_mod(Loaded) {
         Mod::get()->setSettingValue<bool>("per-level-settings", false);
         Mod::get()->setSavedValue("per-level-v262", true);
     }
+    CBF_STEP("loaded: settings read, applying stage");
     readSettings();
     applyStage();
+    CBF_STEP("loaded: stage applied");
 #ifdef GEODE_IS_WINDOWS
     if (buf.console) {
         AllocConsole();
@@ -5728,7 +5742,7 @@ $on_mod(Loaded) {
     if (Loader::get()->isModLoaded("square3ang.cbfextrapolate")) {
         say("CBF Extrapolate detected: visual only, predictions unaffected");
     }
-    say("v2.98.0 loaded. Stage key cycles: 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom -> off");
+    say("v2.99.1 loaded. Stage key cycles: 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom -> off");
 }
 
 class $modify(BufPlayLayer, PlayLayer) {
@@ -6569,17 +6583,25 @@ namespace {
 }
 
 $on_mod(Loaded) {
+    CBF_STEP("loaded: keybinds");
     setupKeybinds();
+    CBF_STEP("loaded: keybinds done");
 }
 
 // the main menu: a heart button that opens the menu (with the other buttons at the bottom),
 // and the update check
 class $modify(BufMenuLayer, MenuLayer) {
     bool init() {
+        CBF_STEP("main menu: game's menu");
         if (!MenuLayer::init()) {
             return false;
         }
+        CBF_STEP("main menu: heart button");
         auto* top = CCSprite::create("heart.png"_spr);
+        if (!top) {
+            geode::log::error("heart.png missing, no menu button");
+            return true;
+        }
         top->setScale(0.55f);
         top->setColor({ 255, 255, 255 });
         auto* sprite = CircleButtonSprite::create(top, CircleBaseColor::DarkPurple, CircleBaseSize::Medium);
@@ -6589,7 +6611,9 @@ class $modify(BufMenuLayer, MenuLayer) {
             bottom->addChild(item);
             bottom->updateLayout();
         }
+        CBF_STEP("main menu: update check");
         checkForUpdate();
+        CBF_STEP("main menu: done");
         if (!latestVersion.empty() && !updateShown) {
             queueInMainThread([] { showUpdatePopup(); });
         }
