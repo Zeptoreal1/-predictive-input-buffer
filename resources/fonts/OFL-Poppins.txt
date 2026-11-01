@@ -1,0 +1,7 @@
+Poppins (Regular, Bold)
+Copyright 2020 The Poppins Project Authors (https://github.com/itfoundry/Poppins)
+
+This Font Software is licensed under the SIL Open Font License, Version 1.1.
+The full licence text and FAQ are at: https://openfontlicense.org (https://scripts.sil.org/OFL)
+
+The fonts are bundled unmodified. Before a public release, add the complete OFL-1.1 text to this file.
