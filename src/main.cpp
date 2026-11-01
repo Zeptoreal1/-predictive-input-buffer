@@ -727,31 +727,6 @@ namespace {
         }
     }
 
-    // v2.14: a run outside practice where auto-release can press for you is marked on screen.
-    // v2.46 watermark: whenever the buffer is on (any stage but OFF) the level shows it, and
-    // can't be turned off, so runs made with the mod are recognisable.
-    void refreshWatermark() {
-        if (!buf.watermark) {
-            return;
-        }
-        // hidden in practice mode (practice runs can't be submitted, and on phones it sat on the
-        // checkpoint buttons); always shown in normal mode while the buffer is on
-        auto* layer = GameManager::get()->m_playLayer;
-        buf.watermark->setVisible(false);
-    }
-
-    void refreshAutoTag() {
-        if (!buf.autoTag) {
-            return;
-        }
-        auto* layer = GameManager::get()->m_playLayer;
-        bool on = buf.enabled && buf.autoNormalRuns && (buf.autoRelease || buf.robotAutoRelease || buf.dashAutoRelease || buf.autoClick) &&
-            layer && !layer->m_isPracticeMode;
-        buf.autoTag->setVisible(on);
-    }
-
-    size_t memorySpots();
-
     // v2.29 F8: copy the console to the clipboard (and save it to console-export.txt in the
     // mod's save folder), with the version, level, physics rate and settings on top, so it
     // can be pasted somewhere in one go.
