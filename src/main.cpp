@@ -1,4 +1,4 @@
-// Click Before Frames v2.9 (cube-style wave, wave auto-release, orb alignment, full ghost state, drift check, in-game console on F9)
+// Aliou's Buffer v2.9 (cube-style wave, wave auto-release, orb alignment, full ghost state, drift check, in-game console on F9)
 //
 // When you click (or release, in wave / robot), a hidden "ghost" player is simulated
 // ahead with your input. If the ghost dies, the input is retried with 1..N ticks of
@@ -287,9 +287,11 @@ namespace {
         bool robotAutoRelease = false;  // v2.12: robot auto-release (practice mode only)
         bool autoNormalRuns = false; // v2.14: let auto-release work outside practice too
         CCLabelBMFont* autoTag = nullptr;  // v2.14: on-screen "AUTO-RELEASE ON" tag
-        CCLabelBMFont* watermark = nullptr;  // v2.46: always-on "Click Before Frames" label while the buffer is on
+        CCLabelBMFont* watermark = nullptr;  // v2.46: always-on "Aliou's Buffer" label while the buffer is on
         bool usedThisAttempt = false;      // v2.46: the buffer was on at some point of this attempt
         bool learn = true;           // v2.13: per-level memory learned from your runs
+        bool sectionLearn = false;   // v3.1: only learn inside the chosen sections (practice mode)
+        bool sectionLoop = false;    // v3.1: restart at the end of the chosen section (practice mode)
         bool fullState = true;       // v2.11.1: copy the full v2.8 player state into the ghost
         int orbWindow = 16;          // v2.6: how far ahead (ticks) an orb may be for that
         int simTick = 0;             // v2.6: tick of the current run
@@ -373,7 +375,7 @@ namespace {
         if (starts("drift")) return { 255, 240, 150 };
         if (starts("ghost killed") || starts("  hitbox")) return { 255, 120, 120 };
         if (starts("perf")) return { 150, 200, 255 };
-        if (starts("Stage") || starts("v2") || starts("path") || starts("Click") || starts("CBF")) return { 255, 215, 90 };
+        if (starts("Stage") || starts("v2") || starts("path") || starts("Click") || starts("CBF") || starts("Aliou")) return { 255, 215, 90 };
         if (starts("pass")) return { 140, 150, 170 };
         if (starts("memory")) return { 255, 150, 220 };
         if (starts("console")) return { 150, 255, 200 };
@@ -601,6 +603,8 @@ namespace {
         buf.orbAlignGround = mod->getSettingValue<bool>("orb-align-ground");
         buf.fullState = mod->getSettingValue<bool>("full-ghost-state");
         buf.learn = mod->getSettingValue<bool>("level-memory");
+        buf.sectionLearn = mod->getSettingValue<bool>("section-learning");
+        buf.sectionLoop = mod->getSettingValue<bool>("section-loop");
         buf.robotSmart = mod->getSettingValue<bool>("robot-smart");
         buf.spiderSmart = mod->getSettingValue<bool>("spider-smart");
         buf.ufoSmart = mod->getSettingValue<bool>("ufo-smart");
@@ -738,7 +742,7 @@ namespace {
         // checkpoint buttons); always shown in normal mode while the buffer is on
         auto* layer = GameManager::get()->m_playLayer;
         buf.watermark->setVisible(buf.enabled && !(layer && layer->m_isPracticeMode));
-        buf.watermark->setString(fmt::format("CBF  |  {}", stageText()).c_str());
+        buf.watermark->setString(fmt::format("Aliou's Buffer  |  {}", stageText()).c_str());
     }
 
     void refreshAutoTag() {
@@ -760,7 +764,7 @@ namespace {
         auto* mod = Mod::get();
         auto* layer = GameManager::get()->m_playLayer;
         std::string text;
-        text += fmt::format("Click Before Frames {} console export\n", mod->getVersion().toVString());
+        text += fmt::format("Aliou's Buffer {} console export\n", mod->getVersion().toVString());
         if (layer && layer->m_level) {
             text += fmt::format("Level: {} (id {}){}\n", std::string(layer->m_level->m_levelName), layer->m_level->m_levelID.value(),
                 layer->m_isPracticeMode ? ", practice" : "");
@@ -2153,6 +2157,165 @@ namespace {
         bool skipped = false;  // v2.64: a save was held back here because of memory
     } pending;
 
+    // v3.1 section learning. A level can be cut into percentage sections (0-25, 25-50, ...).
+    // Sections are saved per level next to the level memory. With "Section learning" on, in
+    // practice mode, level memory only learns inside the sections you switched on. What it
+    // learns is the usual memory (the delays that worked at each spot), so it is reused in every
+    // later attempt and in full runs. Nothing is replayed: every input is still yours.
+    struct Section {
+        int from = 0;           // percent, 0-99
+        int to = 100;           // percent, 1-100
+        bool on = false;        // selected for practice
+        uint32_t saves = 0;     // saves that worked inside it
+        uint32_t deaths = 0;    // deaths after a decision inside it
+    };
+
+    std::vector<Section> sections;
+    bool sectionsDirty = false;
+    bool sectionLoopQueued = false;
+    int sectionBlockEnd = -1;  // end (percent) of the selected block you are in, -1 = none
+
+    std::filesystem::path sectionsFile() {
+        return Mod::get()->getSaveDir() / "memory" / (memoryKey + "_sections.txt");
+    }
+
+    void loadSections() {
+        sections.clear();
+        sectionsDirty = false;
+        sectionBlockEnd = -1;
+        if (memoryKey.empty()) {
+            return;
+        }
+        std::ifstream in(sectionsFile());
+        std::string line;
+        while (std::getline(in, line)) {
+            std::istringstream fields(line);
+            Section sec;
+            int on = 0;
+            if (!(fields >> sec.from >> sec.to >> on)) {
+                continue;
+            }
+            fields >> sec.saves >> sec.deaths;
+            sec.on = on != 0;
+            sec.from = std::clamp(sec.from, 0, 99);
+            sec.to = std::clamp(sec.to, sec.from + 1, 100);
+            sections.push_back(sec);
+        }
+    }
+
+    void saveSections() {
+        if (!sectionsDirty || memoryKey.empty()) {
+            return;
+        }
+        std::error_code ec;
+        std::filesystem::create_directories(sectionsFile().parent_path(), ec);
+        std::ofstream out(sectionsFile(), std::ios::trunc);
+        for (auto const& sec : sections) {
+            out << sec.from << ' ' << sec.to << ' ' << (sec.on ? 1 : 0) << ' ' << sec.saves << ' ' << sec.deaths << '\n';
+        }
+        sectionsDirty = false;
+    }
+
+    size_t sectionsOnCount() {
+        size_t n = 0;
+        for (auto const& sec : sections) {
+            n += sec.on ? 1 : 0;
+        }
+        return n;
+    }
+
+    bool sectionContains(Section const& sec, float pct) {
+        return pct >= sec.from && (pct < sec.to || (sec.to >= 100 && pct <= 100.f));
+    }
+
+    float sectionPercent(PlayLayer* layer, PlayerObject* p) {
+        float length = layer ? layer->m_levelLength : 0.f;
+        if (length <= 0.f || !p) {
+            return 0.f;
+        }
+        return std::clamp(p->getPosition().x / length * 100.f, 0.f, 100.f);
+    }
+
+    // index of a selected section that contains this percent, or -1
+    int sectionAt(float pct) {
+        for (size_t i = 0; i < sections.size(); ++i) {
+            if (sections[i].on && sectionContains(sections[i], pct)) {
+                return static_cast<int>(i);
+            }
+        }
+        return -1;
+    }
+
+    // section learning only applies in practice mode, with at least one section selected
+    bool sectionModeActive(PlayLayer* layer) {
+        return buf.sectionLearn && layer && layer->m_isPracticeMode && sectionsOnCount() > 0;
+    }
+
+    // counts a save / a death at a memory slice for every section that contains it
+    void sectionRecord(int slice, bool death) {
+        auto* layer = GameManager::get()->m_playLayer;
+        if (!layer || layer->m_levelLength <= 0.f || sections.empty()) {
+            return;
+        }
+        float pct = std::clamp((slice + 0.5f) * SLICE / layer->m_levelLength * 100.f, 0.f, 100.f);
+        for (auto& sec : sections) {
+            if (sectionContains(sec, pct)) {
+                (death ? sec.deaths : sec.saves) += 1;
+                sectionsDirty = true;
+            }
+        }
+    }
+
+    void forgetSections() {
+        for (auto& sec : sections) {
+            sec.saves = 0;
+            sec.deaths = 0;
+        }
+        sectionsDirty = true;
+        saveSections();
+    }
+
+    // Practice only: "Restart at section end". When you run past the end of the selected block
+    // you were in, the attempt restarts (at your last checkpoint, so plant one at the start of
+    // the section). Deferred to the main thread so it never runs inside a physics step.
+    void sectionTick(PlayLayer* layer) {
+        if (!buf.sectionLoop || sectionLoopQueued || !layer || !layer->m_player1 || layer->m_player1->m_isDead) {
+            return;
+        }
+        if (!sectionModeActive(layer)) {
+            sectionBlockEnd = -1;
+            return;
+        }
+        float pct = sectionPercent(layer, layer->m_player1);
+        int idx = sectionAt(pct);
+        if (idx >= 0) {
+            int end = sections[idx].to;
+            for (bool grew = true; grew;) {  // adjacent selected sections form one block
+                grew = false;
+                for (auto const& sec : sections) {
+                    if (sec.on && sec.from <= end && sec.to > end) {
+                        end = sec.to;
+                        grew = true;
+                    }
+                }
+            }
+            sectionBlockEnd = end;
+            return;
+        }
+        if (sectionBlockEnd >= 0 && pct >= sectionBlockEnd) {
+            say("section: reached {}%, restarting", sectionBlockEnd);
+            sectionBlockEnd = -1;
+            sectionLoopQueued = true;
+            geode::queueInMainThread([] {
+                sectionLoopQueued = false;
+                auto* now = GameManager::get()->m_playLayer;
+                if (now && now->m_isPracticeMode && now->m_player1 && !now->m_player1->m_isDead) {
+                    now->resetLevel();
+                }
+            });
+        }
+    }
+
     int sliceOf(PlayerObject* p) {
         return static_cast<int>(std::floor(p->getPosition().x / SLICE));
     }
@@ -2184,6 +2347,7 @@ namespace {
     }
 
     void saveMemory() {
+        saveSections();
         if (!memoryDirty || memoryKey.empty()) {
             return;
         }
@@ -2252,6 +2416,7 @@ namespace {
             memoryDirty = true;
             saveMemory();
         }
+        loadSections();
         if (!memory.empty()) {
             say("memory: {} spots learned on this level", memory.size());
         }
@@ -2280,6 +2445,7 @@ namespace {
             if (spot.bad > 0) {
                 --spot.bad;
             }
+            sectionRecord(pending.slice, false);
             memoryChanged();
         }
     }
@@ -2287,6 +2453,10 @@ namespace {
     // Called for every decision: remembers it until it can be scored.
     void memoryNote(PlayerObject* p1, int delay) {
         if (!buf.learn || memoryKey.empty()) {
+            return;
+        }
+        // v3.1: in practice with sections selected, only decisions inside a selected section learn
+        if (auto* layer = GameManager::get()->m_playLayer; sectionModeActive(layer) && sectionAt(sectionPercent(layer, p1)) < 0) {
             return;
         }
         // A decision that lived long enough before the next one counts as having worked.
@@ -2311,6 +2481,7 @@ namespace {
         pending.active = false;
         auto& spot = memory[pending.slice];
         ++spot.deaths;
+        sectionRecord(pending.slice, true);
         if (pending.delay > 0) {
             ++spot.bad;
         }
@@ -4767,74 +4938,109 @@ namespace {
     }
 }
 
-// v2.88 menu: a draggable window in a space theme (night-sky gradient, nebula, twinkling
-// stars, the odd shooting star) with a tab for each category: Buffer, Prediction, Modes,
-// Custom (each game mode's own frames) and Tools. Opens with the menu key in a level or the
-// heart button on the main menu.
+// v3.0 menu: a draggable dashboard window in the Aliou's Buffer colours: a sidebar with an icon
+// for each of ten sections (Overview, Prediction, Game Modes, Automation, Memory, Sections,
+// Performance, Visuals, Tools, About), the page in the middle and a live status panel on the right. Opens
+// with the menu key in a level or the logo button on the main menu / pause menu.
 class BufferMenu : public geode::Popup {
     struct Option {
         char const* key;    // mod setting, or nullptr for the runtime path view
         char const* label;
     };
     static constexpr Option PREDICTION[] = {
+        { "smart-prediction", "Orbs, pads, portals" },
+        { "orb-assume-hit", "Assume orb clicks" },
+        { "orb-try-both", "Try the other orb choice" },
         { "robust-saves", "Robust saves" },
         { "orb-align", "Orb alignment" },
         { "orb-timing", "Orb timing" },
-        { "predict-moving-objects", "Moving objects" },
+        { "predict-moving-objects", "Moving objects (exp.)" },
         { "predict-move-triggers", "Move triggers" },
         { "predict-through-portals", "Through portals" },
         { "plan-next-click", "Two clicks ahead" },
-        { "no-hitch-searches", "No-hitch searches" },
+        { "ignore-touching-hazards", "Ignore touching hazards" },
+        { "full-ghost-state", "Full ghost state" },
+        { "avoid-moving-objects", "Skip near moving (exp.)" },
+    };
+    static constexpr Option MODE_HELPERS[] = {
+        { "ship-buffer", "Ship buffering" },
+        { "robot-smart", "Robot: smart jumps" },
+        { "spider-smart", "Spider: smart flips" },
+        { "ufo-smart", "UFO: smart flaps" },
+        { "ball-smart", "Ball: smart flips" },
+        { "swing-smart", "Swing: smart flips" },
+        { "cbf-sync", "Click Between Frames sync" },
+    };
+    static constexpr Option AUTOMATION[] = {
+        { "auto-click", "Auto-click" },
+        { "wave-auto-release", "Wave auto-release" },
+        { "robot-auto-release", "Robot auto-release" },
+        { "dash-auto-release", "Dash orb auto-release" },
+        { "auto-release-normal-runs", "Also in normal runs" },
+        { "practice-only", "Buffer in practice only" },
+    };
+    static constexpr Option MEMORY[] = {
         { "level-memory", "Level memory" },
         { "more-time-death-spots", "More time at deaths" },
+        { "per-level-settings", "Per-level settings" },
     };
-    static constexpr Option MODES[] = {
+    static constexpr Option SECTION_OPTS[] = {
+        { "section-learning", "Section learning" },
+        { "section-loop", "Restart at section end" },
+    };
+    static constexpr Option PERFORMANCE[] = {
+        { "performance-mode", "Performance mode" },
         { "low-latency", "Low latency" },
-        { "cbf-sync", "CBF sync" },
-        { "ship-buffer", "Ship buffering" },
-        { "robot-smart", "Smart robot" },
-        { "spider-smart", "Smart spider" },
-        { "ufo-smart", "Smart UFO" },
-        { "ball-smart", "Smart ball" },
-        { "swing-smart", "Smart swing" },
-        { "auto-click", "Auto-click (practice)" },
+        { "auto-budget", "Auto time budget" },
+        { "no-hitch-searches", "No-hitch searches" },
     };
-    static constexpr Option TOOLS[] = {
-        { nullptr, "Path view" },
-        { "training-mode", "Training (hints)" },
+    static constexpr Option VISUALS[] = {
+        { "show-path", "Path view at start" },
         { "death-heatmap", "Death heatmap" },
         { "save-ding", "Ding on save" },
-        { "performance-mode", "Performance mode" },
-        { "explain-inputs", "Explain inputs" },
     };
-    static constexpr char const* TABS[] = { "Buffer", "Prediction", "Modes", "Custom", "Tools" };
+    static constexpr Option QUICK[] = {
+        { nullptr, "Path view (now)" },
+        { "training-mode", "Training (hints)" },
+    };
+    static constexpr Option TOOLS[] = {
+        { "drift-check", "Drift check" },
+        { "perf-log", "Performance log" },
+        { "death-log", "Death log" },
+        { "explain-inputs", "Explain inputs" },
+        { "check-updates", "Update checker" },
+    };
+    static constexpr char const* TABS[] = { "Overview", "Prediction", "Game Modes", "Automation", "Memory", "Sections", "Performance",
+        "Visuals", "Tools", "About" };
+    static constexpr char const* THEMES[] = { "AMOLED", "Light", "Graphite" };
+    static constexpr char const* ABOUT_URL = "https://github.com/Zeptoreal1/-predictive-input-buffer";
 
     struct Theme {
-        ccColor3B main, soft, accent, bg;
+        ccColor3B bg, surface, line, text, muted, accent, onAccent, off, warn, bad;
+        bool light;
         char const* button;
     };
 
 public:
-    // the "Menu theme" setting picks the accent colour (purple by default)
+    // the "Menu theme" setting: AMOLED (pure black), Light (white, dark text) or Graphite
     static Theme currentTheme() {
         auto name = Mod::get()->getSettingValue<std::string>("menu-theme");
-        if (name == "Pink") {
-            return { { 255, 120, 200 }, { 255, 205, 230 }, { 215, 190, 255 }, { 255, 195, 235 }, "GJ_button_02.png" };
+        if (name == "Light") {
+            return { { 255, 255, 255 }, { 243, 245, 249 }, { 214, 219, 228 }, { 17, 19, 26 }, { 96, 103, 118 }, { 37, 99, 235 },
+                { 255, 255, 255 }, { 200, 206, 217 }, { 180, 95, 6 }, { 200, 40, 40 }, true, "GJ_button_06.png" };
         }
-        if (name == "Blue") {
-            return { { 90, 170, 255 }, { 205, 228, 255 }, { 170, 210, 255 }, { 170, 205, 255 }, "GJ_button_06.png" };
+        if (name == "Graphite") {
+            return { { 20, 22, 28 }, { 31, 34, 43 }, { 52, 56, 68 }, { 236, 238, 244 }, { 148, 154, 170 }, { 96, 165, 250 },
+                { 10, 16, 30 }, { 74, 80, 96 }, { 245, 175, 50 }, { 248, 113, 113 }, false, "GJ_button_06.png" };
         }
-        if (name == "Green") {
-            return { { 90, 225, 150 }, { 210, 255, 220 }, { 180, 240, 200 }, { 170, 235, 190 }, "GJ_button_01.png" };
-        }
-        if (name == "Dark") {
-            return { { 170, 150, 230 }, { 225, 225, 235 }, { 170, 170, 190 }, { 90, 85, 110 }, "GJ_button_04.png" };
-        }
-        return { { 166, 107, 255 }, { 220, 195, 255 }, { 200, 170, 255 }, { 205, 170, 255 }, "GJ_button_02.png" };
+        return { { 0, 0, 0 }, { 14, 15, 18 }, { 38, 40, 48 }, { 245, 246, 250 }, { 140, 145, 158 }, { 59, 130, 246 },
+            { 255, 255, 255 }, { 58, 62, 74 }, { 245, 175, 50 }, { 248, 113, 113 }, false, "GJ_button_06.png" };
     }
 
 private:
-    static constexpr float W = 430.f;
+    static constexpr float W = 430.f;      // sidebar + page
+    static constexpr float RP = 112.f;     // right status panel
+    static constexpr float WIN_W = W + RP; // whole window
     static constexpr float H = 272.f;
     static constexpr float TITLE = 28.f;
     static constexpr float SIDE = 100.f;
@@ -4844,11 +5050,24 @@ private:
     static inline int s_tab = 0;
     static inline bool s_moved = false;
     static inline CCPoint s_pos {};
+    static inline int s_modeSub = 0;
+    static inline int s_secPage = 0;
+    static inline int s_newFrom = 0;
+    static inline int s_newTo = 25;
 
     Theme m_t = currentTheme();
-    ccColor3B m_text { 232, 234, 255 };
-    ccColor3B m_muted { 142, 148, 190 };
-    ccColor3B m_cyan { 110, 230, 255 };
+    ccColor3B m_text = m_t.text;
+    ccColor3B m_muted = m_t.muted;
+    ccColor3B m_hi = m_t.accent;  // highlight: values, active marks
+    bool m_hasImage = false;
+    CCNode* m_chrome = nullptr;   // the window frame, rebuilt when the theme changes
+
+    void applyTheme() {
+        m_t = currentTheme();
+        m_text = m_t.text;
+        m_muted = m_t.muted;
+        m_hi = m_t.accent;
+    }
 
     CCMenu* m_frameMenu = nullptr;
     CCNode* m_tabsNode = nullptr;
@@ -4870,7 +5089,18 @@ private:
     int m_dragSlider = -1;
     CCDrawNode* m_perModeSwitch = nullptr;
     bool m_dragging = false;
-    float m_shootTimer = 2.f;
+    float m_infoTimer = 0.f;
+    CCLabelBMFont* m_memLabel = nullptr;
+    CCLabelBMFont* m_budgetLabel = nullptr;
+    // right status panel
+    CCNode* m_dotNode = nullptr;
+    CCDrawNode* m_dot = nullptr;
+    CCLabelBMFont* m_infoBuffer = nullptr;
+    CCLabelBMFont* m_infoStage = nullptr;
+    CCLabelBMFont* m_infoPred = nullptr;
+    CCLabelBMFont* m_infoScope = nullptr;
+    CCLabelBMFont* m_infoPerf[3] = {};
+    CCLabelBMFont* m_infoActive[5] = {};
 
     static constexpr int TPS_MIN = 240;
     static constexpr int TPS_MAX = 1000;
@@ -4915,17 +5145,17 @@ private:
         d->drawPolygon(pts.data(), static_cast<unsigned>(pts.size()), fill, border, borderColor);
     }
 
-    // v2.89 fonts (bundled, OFL): Orbitron for titles, tabs and headings, Exo 2 for the rest
+    // v3.2 fonts (bundled, OFL): Poppins Bold for titles and headings, Poppins Regular for the rest
     static char const* bodyFont() {
-        return "exo2.fnt"_spr;
+        return "sans.fnt"_spr;
     }
 
     static char const* headFont() {
-        return "orbitron.fnt"_spr;
+        return "sans-bold.fnt"_spr;
     }
 
-    static constexpr float BODY_K = 1.f;   // size of Exo 2 next to the old chat font
-    static constexpr float HEAD_K = 0.8f;  // Orbitron is wide
+    static constexpr float BODY_K = 0.86f;  // Poppins Regular next to the old chat font
+    static constexpr float HEAD_K = 0.82f;  // Poppins Bold
 
     CCLabelBMFont* label(CCNode* parent, std::string const& str, float scale, ccColor3B color, CCPoint at, CCPoint anchor = { 0.5f, 0.5f },
         bool head = false) {
@@ -4944,12 +5174,12 @@ private:
         auto* node = CCNode::create();
         node->setContentSize({ width, height });
         auto* d = CCDrawNode::create();
-        roundRect(d, { 0.f, 0.f, width, height }, height / 2.f, primary ? col(m_t.main, 0.9f) : col({ 255, 255, 255 }, 0.07f), 0.6f,
-            col(primary ? m_t.soft : m_t.main, primary ? 0.6f : 0.55f));
+        roundRect(d, { 0.f, 0.f, width, height }, height / 2.f, primary ? col(m_t.accent, 1.f) : col(m_t.surface, 1.f), primary ? 0.f : 0.7f,
+            col(m_t.line, 1.f));
         node->addChild(d);
         auto* l = CCLabelBMFont::create(str.c_str(), bodyFont());
         l->setScale(0.5f * BODY_K);
-        l->setColor(primary ? ccColor3B { 255, 255, 255 } : m_text);
+        l->setColor(primary ? m_t.onAccent : m_text);
         l->setPosition({ width / 2.f, height / 2.f + 0.5f });
         l->limitLabelWidth(width - 8.f, 0.5f * BODY_K, 0.2f);
         node->addChild(l);
@@ -4963,12 +5193,8 @@ private:
 
     void drawSwitch(CCDrawNode* d, bool on) {
         d->clear();
-        roundRect(d, { 0.f, 0.f, 26.f, 13.f }, 6.5f, on ? col(m_t.main, 0.95f) : col({ 70, 74, 110 }, 0.9f), 0.5f,
-            col(on ? m_t.soft : ccColor3B { 110, 115, 160 }, 0.6f));
-        if (on) {
-            circle(d, { 19.5f, 6.5f }, 7.f, col(m_cyan, 0.18f));
-        }
-        circle(d, { on ? 19.5f : 6.5f, 6.5f }, 4.6f, col({ 255, 255, 255 }, on ? 1.f : 0.8f));
+        roundRect(d, { 0.f, 0.f, 26.f, 13.f }, 6.5f, col(on ? m_t.accent : m_t.off, 1.f));
+        circle(d, { on ? 19.5f : 6.5f, 6.5f }, 4.8f, col({ 255, 255, 255 }, 1.f));
     }
 
     CCMenuItemSpriteExtra* switchItem(CCPoint center, bool on, SEL_MenuHandler handler, int tag, CCDrawNode** out) {
@@ -5030,154 +5256,149 @@ private:
 
     // ---------- the window ----------
 
-    void buildFrame() {
-        // a soft glow around the window: rings of the accent fading outwards
-        auto* glow = CCDrawNode::create();
-        for (int i = 7; i >= 1; --i) {
-            float g = i * 1.7f;
-            roundRect(glow, { -g, -g, W + 2.f * g, H + 2.f * g }, 12.f + g, col(m_t.main, 0.022f));
+    // an optional picture behind everything (setting "Menu background"), dimmed so text stays readable
+    bool addBackgroundImage(CCNode* root) {
+        std::error_code ec;
+        auto path = Mod::get()->getSettingValue<std::filesystem::path>("menu-background");
+        if (path.empty() || !std::filesystem::exists(path, ec)) {
+            return false;
         }
-        m_mainLayer->addChild(glow, -3);
-
-        // the sky, clipped to the window's shape. v2.90: a black night sky full of stars
+        auto* img = CCSprite::create(path.string().c_str());
+        if (!img || img->getContentSize().width <= 0.f || img->getContentSize().height <= 0.f) {
+            return false;
+        }
         auto* stencil = CCDrawNode::create();
-        roundRect(stencil, { 0.f, 0.f, W, H }, 12.f, { 1, 1, 1, 1 });
+        roundRect(stencil, { 0.f, 0.f, WIN_W, H }, 14.f, { 1, 1, 1, 1 });
         auto* clip = CCClippingNode::create(stencil);
-        m_mainLayer->addChild(clip, -2);
-        auto* sky = CCLayerGradient::create({ 2, 2, 7, 253 }, { 7, 5, 16, 253 });
-        sky->setContentSize({ W, H });
-        clip->addChild(sky);
-        // the faintest hint of the milky way across the sky
-        auto* haze = CCDrawNode::create();
-        for (int i = 0; i < 24; ++i) {
-            float t = i / 23.f;
-            CCPoint c { -20.f + t * (W + 40.f), H * 0.85f - t * H * 0.7f };
-            circle(haze, c, 60.f, col({ 120, 110, 200 }, 0.006f), 40);
-            circle(haze, c, 34.f, col({ 160, 150, 230 }, 0.006f), 32);
-        }
-        clip->addChild(haze);
-        auto drift = [](CCNode* node, CCPoint by, float period) {
-            node->runAction(CCRepeatForever::create(CCSequence::create(CCEaseSineInOut::create(CCMoveBy::create(period, by)),
-                CCEaseSineInOut::create(CCMoveBy::create(period, ccpNeg(by))), nullptr)));
-        };
-        uint32_t seed = 1234567;
-        auto rnd = [&seed] {
-            seed = seed * 1103515245u + 12345u;
-            return static_cast<float>((seed >> 8) & 0xffff) / 65535.f;
-        };
-        auto tint = [&]() -> ccColor3B {
-            float r = rnd();
-            return r < 0.12f ? m_cyan : r < 0.22f ? ccColor3B { 255, 225, 190 } : r < 0.30f ? m_t.soft : ccColor3B { 255, 255, 255 };
-        };
-        // two layers of stars drifting at different speeds (far = small and slow, near = bigger)
-        for (int layer = 0; layer < 2; ++layer) {
-            auto* field = CCNode::create();
-            clip->addChild(field);
-            drift(field, layer == 0 ? CCPoint { -8.f, 3.f } : CCPoint { -18.f, 7.f }, layer == 0 ? 22.f : 14.f);
-            int count = layer == 0 ? 150 : 60;
-            for (int i = 0; i < count; ++i) {
-                float size = layer == 0 ? 0.5f + rnd() * 0.5f : 0.9f + rnd() * 0.8f;
-                auto* star = CCLayerColor::create({ 255, 255, 255, 255 }, size, size);
-                star->setPosition({ rnd() * (W + 50.f) - 25.f, rnd() * (H + 30.f) - 15.f });
-                star->setColor(tint());
-                GLubyte hi = static_cast<GLubyte>((layer == 0 ? 110 : 170) + rnd() * 85);
-                GLubyte lo = static_cast<GLubyte>(15 + rnd() * 45);
-                star->setOpacity(hi);
-                float t = 0.6f + rnd() * 2.2f;
-                star->runAction(CCRepeatForever::create(CCSequence::create(CCDelayTime::create(rnd() * 3.f),
-                    CCFadeTo::create(t, lo), CCFadeTo::create(t, hi), nullptr)));
-                field->addChild(star);
-            }
-            if (layer == 1) {
-                // the shiny ones: four-pointed sparkles that grow, shrink and turn
-                for (int i = 0; i < 14; ++i) {
-                    auto* glint = CCDrawNode::create();
-                    ccColor3B c = tint();
-                    float arm = 3.5f + rnd() * 3.5f;
-                    float w = arm * 0.16f;
-                    CCPoint h1[] = { { 0.f, arm }, { w, 0.f }, { 0.f, -arm }, { -w, 0.f } };
-                    CCPoint h2[] = { { arm, 0.f }, { 0.f, w }, { -arm, 0.f }, { 0.f, -w } };
-                    circle(glint, { 0.f, 0.f }, arm * 0.55f, col(c, 0.10f), 16);
-                    glint->drawPolygon(h1, 4, col(c, 0.95f), 0.f, { 0, 0, 0, 0 });
-                    glint->drawPolygon(h2, 4, col(c, 0.95f), 0.f, { 0, 0, 0, 0 });
-                    circle(glint, { 0.f, 0.f }, w * 1.3f, col({ 255, 255, 255 }, 1.f), 10);
-                    glint->setPosition({ 10.f + rnd() * (W - 20.f), 10.f + rnd() * (H - 20.f) });
-                    float s0 = 0.35f + rnd() * 0.25f;
-                    glint->setScale(s0);
-                    glint->setRotation(rnd() * 45.f);
-                    float t = 1.f + rnd() * 1.8f;
-                    glint->runAction(CCRepeatForever::create(CCSequence::create(CCDelayTime::create(rnd() * 3.f),
-                        CCEaseSineInOut::create(CCScaleTo::create(t, s0 * 2.2f)), CCEaseSineInOut::create(CCScaleTo::create(t, s0)), nullptr)));
-                    glint->runAction(CCRepeatForever::create(CCRotateBy::create(6.f + rnd() * 6.f, rnd() < 0.5f ? 45.f : -45.f)));
-                    field->addChild(glint);
-                }
-            }
-        }
-        // a light sweeping along the title line now and then
-        auto* shine = CCLayerGradient::create({ 255, 255, 255, 0 }, { 255, 255, 255, 210 }, { 1.f, 0.f });
-        shine->setContentSize({ 40.f, 1.f });
-        shine->setPosition({ -40.f, H - TITLE });
-        clip->addChild(shine, 5);
-        shine->runAction(CCRepeatForever::create(CCSequence::create(CCDelayTime::create(2.5f),
-            CCEaseSineInOut::create(CCMoveBy::create(1.6f, { W + 40.f, 0.f })), CCMoveTo::create(0.f, { -40.f, H - TITLE }), nullptr)));
-        m_sky = clip;
+        img->setScale(std::max(WIN_W / img->getContentSize().width, H / img->getContentSize().height));
+        img->setPosition({ WIN_W / 2.f, H / 2.f });
+        clip->addChild(img);
+        auto* scrim = CCDrawNode::create();
+        roundRect(scrim, { 0.f, 0.f, WIN_W, H }, 14.f, col(m_t.bg, 0.8f));
+        clip->addChild(scrim, 1);
+        root->addChild(clip, -4);
+        return true;
+    }
 
-        // edge, the sidebar's darker panel, the title's accent line
+    void buildFrame() {
+        m_chrome = CCNode::create();
+        m_mainLayer->addChild(m_chrome, 0);
+        auto* root = m_chrome;
+
+        // flat window: solid background, hairline border, no glow
+        auto* base = CCDrawNode::create();
+        roundRect(base, { 0.f, 0.f, WIN_W, H }, 14.f, col(m_t.bg, 1.f));
+        root->addChild(base, -5);
+        m_hasImage = addBackgroundImage(root);
+
         auto* chrome = CCDrawNode::create();
-        roundRect(chrome, { 0.f, 0.f, W, H }, 12.f, { 0, 0, 0, 0 }, 0.7f, col(m_t.main, 0.75f));
-        roundRect(chrome, { 1.5f, 1.5f, W - 3.f, H - 3.f }, 11.f, { 0, 0, 0, 0 }, 0.4f, col({ 255, 255, 255 }, 0.06f));
-        roundRect(chrome, { 7.f, 8.f, SIDE - 12.f, H - TITLE - 14.f }, 9.f, col({ 0, 0, 0 }, 0.28f), 0.4f, col({ 255, 255, 255 }, 0.05f));
-        m_mainLayer->addChild(chrome, -1);
-        auto* line = CCLayerGradient::create({ m_t.main.r, m_t.main.g, m_t.main.b, 230 }, { m_cyan.r, m_cyan.g, m_cyan.b, 0 }, { 1.f, 0.f });
-        line->setContentSize({ W - 24.f, 1.f });
-        line->setPosition({ 12.f, H - TITLE });
-        m_mainLayer->addChild(line, -1);
+        roundRect(chrome, { 0.f, 0.f, WIN_W, H }, 14.f, { 0, 0, 0, 0 }, 0.8f, col(m_t.line, 1.f));
+        roundRect(chrome, { 8.f, 8.f, SIDE - 12.f, H - TITLE - 14.f }, 10.f, col(m_t.surface, m_hasImage ? 0.9f : 1.f), 0.7f, col(m_t.line, 1.f));
+        root->addChild(chrome, -1);
+        auto* sep = CCLayerColor::create({ m_t.line.r, m_t.line.g, m_t.line.b, 255 }, WIN_W - 24.f, 1.f);
+        sep->setPosition({ 12.f, H - TITLE });
+        root->addChild(sep, -1);
 
-        // the logo: a little planet with a tilted ring
-        auto* logo = CCDrawNode::create();
+        // title bar: the logo, the name, the version
         CCPoint lc { 21.f, H - TITLE / 2.f };
-        circle(logo, lc, 6.5f, col(m_t.main, 1.f));
-        circle(logo, lc + CCPoint { -1.6f, 1.8f }, 3.4f, col(m_t.soft, 0.45f));
-        std::vector<CCPoint> ring;
-        for (int i = 0; i <= 32; ++i) {
-            float a = i * 2.f * 3.14159265f / 32.f;
-            float x = 11.f * std::cos(a), y = 3.2f * std::sin(a);
-            float t = 0.38f;
-            ring.push_back(lc + CCPoint { x * std::cos(t) - y * std::sin(t), x * std::sin(t) + y * std::cos(t) });
+        if (auto* icon = CCSprite::create("alious-buffer-icon.png"_spr)) {
+            icon->setScale(21.f / icon->getContentSize().height);
+            icon->setPosition(lc);
+            root->addChild(icon, 2);
         }
-        for (size_t i = 0; i + 1 < ring.size(); ++i) {
-            logo->drawSegment(ring[i], ring[i + 1], 0.55f, col(m_cyan, 0.95f));
-        }
-        m_mainLayer->addChild(logo, 2);
-        // a moon going round the logo along its ring
-        auto* tilt = CCNode::create();
-        tilt->setPosition(lc);
-        tilt->setRotation(-0.38f * 180.f / 3.14159265f);
-        tilt->setScaleY(3.2f / 11.f);
-        m_mainLayer->addChild(tilt, 3);
-        auto* orbit = CCNode::create();
-        tilt->addChild(orbit);
-        auto* moon = CCDrawNode::create();
-        circle(moon, { 11.f, 0.f }, 1.7f, col({ 255, 255, 255 }, 1.f), 12);
-        orbit->addChild(moon);
-        orbit->runAction(CCRepeatForever::create(CCRotateBy::create(4.f, -360.f)));
-        label(m_mainLayer, "CLICK BEFORE FRAMES", 0.56f, m_text, { 38.f, H - TITLE / 2.f }, { 0.f, 0.5f }, true);
-        label(m_mainLayer, Mod::get()->getVersion().toVString(), 0.4f, m_muted, { W - 38.f, H - TITLE / 2.f }, { 1.f, 0.5f });
+        label(root, "Aliou's Buffer", 0.62f, m_text, { 38.f, H - TITLE / 2.f }, { 0.f, 0.5f }, true);
+        label(root, Mod::get()->getVersion().toVString(), 0.4f, m_muted, { WIN_W - 36.f, H - TITLE / 2.f }, { 1.f, 0.5f });
 
         m_frameMenu = CCMenu::create();
         m_frameMenu->setPosition({ 0.f, 0.f });
-        m_mainLayer->addChild(m_frameMenu, 5);
+        root->addChild(m_frameMenu, 5);
         // close: a thin ring with an x
         auto* node = CCNode::create();
         node->setContentSize({ 18.f, 18.f });
         auto* d = CCDrawNode::create();
-        circle(d, { 9.f, 9.f }, 8.f, col({ 255, 255, 255 }, 0.06f), 28, 0.5f, col(m_t.main, 0.8f));
-        d->drawSegment({ 6.2f, 6.2f }, { 11.8f, 11.8f }, 0.6f, col(m_text, 0.95f));
-        d->drawSegment({ 6.2f, 11.8f }, { 11.8f, 6.2f }, 0.6f, col(m_text, 0.95f));
+        circle(d, { 9.f, 9.f }, 8.f, col(m_t.surface, 1.f), 28, 0.7f, col(m_t.line, 1.f));
+        d->drawSegment({ 6.2f, 6.2f }, { 11.8f, 11.8f }, 0.7f, col(m_text, 1.f));
+        d->drawSegment({ 6.2f, 11.8f }, { 11.8f, 6.2f }, 0.7f, col(m_text, 1.f));
         node->addChild(d);
         auto* close = CCMenuItemSpriteExtra::create(node, this, menu_selector(BufferMenu::onCloseButton));
-        close->setPosition({ W - 18.f, H - TITLE / 2.f });
+        close->setPosition({ WIN_W - 18.f, H - TITLE / 2.f });
         m_frameMenu->addChild(close);
+        button(m_frameMenu, "Settings", menu_selector(BufferMenu::onAllSettings), { WIN_W - 112.f, H - TITLE / 2.f }, 54.f, false, 0, 16.f);
+        buildInfoPanel();
+    }
+
+    // a small line icon for each section (drawn, no extra images)
+    void navIcon(CCDrawNode* d, int i, CCPoint c, ccColor4F k) {
+        constexpr float PI = 3.14159265f;
+        auto seg = [&](float x1, float y1, float x2, float y2) {
+            d->drawSegment(c + CCPoint { x1, y1 }, c + CCPoint { x2, y2 }, 0.7f, k);
+        };
+        switch (i) {
+            case 0:  // overview: four tiles
+                for (int a = 0; a < 2; ++a) {
+                    for (int b = 0; b < 2; ++b) {
+                        roundRect(d, { c.x - 4.5f + a * 5.f, c.y - 4.5f + b * 5.f, 4.f, 4.f }, 1.f, k);
+                    }
+                }
+                break;
+            case 1:  // prediction: a path ending in a dot
+                seg(-5.f, -3.f, -2.f, 2.f);
+                seg(-2.f, 2.f, 1.f, -1.f);
+                seg(1.f, -1.f, 4.f, 4.f);
+                circle(d, c + CCPoint { 4.5f, 4.5f }, 1.4f, k, 10);
+                break;
+            case 2: {  // game modes: a diamond
+                CCPoint p[] = { c + CCPoint { 0.f, 5.5f }, c + CCPoint { 5.5f, 0.f }, c + CCPoint { 0.f, -5.5f }, c + CCPoint { -5.5f, 0.f } };
+                d->drawPolygon(p, 4, { 0, 0, 0, 0 }, 0.8f, k);
+                circle(d, c, 1.3f, k, 10);
+                break;
+            }
+            case 3: {  // automation: a bolt
+                CCPoint p[] = { c + CCPoint { 1.5f, 6.f }, c + CCPoint { -3.5f, -0.5f }, c + CCPoint { -0.2f, -0.5f },
+                    c + CCPoint { -1.5f, -6.f }, c + CCPoint { 3.5f, 0.8f }, c + CCPoint { 0.2f, 0.8f } };
+                d->drawPolygon(p, 6, k, 0.f, { 0, 0, 0, 0 });
+                break;
+            }
+            case 4:  // memory: stacked bars
+                for (int r = -1; r <= 1; ++r) {
+                    roundRect(d, { c.x - 5.f, c.y + r * 3.8f - 1.1f, 10.f, 2.2f }, 1.1f, k);
+                }
+                break;
+            case 5:  // sections: a bar cut by markers
+                seg(-5.5f, 0.f, 5.5f, 0.f);
+                seg(-5.5f, -3.f, -5.5f, 3.f);
+                seg(-1.8f, -3.f, -1.8f, 3.f);
+                seg(1.8f, -3.f, 1.8f, 3.f);
+                seg(5.5f, -3.f, 5.5f, 3.f);
+                break;
+            case 6:  // performance: a gauge
+                for (int n = 0; n < 8; ++n) {
+                    float a1 = (200.f - n * 27.5f) * PI / 180.f, a2 = (200.f - (n + 1) * 27.5f) * PI / 180.f;
+                    seg(5.5f * std::cos(a1), 5.5f * std::sin(a1) - 1.f, 5.5f * std::cos(a2), 5.5f * std::sin(a2) - 1.f);
+                }
+                seg(0.f, -1.f, 3.f, 3.f);
+                break;
+            case 7:  // visuals: an eye
+                for (int n = 0; n < 12; ++n) {
+                    float a1 = n * 2.f * PI / 12.f, a2 = (n + 1) * 2.f * PI / 12.f;
+                    seg(6.f * std::cos(a1), 3.5f * std::sin(a1), 6.f * std::cos(a2), 3.5f * std::sin(a2));
+                }
+                circle(d, c, 1.7f, k, 10);
+                break;
+            case 8:  // tools: a gear-like ring
+                circle(d, c, 4.2f, { 0, 0, 0, 0 }, 16, 0.8f, k);
+                circle(d, c, 1.3f, k, 10);
+                seg(0.f, 5.6f, 0.f, 4.2f);
+                seg(0.f, -5.6f, 0.f, -4.2f);
+                seg(5.6f, 0.f, 4.2f, 0.f);
+                seg(-5.6f, 0.f, -4.2f, 0.f);
+                break;
+            default:  // about: an "i" in a ring
+                circle(d, c, 5.2f, { 0, 0, 0, 0 }, 18, 0.8f, k);
+                seg(0.f, -2.8f, 0.f, 0.8f);
+                circle(d, c + CCPoint { 0.f, 3.f }, 0.8f, k, 8);
+                break;
+        }
     }
 
     void buildTabs() {
@@ -5190,28 +5411,147 @@ private:
         menu->setPosition({ 0.f, 0.f });
         m_tabsNode->addChild(menu);
         for (int i = 0; i < static_cast<int>(std::size(TABS)); ++i) {
-            float y = H - TITLE - 22.f - i * 27.f;
+            float y = H - TITLE - 18.f - i * 22.f;
             bool active = i == s_tab;
             auto* node = CCNode::create();
-            node->setContentSize({ SIDE - 16.f, 22.f });
+            node->setContentSize({ SIDE - 16.f, 21.f });
             auto* d = CCDrawNode::create();
             if (active) {
-                roundRect(d, { 0.f, 0.f, SIDE - 16.f, 22.f }, 7.f, col(m_t.main, 0.32f), 0.6f, col(m_t.main, 0.9f));
-                d->drawSegment({ 3.f, 6.f }, { 3.f, 16.f }, 1.2f, col(m_cyan, 1.f));
+                roundRect(d, { 0.f, 0.f, SIDE - 16.f, 21.f }, 7.f, col(m_t.accent, m_t.light ? 0.13f : 0.2f));
+                roundRect(d, { 0.f, 4.f, 2.5f, 13.f }, 1.2f, col(m_t.accent, 1.f));
             }
-            circle(d, { 12.f, 11.f }, 2.2f, active ? col(m_cyan, 1.f) : col(m_muted, 0.6f), 12);
+            navIcon(d, i, { 13.f, 10.5f }, col(active ? m_t.accent : m_muted, 1.f));
             node->addChild(d);
-            auto* l = CCLabelBMFont::create(TABS[i], headFont());
-            l->setScale(0.42f * HEAD_K);
+            auto* l = CCLabelBMFont::create(TABS[i], active ? headFont() : bodyFont());
+            l->setScale(0.44f * (active ? HEAD_K : BODY_K));
             l->setColor(active ? m_text : m_muted);
             l->setAnchorPoint({ 0.f, 0.5f });
-            l->setPosition({ 22.f, 11.5f });
+            l->setPosition({ 25.f, 10.5f });
+            l->limitLabelWidth(SIDE - 16.f - 29.f, 0.44f * (active ? HEAD_K : BODY_K), 0.15f);
             node->addChild(l);
             auto* item = CCMenuItemSpriteExtra::create(node, this, menu_selector(BufferMenu::onTab));
-            item->m_scaleMultiplier = 1.04f;
+            item->m_scaleMultiplier = 1.03f;
             item->setTag(i);
             item->setPosition({ SIDE / 2.f, y });
             menu->addChild(item);
+        }
+    }
+
+    // ---------- right status panel ----------
+
+    void buildInfoPanel() {
+        auto* root = m_chrome;
+        float x0 = W + 5.f, pw = RP - 11.f;
+        auto* d = CCDrawNode::create();
+        roundRect(d, { x0, 8.f, pw, H - TITLE - 14.f }, 10.f, col(m_t.surface, m_hasImage ? 0.9f : 1.f), 0.7f, col(m_t.line, 1.f));
+        root->addChild(d, -1);
+        float lx = x0 + 10.f, lw = pw - 20.f;
+        auto section = [&](char const* t, float y) {
+            label(root, t, 0.4f, m_muted, { lx, y }, { 0.f, 0.5f }, true);
+        };
+        auto line = [&](float y, ccColor3B c) {
+            return label(root, "", 0.4f, c, { lx, y }, { 0.f, 0.5f });
+        };
+        section("Status", H - TITLE - 16.f);
+        m_dotNode = CCNode::create();
+        m_dotNode->setPosition({ lx + 4.f, H - TITLE - 32.f });
+        root->addChild(m_dotNode, 3);
+        m_dot = CCDrawNode::create();
+        m_dotNode->addChild(m_dot);
+        m_dotNode->runAction(CCRepeatForever::create(CCSequence::create(CCEaseSineInOut::create(CCScaleTo::create(1.4f, 1.25f)),
+            CCEaseSineInOut::create(CCScaleTo::create(1.4f, 1.f)), nullptr)));
+        m_infoBuffer = label(root, "", 0.5f, m_text, { lx + 12.f, H - TITLE - 32.f }, { 0.f, 0.5f }, true);
+        m_infoStage = line(H - TITLE - 46.f, m_muted);
+        section("Prediction", H - TITLE - 64.f);
+        m_infoPred = line(H - TITLE - 77.f, m_text);
+        m_infoScope = line(H - TITLE - 89.f, m_muted);
+        section("Active", H - TITLE - 107.f);
+        for (int i = 0; i < 5; ++i) {
+            m_infoActive[i] = line(H - TITLE - 120.f - i * 11.f, m_text);
+        }
+        section("Performance", H - TITLE - 176.f);
+        for (int i = 0; i < 3; ++i) {
+            m_infoPerf[i] = line(H - TITLE - 189.f - i * 10.f, m_muted);
+        }
+        label(root, "Practice use only", 0.36f, m_t.warn, { x0 + pw / 2.f, 25.f }, { 0.5f, 0.5f }, true)->limitLabelWidth(lw, 0.36f * HEAD_K, 0.15f);
+        label(root, "Assisted runs are not legit", 0.32f, m_muted, { x0 + pw / 2.f, 14.f }, { 0.5f, 0.5f })->limitLabelWidth(lw, 0.32f * BODY_K, 0.15f);
+        refreshInfo();
+    }
+
+    void refreshInfo() {
+        if (!m_infoBuffer) {
+            return;
+        }
+        auto* mod = Mod::get();
+        auto on = [&](char const* k) { return mod->getSettingValue<bool>(k); };
+        float lw = RP - 11.f - 18.f;
+        ccColor3B amber = m_t.warn;
+        bool enabled = buf.enabled;
+        m_dot->clear();
+        circle(m_dot, { 0.f, 0.f }, 5.f, col(enabled ? m_hi : m_t.bad, 0.2f), 16);
+        circle(m_dot, { 0.f, 0.f }, 3.f, col(enabled ? m_hi : m_t.bad, 1.f), 14);
+        m_infoBuffer->setString(enabled ? "Buffer on" : "Buffer off");
+        m_infoBuffer->setColor(enabled ? m_text : m_t.bad);
+        m_infoStage->setString(stageText().c_str());
+        m_infoStage->limitLabelWidth(lw, 0.4f, 0.15f);
+        m_infoPred->setString(on("smart-prediction") ? "Orbs, pads, portals" : "Basic only");
+        m_infoPred->limitLabelWidth(lw, 0.4f, 0.15f);
+        bool practice = on("practice-only");
+        m_infoScope->setString(practice ? "Practice mode only" : "Every run");
+        m_infoScope->setColor(practice ? m_muted : amber);
+        m_infoScope->limitLabelWidth(lw, 0.4f, 0.15f);
+
+        std::vector<std::pair<std::string, ccColor3B>> act;
+        if (on("auto-click")) {
+            act.push_back({ "Auto-click", amber });
+        }
+        if (on("wave-auto-release") || on("robot-auto-release") || on("dash-auto-release")) {
+            act.push_back({ "Auto-release", amber });
+        }
+        if (on("auto-release-normal-runs")) {
+            act.push_back({ "Auto in normal runs", amber });
+        }
+        if (on("training-mode")) {
+            act.push_back({ "Training (hints)", m_text });
+        }
+        if (on("low-latency")) {
+            act.push_back({ "Low latency", m_text });
+        }
+        if (on("performance-mode")) {
+            act.push_back({ "Performance mode", m_text });
+        }
+        if (on("level-memory")) {
+            act.push_back({ "Level memory", m_text });
+        }
+        if (on("section-learning") && sectionsOnCount() > 0) {
+            act.push_back({ fmt::format("Sections: {} picked", sectionsOnCount()), m_text });
+        }
+        if (on("predict-moving-objects")) {
+            act.push_back({ "Moving objects (exp.)", amber });
+        }
+        if (buf.showPath) {
+            act.push_back({ "Path view", m_text });
+        }
+        if (act.empty()) {
+            act.push_back({ "Nothing extra", m_muted });
+        }
+        for (int i = 0; i < 5; ++i) {
+            if (i < static_cast<int>(act.size())) {
+                m_infoActive[i]->setString(act[i].first.c_str());
+                m_infoActive[i]->setColor(act[i].second);
+                m_infoActive[i]->limitLabelWidth(lw, 0.4f, 0.15f);
+            }
+            else {
+                m_infoActive[i]->setString("");
+            }
+        }
+        float dt = buf.tickLength > 0.001f ? buf.tickLength : TICK;
+        m_infoPerf[0]->setString(fmt::format("physics {:.0f}/s", 60.f / dt).c_str());
+        m_infoPerf[1]->setString(fmt::format("memory {} spots", memorySpots()).c_str());
+        m_infoPerf[2]->setString(on("performance-mode") ? "budget 4 ms (perf.)"
+                                                          : fmt::format("budget {:g} ms", mod->getSettingValue<double>("sim-budget-ms")).c_str());
+        for (auto* l : m_infoPerf) {
+            l->limitLabelWidth(lw, 0.4f, 0.15f);
         }
     }
 
@@ -5222,7 +5562,7 @@ private:
     }
 
     void heading(std::string const& title, std::string const& sub) {
-        label(m_page, title, 0.7f, m_text, { SIDE + 14.f, pageTop() }, { 0.f, 0.5f }, true);
+        label(m_page, title, 0.72f, m_text, { SIDE + 14.f, pageTop() }, { 0.f, 0.5f }, true);
         if (!sub.empty()) {
             label(m_page, sub, 0.42f, m_muted, { SIDE + 14.f, pageTop() - 14.f }, { 0.f, 0.5f })->limitLabelWidth(W - SIDE - 28.f, 0.42f, 0.2f);
         }
@@ -5231,19 +5571,24 @@ private:
     // a translucent card behind a group of rows
     void card(float top, float height) {
         auto* d = CCDrawNode::create();
-        roundRect(d, { SIDE + 8.f, top - height, W - SIDE - 16.f, height }, 8.f, col({ 255, 255, 255 }, 0.045f), 0.5f, col(m_t.main, 0.35f));
+        roundRect(d, { SIDE + 8.f, top - height, W - SIDE - 16.f, height }, 9.f, col(m_t.surface, m_hasImage ? 0.9f : 1.f), 0.7f, col(m_t.line, 1.f));
         m_page->addChild(d, 1);
     }
 
-    void pageBuffer() {
-        heading("Buffer", "How much an early click can be held back, and the physics speed.");
+    // a short muted line of text on a page
+    void note(std::string const& text, float y, ccColor3B color, float scale = 0.4f) {
+        label(m_page, text, scale, color, { SIDE + 14.f, y }, { 0.f, 0.5f })->limitLabelWidth(W - SIDE - 28.f, scale, 0.2f);
+    }
+
+    void pageOverview() {
+        heading("Overview", "Pick a stage or preset, then play.");
         float cx = SIDE + (W - SIDE) / 2.f;
         float y = pageTop() - 40.f;
         card(y + 13.f, 52.f);
         label(m_page, "Stage", 0.5f, m_muted, { SIDE + 20.f, y }, { 0.f, 0.5f });
         button(m_pageMenu, "<", menu_selector(BufferMenu::onStage), { cx - 20.f, y }, 22.f, false, -1);
         button(m_pageMenu, ">", menu_selector(BufferMenu::onStage), { W - 30.f, y }, 22.f, false, 1);
-        m_stage = label(m_page, "", 0.55f, m_text, { (cx - 8.f + W - 42.f) / 2.f, y });
+        m_stage = label(m_page, "", 0.55f, m_text, { (cx - 8.f + W - 42.f) / 2.f, y }, { 0.5f, 0.5f }, true);
         y -= 22.f;
         char const* presets[] = { "Safe", "Balanced", "Aggressive" };
         float pw = (W - SIDE - 40.f) / 3.f;
@@ -5255,14 +5600,184 @@ private:
         label(m_page, "Physics TPS", 0.5f, m_muted, { SIDE + 20.f, y }, { 0.f, 0.5f });
         button(m_pageMenu, "-", menu_selector(BufferMenu::onTps), { W - 92.f, y }, 22.f, false, -1);
         button(m_pageMenu, "+", menu_selector(BufferMenu::onTps), { W - 30.f, y }, 22.f, false, 1);
-        m_tpsLabel = label(m_page, "", 0.55f, m_text, { W - 61.f, y });
+        m_tpsLabel = label(m_page, "", 0.55f, m_text, { W - 61.f, y }, { 0.5f, 0.5f }, true);
         y -= 30.f;
-        m_status = label(m_page, "", 0.45f, m_cyan, { SIDE + 14.f, y }, { 0.f, 0.5f });
+        card(y + 12.f, ROW + 4.f);
+        optionGrid(QUICK, std::size(QUICK), y);
+        y -= ROW + 18.f;
+        button(m_pageMenu, "Run check", menu_selector(BufferMenu::onRunCheck), { SIDE + 62.f, y }, 84.f, true, 0, 16.f);
+        label(m_page, "Replays your longest recorded run on the hidden player.", 0.4f, m_muted, { SIDE + 112.f, y }, { 0.f, 0.5f })->limitLabelWidth(W - SIDE - 124.f, 0.4f, 0.15f);
         if (buf.perMode) {
-            label(m_page, "Per-mode frames are on (Custom tab). Stage and presets turn them off.", 0.4f, m_t.soft, { SIDE + 14.f, y - 14.f },
-                { 0.f, 0.5f })->limitLabelWidth(W - SIDE - 28.f, 0.4f, 0.2f);
+            note("Per-mode frames are on (Game Modes). Stage and presets turn them off.", y - 16.f, m_muted);
         }
-        button(m_pageMenu, "Run check", menu_selector(BufferMenu::onRunCheck), { cx, 26.f }, 90.f, true);
+    }
+
+    void pagePrediction() {
+        pageOptions("Prediction", "What the hidden ghost predicts before your click is let through.", PREDICTION, std::size(PREDICTION));
+    }
+
+    void pageGameModes() {
+        heading("Game Modes", "Frames each mode can be held back, and smart helpers per mode.");
+        button(m_pageMenu, "Frames", menu_selector(BufferMenu::onModeSub), { W - 88.f, pageTop() }, 52.f, s_modeSub == 0, 0, 16.f);
+        button(m_pageMenu, "Helpers", menu_selector(BufferMenu::onModeSub), { W - 30.f, pageTop() }, 52.f, s_modeSub == 1, 1, 16.f);
+        if (s_modeSub == 0) {
+            pageCustom();
+            return;
+        }
+        float top = pageTop() - 40.f;
+        card(top + 12.f, ((std::size(MODE_HELPERS) + 1) / 2) * ROW + 4.f);
+        optionGrid(MODE_HELPERS, std::size(MODE_HELPERS), top);
+        note("Smart helpers judge crashes you could still react to as safe, and let fast taps through.", top - 4 * ROW - 8.f, m_muted);
+    }
+
+    void pageAutomation() {
+        pageOptions("Automation", "Practice-only helpers that click or release for you.", AUTOMATION, std::size(AUTOMATION));
+        float y = pageTop() - 40.f - 3 * ROW - 22.f;
+        ccColor3B amber = m_t.warn;
+        note("EXPERIMENTAL. Runs that use these are not verified or leaderboard-legitimate.", y, amber, 0.42f);
+        note("Auto inputs only act in practice mode, unless 'Also in normal runs' is on.", y - 14.f, m_muted);
+        note("While they can act in a normal run, AUTO INPUTS ON shows on screen.", y - 27.f, m_muted);
+        note("The auto-release window is in All settings (Tools).", y - 40.f, m_muted);
+    }
+
+    void pageMemory() {
+        heading("Memory", "What the mod learns from your runs on this level.");
+        float top = pageTop() - 40.f;
+        card(top + 12.f, 2 * ROW + 4.f);
+        optionGrid(MEMORY, std::size(MEMORY), top);
+        float y = top - 2 * ROW - 14.f;
+        m_memLabel = label(m_page, "", 0.5f, m_hi, { SIDE + 14.f, y }, { 0.f, 0.5f });
+        y -= 24.f;
+        button(m_pageMenu, "Forget this level", menu_selector(BufferMenu::onForget), { SIDE + 70.f, y }, 112.f, false, 0, 16.f);
+        y -= 22.f;
+        note("Delays that worked are tried first; spots where saves keep failing are left alone.", y, m_muted);
+        note("Pick parts of the level to practise on the Sections page.", y - 13.f, m_muted);
+    }
+
+    void pageSections() {
+        heading("Sections", "Practice chosen parts of the level. Timings learned there are reused later.");
+        if (memoryKey.empty()) {
+            note("Open a level first: sections are saved per level.", pageTop() - 40.f, m_muted, 0.46f);
+            note("Practice mode only. Learned timings are reused in every later run, full runs included.", pageTop() - 56.f, m_muted);
+            return;
+        }
+        float top = pageTop() - 40.f;
+        card(top + 12.f, ROW + 4.f);
+        optionGrid(SECTION_OPTS, std::size(SECTION_OPTS), top);
+        float y = top - ROW - 14.f;
+        label(m_page, "Split into", 0.46f, m_muted, { SIDE + 14.f, y }, { 0.f, 0.5f });
+        int splits[] = { 2, 4, 5, 10, 0 };
+        char const* names[] = { "2", "4", "5", "10", "Clear" };
+        for (int i = 0; i < 5; ++i) {
+            button(m_pageMenu, names[i], menu_selector(BufferMenu::onSecSplit), { SIDE + 84.f + i * 42.f + (i == 4 ? 8.f : 0.f), y },
+                i == 4 ? 50.f : 36.f, false, splits[i], 16.f);
+        }
+        y -= 24.f;
+        label(m_page, "New", 0.46f, m_muted, { SIDE + 14.f, y }, { 0.f, 0.5f });
+        button(m_pageMenu, "-", menu_selector(BufferMenu::onSecStep), { SIDE + 52.f, y }, 18.f, false, 0, 16.f);
+        label(m_page, fmt::format("{}%", s_newFrom), 0.5f, m_text, { SIDE + 76.f, y });
+        button(m_pageMenu, "+", menu_selector(BufferMenu::onSecStep), { SIDE + 100.f, y }, 18.f, false, 1, 16.f);
+        label(m_page, "to", 0.46f, m_muted, { SIDE + 122.f, y });
+        button(m_pageMenu, "-", menu_selector(BufferMenu::onSecStep), { SIDE + 144.f, y }, 18.f, false, 2, 16.f);
+        label(m_page, fmt::format("{}%", s_newTo), 0.5f, m_text, { SIDE + 170.f, y });
+        button(m_pageMenu, "+", menu_selector(BufferMenu::onSecStep), { SIDE + 196.f, y }, 18.f, false, 3, 16.f);
+        button(m_pageMenu, "Add", menu_selector(BufferMenu::onSecAdd), { SIDE + 246.f, y }, 56.f, true, 0, 16.f);
+        y -= 24.f;
+        int count = static_cast<int>(sections.size());
+        int pages = std::max(1, (count + 3) / 4);
+        s_secPage = std::clamp(s_secPage, 0, pages - 1);
+        card(y + 12.f, 4 * 19.f + 4.f);
+        if (count == 0) {
+            note("No sections yet. Split the level or add one above.", y, m_muted, 0.46f);
+        }
+        for (int k = 0; k < 4; ++k) {
+            int idx = s_secPage * 4 + k;
+            if (idx >= count) {
+                break;
+            }
+            auto const& sec = sections[idx];
+            float ry = y - k * 19.f;
+            CCDrawNode* unused = nullptr;
+            switchItem({ SIDE + 26.f, ry }, sec.on, menu_selector(BufferMenu::onSecToggle), idx, &unused);
+            label(m_page, fmt::format("{}% - {}%", sec.from, sec.to), 0.5f, sec.on ? m_text : m_muted, { SIDE + 46.f, ry }, { 0.f, 0.5f });
+            label(m_page, fmt::format("{} saves, {} deaths", sec.saves, sec.deaths), 0.4f, m_muted, { SIDE + 130.f, ry }, { 0.f, 0.5f })
+                ->limitLabelWidth(W - SIDE - 180.f, 0.4f, 0.15f);
+            button(m_pageMenu, "x", menu_selector(BufferMenu::onSecDelete), { W - 26.f, ry }, 18.f, false, idx, 16.f);
+        }
+        float by = y - 4 * 19.f - 6.f;
+        note(fmt::format("{} of {} picked. Practice mode only; every input stays yours.", sectionsOnCount(), count), by, m_muted);
+        if (pages > 1) {
+            button(m_pageMenu, "<", menu_selector(BufferMenu::onSecPage), { W - 62.f, by }, 18.f, false, -1, 16.f);
+            label(m_page, fmt::format("{}/{}", s_secPage + 1, pages), 0.42f, m_text, { W - 44.f, by });
+            button(m_pageMenu, ">", menu_selector(BufferMenu::onSecPage), { W - 26.f, by }, 18.f, false, 1, 16.f);
+        }
+    }
+
+    void pagePerformance() {
+        heading("Performance", "Prediction time, latency and optimisation.");
+        float top = pageTop() - 40.f;
+        card(top + 12.f, 2 * ROW + 4.f);
+        optionGrid(PERFORMANCE, std::size(PERFORMANCE), top);
+        float y = top - 2 * ROW - 16.f;
+        card(y + 11.f, 24.f);
+        label(m_page, "Prediction budget (ms)", 0.5f, m_muted, { SIDE + 20.f, y }, { 0.f, 0.5f });
+        button(m_pageMenu, "-", menu_selector(BufferMenu::onBudget), { W - 92.f, y }, 22.f, false, -1);
+        button(m_pageMenu, "+", menu_selector(BufferMenu::onBudget), { W - 30.f, y }, 22.f, false, 1);
+        m_budgetLabel = label(m_page, "", 0.55f, m_text, { W - 61.f, y });
+        y -= 26.f;
+        m_status = label(m_page, "", 0.42f, m_hi, { SIDE + 14.f, y }, { 0.f, 0.5f });
+        note("Performance mode: 4 ms per click, no extra checks, live path view off.", y - 16.f, m_muted);
+        note("Auto time budget: 4 ms while the game is already dropping frames.", y - 29.f, m_muted);
+        note("Low latency: delays up to 1 frame, searches capped at 3 ms.", y - 42.f, m_muted);
+    }
+
+    void pageVisuals() {
+        heading("Visuals", "Path display, indicators and how the menu looks.");
+        float top = pageTop() - 40.f;
+        card(top + 12.f, 2 * ROW + 4.f);
+        optionGrid(VISUALS, std::size(VISUALS), top);
+        float y = top - 2 * ROW - 16.f;
+        card(y + 11.f, 24.f);
+        label(m_page, "Menu theme", 0.5f, m_muted, { SIDE + 20.f, y }, { 0.f, 0.5f });
+        button(m_pageMenu, Mod::get()->getSettingValue<std::string>("menu-theme"), menu_selector(BufferMenu::onTheme), { W - 58.f, y }, 84.f, true, 0, 16.f);
+        y -= 28.f;
+        card(y + 11.f, 24.f);
+        label(m_page, "Background image", 0.5f, m_muted, { SIDE + 20.f, y }, { 0.f, 0.5f });
+        button(m_pageMenu, "Choose", menu_selector(BufferMenu::onAllSettings), { W - 58.f, y }, 84.f, false, 0, 16.f);
+        note("Pick a picture under Menu background in Settings. It is dimmed for readability.", y - 20.f, m_muted);
+        note("Path view: red = this input as pressed, green = what the game gets, dot = where it fires.", y - 33.f, m_muted);
+    }
+
+    void pageTools() {
+        heading("Tools", "Debug console, logs and diagnostics.");
+        float top = pageTop() - 40.f;
+        card(top + 12.f, 3 * ROW + 4.f);
+        optionGrid(TOOLS, std::size(TOOLS), top);
+        float y = top - 3 * ROW - 14.f;
+        float bw = (W - SIDE - 46.f) / 3.f;
+        float x0 = SIDE + 20.f + bw / 2.f;
+        button(m_pageMenu, "Stats", menu_selector(BufferMenu::onStats), { x0, y }, bw);
+        button(m_pageMenu, "Console", menu_selector(BufferMenu::onConsole), { x0 + bw + 6.f, y }, bw);  // phones have no F9
+        button(m_pageMenu, "Copy log", menu_selector(BufferMenu::onCopyLog), { x0 + 2.f * (bw + 6.f), y }, bw);
+        note("Debug options only log; they change nothing about the decisions.", y - 20.f, m_muted);
+    }
+
+    void pageAbout() {
+        heading("About", "A predictive input buffer for Geometry Dash.");
+        float top = pageTop() - 22.f;
+        card(top, 70.f);
+        if (auto* icon = CCSprite::create("alious-buffer-icon.png"_spr)) {
+            icon->setScale(52.f / icon->getContentSize().height);
+            icon->setPosition({ SIDE + 40.f, top - 35.f });
+            m_page->addChild(icon, 3);
+        }
+        label(m_page, "Aliou's Buffer", 0.66f, m_text, { SIDE + 76.f, top - 16.f }, { 0.f, 0.5f }, true);
+        label(m_page, fmt::format("Version {}", Mod::get()->getVersion().toVString()), 0.46f, m_hi, { SIDE + 76.f, top - 33.f }, { 0.f, 0.5f });
+        label(m_page, "Developer: Aliou", 0.46f, m_text, { SIDE + 76.f, top - 47.f }, { 0.f, 0.5f });
+        button(m_pageMenu, "GitHub", menu_selector(BufferMenu::onAboutLink), { W - 44.f, top - 35.f }, 62.f, true, 0, 16.f);
+        float y = top - 88.f;
+        note("Keys (default): 6 stage, 7 menu, F8 copy log, F9 console, F10 path, F11 forget.", y, m_muted);
+        note("Based on the predictive input buffer by BASU. See NOTICE.md for attribution.", y - 14.f, m_muted);
     }
 
     void pageOptions(char const* title, char const* sub, Option const* options, size_t count) {
@@ -5273,7 +5788,6 @@ private:
     }
 
     void pageCustom() {
-        heading("Custom", "Pick how many frames each game mode can be held back. 0 = no buffer.");
         float y = pageTop() - 38.f;
         card(y + 11.f, 24.f);
         label(m_page, "Use per-mode frames", 0.52f, buf.perMode ? m_text : m_muted, { SIDE + 20.f, y }, { 0.f, 0.5f });
@@ -5291,29 +5805,11 @@ private:
             auto* track = CCDrawNode::create();
             m_page->addChild(track, 2);
             m_sliders.push_back({ i, x + 30.f, x + colW - 36.f, ry, track });
-            m_modeValues[i] = label(m_page, "", 0.52f, m_cyan, { x + colW - 15.f, ry });
+            m_modeValues[i] = label(m_page, "", 0.52f, m_hi, { x + colW - 15.f, ry });
         }
         label(m_page, "Drag a slider: half-frame steps, up to 10 frames. With this on, low latency's 1-frame limit doesn't apply.", 0.38f, m_muted,
             { SIDE + 14.f, 22.f }, { 0.f, 0.5f })->limitLabelWidth(W - SIDE - 28.f, 0.38f, 0.2f);
         refreshModes();
-    }
-
-    void pageTools() {
-        heading("Tools", "What you see while playing, plus stats and the log.");
-        float top = pageTop() - 40.f;
-        card(top + 12.f, 3 * ROW + 4.f);
-        optionGrid(TOOLS, std::size(TOOLS), top);
-        float y = top - 3 * ROW - 14.f;
-        float bw = (W - SIDE - 46.f) / 3.f;
-        float x0 = SIDE + 20.f + bw / 2.f;
-        button(m_pageMenu, "Stats", menu_selector(BufferMenu::onStats), { x0, y }, bw);
-        button(m_pageMenu, "Console", menu_selector(BufferMenu::onConsole), { x0 + bw + 6.f, y }, bw);  // phones have no F9
-        button(m_pageMenu, "Copy log", menu_selector(BufferMenu::onCopyLog), { x0 + 2.f * (bw + 6.f), y }, bw);
-        y -= 24.f;
-        float bw2 = (W - SIDE - 40.f) / 2.f;
-        float x2 = SIDE + 20.f + bw2 / 2.f;
-        button(m_pageMenu, "Forget this level", menu_selector(BufferMenu::onForget), { x2, y }, bw2);
-        button(m_pageMenu, "All settings", menu_selector(BufferMenu::onAllSettings), { x2 + bw2 + 6.f, y }, bw2);
     }
 
     void rebuildPage() {
@@ -5322,6 +5818,7 @@ private:
         }
         m_stage = m_status = m_tpsLabel = nullptr;
         m_perModeSwitch = nullptr;
+        m_memLabel = m_budgetLabel = nullptr;
         m_modeValues.fill(nullptr);
         m_sliders.clear();
         m_dragSlider = -1;
@@ -5337,13 +5834,16 @@ private:
         m_page->addChild(m_pageMenu, 5);
 
         switch (s_tab) {
-            case 1:
-                pageOptions("Prediction", "What the hidden ghost predicts before your click is let through.", PREDICTION, std::size(PREDICTION));
-                break;
-            case 2: pageOptions("Modes", "Per game mode helpers and latency.", MODES, std::size(MODES)); break;
-            case 3: pageCustom(); break;
-            case 4: pageTools(); break;
-            default: pageBuffer(); break;
+            case 1: pagePrediction(); break;
+            case 2: pageGameModes(); break;
+            case 3: pageAutomation(); break;
+            case 4: pageMemory(); break;
+            case 5: pageSections(); break;
+            case 6: pagePerformance(); break;
+            case 7: pageVisuals(); break;
+            case 8: pageTools(); break;
+            case 9: pageAbout(); break;
+            default: pageOverview(); break;
         }
         buildTabs();
         handleTouchPriority(this);
@@ -5360,9 +5860,17 @@ private:
         }
         if (m_status) {
             float dt = buf.tickLength > 0.001f ? buf.tickLength : TICK;
-            m_status->setString(fmt::format("physics {:.0f}/s   |   CBF {}   |   memory {} spots", 60.f / dt,
-                Loader::get()->isModLoaded("syzzi.click_between_frames") ? "on" : "off", memorySpots()).c_str());
+            m_status->setString(fmt::format("physics {:.0f}/s   |   Click Between Frames {}", 60.f / dt,
+                Loader::get()->isModLoaded("syzzi.click_between_frames") ? "on" : "off").c_str());
+            m_status->limitLabelWidth(W - SIDE - 28.f, 0.42f, 0.15f);
         }
+        if (m_memLabel) {
+            m_memLabel->setString(fmt::format("{} remembered spots on this level", memorySpots()).c_str());
+        }
+        if (m_budgetLabel) {
+            m_budgetLabel->setString(fmt::format("{:g}", Mod::get()->getSettingValue<double>("sim-budget-ms")).c_str());
+        }
+        refreshInfo();
         for (size_t i = 0; i < m_switches.size(); ++i) {
             bool on = optionValue(*m_options[i]);
             drawSwitch(m_switches[i], on);
@@ -5376,12 +5884,11 @@ private:
         d->clear();
         float t = static_cast<float>(buf.modeTicks[sl.mode]) / MODE_TICKS_MAX;
         float kx = sl.x0 + (sl.x1 - sl.x0) * t;
-        roundRect(d, { sl.x0, sl.y - 2.f, sl.x1 - sl.x0, 4.f }, 2.f, col({ 255, 255, 255 }, 0.12f));
+        roundRect(d, { sl.x0, sl.y - 2.f, sl.x1 - sl.x0, 4.f }, 2.f, col(m_t.line, 1.f));
         if (kx - sl.x0 > 1.f) {
-            roundRect(d, { sl.x0, sl.y - 2.f, kx - sl.x0, 4.f }, 2.f, col(buf.perMode ? m_t.main : m_muted, buf.perMode ? 1.f : 0.6f));
+            roundRect(d, { sl.x0, sl.y - 2.f, kx - sl.x0, 4.f }, 2.f, col(buf.perMode ? m_t.accent : m_muted, 1.f));
         }
-        circle(d, { kx, sl.y }, 7.5f, col(buf.perMode ? m_cyan : m_muted, 0.16f), 24);
-        circle(d, { kx, sl.y }, 5.f, col({ 255, 255, 255 }, buf.perMode ? 1.f : 0.75f), 24);
+        circle(d, { kx, sl.y }, 5.5f, col({ 255, 255, 255 }, 1.f), 24, 0.8f, col(buf.perMode ? m_t.accent : m_t.line, 1.f));
     }
 
     // a touch on a slider sets its mode's frames (snapped to half frames)
@@ -5401,7 +5908,7 @@ private:
         for (int i = 0; i < 8; ++i) {
             if (m_modeValues[i]) {
                 m_modeValues[i]->setString(fmt::format("{:g}f", buf.modeTicks[i] * TICK).c_str());
-                m_modeValues[i]->setColor(buf.perMode ? m_cyan : m_muted);
+                m_modeValues[i]->setColor(buf.perMode ? m_hi : m_muted);
             }
         }
         if (m_perModeSwitch) {
@@ -5409,26 +5916,13 @@ private:
         }
     }
 
-    // ---------- motion: shooting stars ----------
-
-    CCNode* m_sky = nullptr;
+    // ---------- status panel refresh ----------
 
     void update(float dt) override {
-        m_shootTimer -= dt;
-        if (m_shootTimer <= 0.f && m_sky) {
-            m_shootTimer = 3.5f + static_cast<float>(std::rand() % 400) / 100.f;
-            auto* streak = CCLayerGradient::create({ 255, 255, 255, 0 }, { 255, 255, 255, 220 }, { 1.f, 0.f });
-            streak->setContentSize({ 34.f, 1.2f });
-            streak->ignoreAnchorPointForPosition(false);
-            streak->setAnchorPoint({ 1.f, 0.5f });
-            float sx = 60.f + static_cast<float>(std::rand() % static_cast<int>(W - 60.f));
-            streak->setPosition({ sx, H + 10.f });
-            streak->setRotation(28.f);
-            m_sky->addChild(streak);
-            streak->runAction(CCSequence::create(
-                CCSpawn::create(CCMoveBy::create(0.9f, { -170.f, -90.f }), CCSequence::create(CCDelayTime::create(0.5f), CCFadeOut::create(0.4f), nullptr),
-                    nullptr),
-                CCRemoveSelf::create(), nullptr));
+        m_infoTimer -= dt;
+        if (m_infoTimer <= 0.f) {
+            m_infoTimer = 0.5f;
+            refreshInfo();
         }
     }
 
@@ -5447,7 +5941,7 @@ private:
             }
         }
         auto p = m_mainLayer->convertToNodeSpace(touch->getLocation());
-        if (p.x >= 0.f && p.x <= W - 34.f && p.y >= H - TITLE && p.y <= H) {
+        if (p.x >= 0.f && p.x <= WIN_W - 190.f && p.y >= H - TITLE && p.y <= H) {
             m_dragging = true;
             return true;
         }
@@ -5493,6 +5987,120 @@ private:
     void onTab(CCObject* sender) {
         s_tab = sender->getTag();
         rebuildPage();
+    }
+
+    void onSecToggle(CCObject* sender) {
+        int i = sender->getTag();
+        if (i >= 0 && i < static_cast<int>(sections.size())) {
+            sections[i].on = !sections[i].on;
+            sectionsDirty = true;
+            sectionBlockEnd = -1;
+            saveSections();
+            say("section {}-{}% {}", sections[i].from, sections[i].to, sections[i].on ? "selected" : "not selected");
+        }
+        rebuildPage();
+    }
+
+    void onSecDelete(CCObject* sender) {
+        int i = sender->getTag();
+        if (i >= 0 && i < static_cast<int>(sections.size())) {
+            sections.erase(sections.begin() + i);
+            sectionsDirty = true;
+            sectionBlockEnd = -1;
+            saveSections();
+        }
+        rebuildPage();
+    }
+
+    void onSecSplit(CCObject* sender) {
+        int n = sender->getTag();
+        sections.clear();
+        for (int i = 0; i < n; ++i) {
+            Section sec;
+            sec.from = i * 100 / n;
+            sec.to = (i + 1) * 100 / n;
+            sections.push_back(sec);
+        }
+        s_secPage = 0;
+        sectionsDirty = true;
+        sectionBlockEnd = -1;
+        saveSections();
+        if (n > 0) {
+            say("level split into {} sections", n);
+        }
+        else {
+            say("sections cleared");
+        }
+        rebuildPage();
+    }
+
+    void onSecStep(CCObject* sender) {
+        int t = sender->getTag();
+        if (t == 0 || t == 1) {
+            s_newFrom = std::clamp(s_newFrom + (t == 1 ? 5 : -5), 0, 95);
+        }
+        else {
+            s_newTo = std::clamp(s_newTo + (t == 3 ? 5 : -5), 5, 100);
+        }
+        if (s_newTo <= s_newFrom) {
+            s_newTo = std::min(100, s_newFrom + 5);
+        }
+        rebuildPage();
+    }
+
+    void onSecAdd(CCObject*) {
+        Section sec;
+        sec.from = s_newFrom;
+        sec.to = std::max(s_newTo, s_newFrom + 1);
+        sec.on = true;
+        sections.push_back(sec);
+        std::sort(sections.begin(), sections.end(), [](Section const& a, Section const& b) { return a.from != b.from ? a.from < b.from : a.to < b.to; });
+        sectionsDirty = true;
+        saveSections();
+        say("section {}-{}% added", sec.from, sec.to);
+        rebuildPage();
+    }
+
+    void onSecPage(CCObject* sender) {
+        s_secPage += sender->getTag();
+        rebuildPage();
+    }
+
+    void onModeSub(CCObject* sender) {
+        s_modeSub = sender->getTag();
+        rebuildPage();
+    }
+
+    void onBudget(CCObject* sender) {
+        double v = Mod::get()->getSettingValue<double>("sim-budget-ms");
+        v = std::clamp(v + sender->getTag() * 1.0, 1.0, 30.0);
+        Mod::get()->setSettingValue<double>("sim-budget-ms", v);
+        readSettings();
+        refresh();
+    }
+
+    void onTheme(CCObject*) {
+        auto cur = Mod::get()->getSettingValue<std::string>("menu-theme");
+        size_t idx = 0;
+        for (size_t i = 0; i < std::size(THEMES); ++i) {
+            if (cur == THEMES[i]) {
+                idx = i;
+            }
+        }
+        Mod::get()->setSettingValue<std::string>("menu-theme", THEMES[(idx + 1) % std::size(THEMES)]);
+        say("menu theme: {}", THEMES[(idx + 1) % std::size(THEMES)]);
+        applyTheme();
+        if (m_chrome) {
+            m_chrome->removeFromParent();
+            m_chrome = nullptr;
+        }
+        m_infoBuffer = nullptr;
+        buildFrame();
+        rebuildPage();
+    }
+
+    void onAboutLink(CCObject*) {
+        geode::utils::web::openLinkInBrowser(std::string(ABOUT_URL));
     }
 
     void onToggle(CCObject* sender) {
@@ -5607,6 +6215,7 @@ private:
         memory.clear();
         pending.active = false;
         memoryDirty = true;
+        forgetSections();
         saveMemory();
         refreshHeatmap();
         say("memory for this level cleared");
@@ -5615,7 +6224,7 @@ private:
 
 protected:
     bool init() {
-        if (!Popup::init(W, H, "GJ_square04.png")) {
+        if (!Popup::init(WIN_W, H, "GJ_square04.png")) {
             return false;
         }
         m_bgSprite->setVisible(false);
@@ -5624,6 +6233,15 @@ protected:
             m_closeBtn->setEnabled(false);
         }
         this->setOpacity(90);
+        // responsive: shrink the window to fit small screens (never enlarge it)
+        auto win = CCDirector::get()->getWinSize();
+        float fit = std::min({ 1.f, (win.width - 16.f) / WIN_W, (win.height - 12.f) / H });
+        if (fit < 1.f) {
+            auto centre = m_mainLayer->convertToWorldSpace({ WIN_W / 2.f, H / 2.f });
+            m_mainLayer->setScale(fit);
+            auto after = m_mainLayer->convertToWorldSpace({ WIN_W / 2.f, H / 2.f });
+            m_mainLayer->setPosition(m_mainLayer->getPosition() + (centre - after));
+        }
         if (s_moved) {
             m_mainLayer->setPosition(s_pos);
         }
@@ -5663,7 +6281,7 @@ public:
     }
 };
 
-// v2.75.1: the level complete screen no longer shows "Click Before Frames was on" or the
+// v2.75.1: the level complete screen no longer shows "Aliou's Buffer was on" or the
 // saves count in the top right corner; the attempt is still finished here.
 class $modify(BufEndLevelLayer, EndLevelLayer) {
     void customSetup() {
@@ -5676,41 +6294,30 @@ class $modify(BufEndLevelLayer, EndLevelLayer) {
 
 // v2.94: the pause menu has a button for the menu again (v2.92 had dropped it, so on phones,
 // with no menu key, there was no way to open it inside a level)
-// v2.99.4: the pause menu button is added by one function, from two places. On iOS the game
-// builds the pause menu with its setup inlined, so the customSetup hook alone never ran there;
-// PlayLayer::pauseGame (below) adds it after the pause menu is shown. Never added twice.
-static void addPauseButton(CCNode* pause) {
-    if (!pause || pause->getChildByID("click-before-frames-menu"_spr)) {
-        return;
-    }
-    auto* top = CCSprite::create("heart.png"_spr);
-    if (!top) {
-        return;
-    }
-    top->setScale(0.55f);
-    auto* sprite = CircleButtonSprite::create(top, CircleBaseColor::DarkPurple, CircleBaseSize::Medium);
-    auto* button = CCMenuItemExt::createSpriteExtra(sprite, [](CCMenuItemSpriteExtra*) {
-        BufferMenu::open();
-    });
-    button->setID("click-before-frames-button"_spr);
-    auto* menu = CCMenu::create();
-    menu->addChild(button);
-    auto win = CCDirector::get()->getWinSize();
-    menu->setPosition({ win.width - 40.f, 40.f });
-    menu->setID("click-before-frames-menu"_spr);
-    pause->addChild(menu, 10);
-}
-
 class $modify(BufPauseLayer, PauseLayer) {
     void customSetup() {
         PauseLayer::customSetup();
-        addPauseButton(this);
+        auto* top = CCSprite::create("alious-buffer-icon.png"_spr);
+        top->setScale(24.f / top->getContentSize().height);
+        auto* sprite = CircleButtonSprite::create(top, CircleBaseColor::Blue, CircleBaseSize::Medium);
+        auto* button = CCMenuItemSpriteExtra::create(sprite, this, menu_selector(BufPauseLayer::onBufferMenu));
+        button->setID("alious-buffer-button"_spr);
+        auto* menu = CCMenu::create();
+        menu->addChild(button);
+        auto win = CCDirector::get()->getWinSize();
+        menu->setPosition({ win.width - 40.f, 40.f });
+        menu->setID("alious-buffer-menu"_spr);
+        this->addChild(menu, 10);
+    }
+
+    void onBufferMenu(CCObject*) {
+        BufferMenu::open();
     }
 };
 
 // v2.99.1: startup checkpoints in the Geode log (each written once), to find where a phone
 // that crashes on start stops
-#define CBF_STEP(name)                                  \
+#define AB_STEP(name)                                  \
     do {                                                \
         static bool cbfStepDone = false;                \
         if (!cbfStepDone) {                             \
@@ -5720,7 +6327,7 @@ class $modify(BufPauseLayer, PauseLayer) {
     } while (false)
 
 $on_mod(Loaded) {
-    CBF_STEP("loaded: reading settings");
+    AB_STEP("loaded: reading settings");
     buf.console = Mod::get()->getSettingValue<bool>("debug-console");
     buf.showPath = Mod::get()->getSettingValue<bool>("show-path");
     recoverGlobals();
@@ -5736,16 +6343,16 @@ $on_mod(Loaded) {
         Mod::get()->setSettingValue<bool>("per-level-settings", false);
         Mod::get()->setSavedValue("per-level-v262", true);
     }
-    CBF_STEP("loaded: settings read, applying stage");
+    AB_STEP("loaded: settings read, applying stage");
     readSettings();
     applyStage();
-    CBF_STEP("loaded: stage applied");
+    AB_STEP("loaded: stage applied");
 #ifdef GEODE_IS_WINDOWS
     if (buf.console) {
         AllocConsole();
         FILE* out = nullptr;
         freopen_s(&out, "CONOUT$", "w", stdout);
-        SetConsoleTitleA("Click Before Frames - Live Console");
+        SetConsoleTitleA("Aliou's Buffer - Live Console");
     }
 #endif
     if (Loader::get()->isModLoaded("syzzi.click_between_frames")) {
@@ -5754,7 +6361,7 @@ $on_mod(Loaded) {
     if (Loader::get()->isModLoaded("square3ang.cbfextrapolate")) {
         say("CBF Extrapolate detected: visual only, predictions unaffected");
     }
-    say("v2.99.5 loaded. Stage key cycles: 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom -> off");
+    say("v2.99.1 loaded. Stage key cycles: 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom -> off");
 }
 
 class $modify(BufPlayLayer, PlayLayer) {
@@ -5877,7 +6484,7 @@ class $modify(BufPlayLayer, PlayLayer) {
             buf.panel->addChild(frame);
         }
 
-        auto* title = CCLabelBMFont::create("Click Before Frames", "goldFont.fnt");
+        auto* title = CCLabelBMFont::create("Aliou's Buffer", "goldFont.fnt");
         title->setScale(0.55f);
         title->setAnchorPoint({ 0.f, 0.5f });
         title->setPosition({ 10.f, H - 14.f });
@@ -5996,6 +6603,7 @@ class $modify(BufPlayLayer, PlayLayer) {
     }
 
     void resetLevel() {
+        sectionBlockEnd = -1;  // v3.1
         triggerChecks.clear();  // v2.84
         attemptStartTick = tickCount;  // v2.84.3
         benchFinish();
@@ -6028,18 +6636,6 @@ class $modify(BufPlayLayer, PlayLayer) {
         // pressed for you as the attempt started (the cube jumped by itself until you clicked).
         // Now the mod only presses when you press.
         syncHeld(this);
-    }
-
-    // v2.99.4: see addPauseButton (iOS never ran the PauseLayer::customSetup hook)
-    void pauseGame(bool unfocused) {
-        PlayLayer::pauseGame(unfocused);
-        if (auto* scene = CCDirector::get()->getRunningScene()) {
-            for (auto* child : CCArrayExt<CCNode*>(scene->getChildren())) {
-                if (typeinfo_cast<PauseLayer*>(child)) {
-                    addPauseButton(child);
-                }
-            }
-        }
     }
 
     void togglePracticeMode(bool practiceMode) {
@@ -6168,16 +6764,12 @@ class $modify(BufRingObject, RingObject) {
     }
 
     // v2.78.3: the activation call itself too (orbs and dash orbs still animated early)
-    // v2.99.3: not on iOS/macOS. There it is a 12-byte stub that jumps into powerOnObject
-    // (hooked above anyway), too short for an arm64 hook, which overwrote powerOnObject's start.
-#if !defined(GEODE_IS_IOS) && !defined(GEODE_IS_MACOS)
     void triggerActivated(float xPosition) {
         if (buf.simulating) {
             return;
         }
         RingObject::triggerActivated(xPosition);
     }
-#endif
 };
 
 class $modify(BufPlayerObject, PlayerObject) {
@@ -6221,6 +6813,7 @@ class $modify(BufPlayerObject, PlayerObject) {
             }
             driftStep(this);
             memoryTick();
+            sectionTick(layer);
             if (buf.enabled) {
                 deliverPending(layer, this);
                 livePath(layer, this);
@@ -6288,10 +6881,6 @@ class $modify(BufPlayerObject, PlayerObject) {
         if (!ghostEffect()) PlayerObject::playBumpEffect(objectType, object);
     }
 
-    // v2.99.5: these 8 only hide ghost visuals (spawn flash, trails, spider run, rotations).
-    // Together they crash the iOS launcher without JIT on the loading screen (Geode's
-    // pre-patched helper), so iOS leaves them out; the buffer doesn't depend on them.
-#ifndef GEODE_IS_IOS
     void playSpawnEffect() {
         if (!ghostEffect()) PlayerObject::playSpawnEffect();
     }
@@ -6323,7 +6912,6 @@ class $modify(BufPlayerObject, PlayerObject) {
     void runNormalRotation(bool notNormalMode, float speed) {
         if (!ghostEffect()) PlayerObject::runNormalRotation(notNormalMode, speed);
     }
-#endif
 
     void toggleGhostEffect(GhostType type) {
         if (!ghostEffect()) PlayerObject::toggleGhostEffect(type);
@@ -6412,6 +7000,7 @@ namespace {
                 break;
             case 5:
                 memory.clear();
+                forgetSections();
                 pending.active = false;
                 memoryDirty = true;
                 saveMemory();
@@ -6434,7 +7023,7 @@ namespace {
 
     // v2.81 update check: once per game start, reads the version in the public repo's mod.json
     // (in the background) and says so on the main menu if a newer one is out.
-    constexpr char const* REPO_URL = "https://github.com/raresdalas1009/-predictive-input-buffer";
+    constexpr char const* REPO_URL = "https://github.com/Zeptoreal1/-predictive-input-buffer";
     std::string latestVersion;
     bool updateChecked = false;
     bool updateShown = false;
@@ -6443,7 +7032,7 @@ namespace {
     // puts it in place of this one; the new version loads on the next start. The file is only
     // installed if it really is this mod and a newer version than the one running.
     constexpr bool INSTALL_UPDATES = true;
-    constexpr char const* RELEASE_API = "https://api.github.com/repos/raresdalas1009/-predictive-input-buffer/releases/latest";
+    constexpr char const* RELEASE_API = "https://api.github.com/repos/Zeptoreal1/-predictive-input-buffer/releases/latest";
     bool updating = false;
     std::string latestAssetUrl;  // v2.98: the .geode of the release the popup is about
 
@@ -6534,7 +7123,7 @@ namespace {
             auto data = std::move(file).data();
             auto version = packageVersion(data);
             if (version.isErr()) {
-                return fail("The downloaded file isn't a valid Click Before Frames build.");
+                return fail("The downloaded file isn't a valid Aliou's Buffer build.");
             }
             auto newVersion = version.unwrap();
             if (!(newVersion > Mod::get()->getVersion())) {
@@ -6556,7 +7145,7 @@ namespace {
         }
         updateShown = true;
         say("update: {} is out (you have {})", latestVersion, Mod::get()->getVersion().toVString());
-        createQuickPopup("Click Before Frames", fmt::format("<cp>{}</c> is out! You have {}.", latestVersion,
+        createQuickPopup("Aliou's Buffer", fmt::format("<cp>{}</c> is out! You have {}.", latestVersion,
             Mod::get()->getVersion().toVString()), "Later", INSTALL_UPDATES ? "Update now" : "Open page", [](FLAlertLayer*, bool yes) {
                 if (!yes) {
                     return;
@@ -6630,39 +7219,37 @@ namespace {
 }
 
 $on_mod(Loaded) {
-    CBF_STEP("loaded: keybinds");
+    AB_STEP("loaded: keybinds");
     setupKeybinds();
-    CBF_STEP("loaded: keybinds done");
-    // v2.99.3: shows in the log whether the game reaches its first frame (iOS start crash hunt)
-    queueInMainThread([] { CBF_STEP("first frame"); });
+    AB_STEP("loaded: keybinds done");
 }
 
-// the main menu: a heart button that opens the menu (with the other buttons at the bottom),
+// the main menu: a logo button that opens the menu (with the other buttons at the bottom),
 // and the update check
 class $modify(BufMenuLayer, MenuLayer) {
     bool init() {
-        CBF_STEP("main menu: game's menu");
+        AB_STEP("main menu: game's menu");
         if (!MenuLayer::init()) {
             return false;
         }
-        CBF_STEP("main menu: heart button");
-        auto* top = CCSprite::create("heart.png"_spr);
+        AB_STEP("main menu: logo button");
+        auto* top = CCSprite::create("alious-buffer-icon.png"_spr);
         if (!top) {
-            geode::log::error("heart.png missing, no menu button");
+            geode::log::error("alious-buffer-icon.png missing, no menu button");
             return true;
         }
-        top->setScale(0.55f);
+        top->setScale(24.f / top->getContentSize().height);
         top->setColor({ 255, 255, 255 });
-        auto* sprite = CircleButtonSprite::create(top, CircleBaseColor::DarkPurple, CircleBaseSize::Medium);
+        auto* sprite = CircleButtonSprite::create(top, CircleBaseColor::Blue, CircleBaseSize::Medium);
         auto* item = CCMenuItemSpriteExtra::create(sprite, this, menu_selector(BufMenuLayer::onBufferMenu));
-        item->setID("click-before-frames-button"_spr);
+        item->setID("alious-buffer-button"_spr);
         if (auto* bottom = this->getChildByID("bottom-menu")) {
             bottom->addChild(item);
             bottom->updateLayout();
         }
-        CBF_STEP("main menu: update check");
+        AB_STEP("main menu: update check");
         checkForUpdate();
-        CBF_STEP("main menu: done");
+        AB_STEP("main menu: done");
         if (!latestVersion.empty() && !updateShown) {
             queueInMainThread([] { showUpdatePopup(); });
         }
