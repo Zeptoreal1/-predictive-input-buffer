@@ -14,7 +14,8 @@ A predictive input-buffering [Geode](https://geode-sdk.org) mod for Geometry Das
 - Percentage-based section learning: split a level into sections (0-25%, 25-50%, ...), pick several, and practise them. In practice mode the mod learns timings only inside the picked sections, saves them per level, and reuses them in later attempts and full runs. It never replays inputs; every click stays yours.
 - Practice-only auto-click and auto-release (wave, robot, dash)
 - Training mode (hints only), performance mode, low-latency mode, no-hitch searches
-- Live path view, drift check, death log, in-game console and log export
+- Live path view with **ghost comparison**: your original input trajectory (dashed amber) and the buffered trajectory (solid cyan) shown at the same time, joined at matching moments, with a verdict ("yours: crash, buffered: safe, held 2f")
+- Drift check, death log, in-game console and log export
 - Update checker (GitHub releases)
 
 ## Screenshots
@@ -140,3 +141,4 @@ Developer: Aliou. Aliou's Buffer is a fork of the predictive input buffer mod or
 - v3.0.0: rebranded as Aliou's Buffer: new mod ID (aliou.aliousbuffer), logo and menu icon, new update source. New dashboard menu: nine sections, icon sidebar, live status panel, Aliou Blue theme (default), fits small screens. Prediction logic unchanged.
 - v3.1.0: percentage-based section learning: split a level into percentage sections, pick several, and practise them (Sections page). In practice mode, level memory only learns inside the picked sections and per-section saves/deaths are counted; learned timings are saved per level and reused in later attempts and full runs. Optional restart at section end (practice only). New settings: section-learning, section-loop.
 - v3.2.0: menu revamp: flat, clean look instead of the space/neon theme. Themes: AMOLED (pure black), Light (white, dark text) and Graphite. Optional custom background picture, Poppins sans-serif font, repeated options removed.
+- v3.3.0: ghost comparison: with the path view on, both trajectories are drawn at once, your input as pressed (dashed amber) and the buffered input (solid cyan), joined at matching moments, with a one-line verdict by the player. New setting: ghost-compare (on by default, only visible while the path view is on).
