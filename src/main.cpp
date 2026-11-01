@@ -304,6 +304,8 @@ namespace {
         std::vector<CCPoint>* recordPath = nullptr;  // v2.4: ghost1 positions of the current run
         bool showPath = false;       // v2.11: draw the predicted path (F10)
         CCDrawNode* pathNode = nullptr;  // v2.11: owned by the level's object layer
+        CCLabelBMFont* ghostLabel = nullptr;  // v3.3: one-line verdict of the ghost comparison
+        bool ghostCompare = true;        // v3.3: show your input and the buffered input side by side
         int pathHoldUntil = 0;       // v2.65: live path waits while a click's path is on screen
 
         std::unordered_set<GameObject*> simUsed;
@@ -603,6 +605,7 @@ namespace {
         buf.orbAlignGround = mod->getSettingValue<bool>("orb-align-ground");
         buf.fullState = mod->getSettingValue<bool>("full-ghost-state");
         buf.learn = mod->getSettingValue<bool>("level-memory");
+        buf.ghostCompare = mod->getSettingValue<bool>("ghost-compare");
         buf.sectionLearn = mod->getSettingValue<bool>("section-learning");
         buf.sectionLoop = mod->getSettingValue<bool>("section-loop");
         buf.robotSmart = mod->getSettingValue<bool>("robot-smart");
@@ -841,6 +844,7 @@ namespace {
         buf.panelTitle = nullptr;
         buf.panelLines.clear();
         buf.pathNode = nullptr;
+        buf.ghostLabel = nullptr;
         buf.autoTag = nullptr;
         buf.watermark = nullptr;
         buf.simulating = false;
@@ -2979,6 +2983,71 @@ namespace {
 
     // v2.11 path view (F10): red = what your input would have done right now, green = what
     // the game actually gets. A dot marks where a delayed input fires, a red dot a crash.
+    // every place that wipes the path also hides the ghost comparison's label
+    void clearPathNode() {
+        if (buf.pathNode) {
+            buf.pathNode->clear();
+        }
+        if (buf.ghostLabel) {
+            buf.ghostLabel->setVisible(false);
+        }
+    }
+
+    // v3.3 ghost comparison: your input as you pressed it (dashed, amber) and the input the
+    // game gets (solid, cyan) at the same time. Thin white lines join the same moment on both
+    // paths; a white dot is where the delayed input fires, a red dot a crash. Returns the
+    // largest gap between the two paths, in level units.
+    float drawGhostComparison(std::vector<CCPoint> const& original, bool originalDied, std::vector<CCPoint> const& buffered, bool bufferedDied, int delay) {
+        ccColor4F amber { 1.f, 0.75f, 0.2f, 0.85f };
+        ccColor4F cyan { 0.25f, 0.9f, 1.f, 0.95f };
+        for (size_t i = 1; i < original.size(); ++i) {
+            if ((i / 3) % 2 == 0) {  // dashed
+                buf.pathNode->drawSegment(original[i - 1], original[i], 0.9f, amber);
+            }
+        }
+        for (size_t i = 1; i < buffered.size(); ++i) {
+            buf.pathNode->drawSegment(buffered[i - 1], buffered[i], 1.5f, cyan);
+        }
+        float gap = 0.f;
+        size_t common = std::min(original.size(), buffered.size());
+        for (size_t i = 0; i < common; ++i) {
+            float d = std::hypot(original[i].x - buffered[i].x, original[i].y - buffered[i].y);
+            gap = std::max(gap, d);
+            if (i % 12 == 11 && d > 1.f) {
+                buf.pathNode->drawSegment(original[i], buffered[i], 0.4f, { 1.f, 1.f, 1.f, 0.3f });
+            }
+        }
+        if (!original.empty()) {
+            buf.pathNode->drawDot(original.back(), 2.5f, amber);
+        }
+        if (!buffered.empty()) {
+            buf.pathNode->drawDot(buffered.back(), 2.5f, cyan);
+        }
+        if (delay > 0 && delay <= static_cast<int>(buffered.size())) {
+            buf.pathNode->drawDot(buffered[delay - 1], 3.f, { 1.f, 1.f, 1.f, 0.9f });
+        }
+        if (originalDied && !original.empty()) {
+            buf.pathNode->drawDot(original.back(), 4.f, { 1.f, 0.2f, 0.2f, 1.f });
+        }
+        if (bufferedDied && !buffered.empty()) {
+            buf.pathNode->drawDot(buffered.back(), 4.f, { 1.f, 0.2f, 0.2f, 1.f });
+        }
+        return gap;
+    }
+
+    void showGhostLabel(PlayerObject* p1, bool originalDied, bool bufferedDied, int delay, float gap) {
+        if (!buf.ghostLabel || !p1) {
+            return;
+        }
+        std::string text = fmt::format("yours: {}   buffered: {}   {}",
+            originalDied ? "crash" : "safe", bufferedDied ? "crash" : "safe",
+            delay > 0 ? fmt::format("held {:g}f, gap {:.1f} blocks", delay * TICK, gap / 30.f) : std::string("no delay needed"));
+        buf.ghostLabel->setString(text.c_str());
+        buf.ghostLabel->setColor(bufferedDied ? ccColor3B { 255, 110, 110 } : ccColor3B { 255, 255, 255 });
+        buf.ghostLabel->setPosition(p1->getPosition() + CCPoint { 0.f, 42.f });
+        buf.ghostLabel->setVisible(true);
+    }
+
     void drawPath(std::vector<CCPoint> const& path, int delay, ccColor4F color, bool died) {
         for (size_t i = 1; i < path.size(); ++i) {
             buf.pathNode->drawSegment(path[i - 1], path[i], 1.2f, color);
@@ -2995,17 +3064,32 @@ namespace {
         if (!buf.showPath || !buf.pathNode) {
             return;
         }
-        buf.pathNode->clear();
+        clearPathNode();
         buf.pathHoldUntil = tickCount + st(45);
         bool nowDied = false;
         auto now = recordRun(layer, p1, p2, dual, 0, down, horizon, releaseAfter, &nowDied);
-        ccColor4F red { 1.f, 0.3f, 0.3f, 0.85f };
-        ccColor4F green { 0.3f, 1.f, 0.5f, 0.9f };
-        drawPath(now, 0, chosen > 0 ? red : (nowDied ? red : green), nowDied);
-        if (chosen > 0) {
-            bool died = false;
-            auto delayed = recordRun(layer, p1, p2, dual, chosen, down, horizon, releaseAfter, &died);
-            drawPath(delayed, chosen, green, died);
+        if (buf.ghostCompare) {
+            // v3.3: both paths, every time (the same run twice when no delay was needed)
+            bool bufferedDied = nowDied;
+            std::vector<CCPoint> buffered;
+            if (chosen > 0) {
+                buffered = recordRun(layer, p1, p2, dual, chosen, down, horizon, releaseAfter, &bufferedDied);
+            }
+            else {
+                buffered = now;
+            }
+            float gap = drawGhostComparison(now, nowDied, buffered, bufferedDied, chosen);
+            showGhostLabel(p1, nowDied, bufferedDied, chosen, gap);
+        }
+        else {
+            ccColor4F red { 1.f, 0.3f, 0.3f, 0.85f };
+            ccColor4F green { 0.3f, 1.f, 0.5f, 0.9f };
+            drawPath(now, 0, chosen > 0 ? red : (nowDied ? red : green), nowDied);
+            if (chosen > 0) {
+                bool died = false;
+                auto delayed = recordRun(layer, p1, p2, dual, chosen, down, horizon, releaseAfter, &died);
+                drawPath(delayed, chosen, green, died);
+            }
         }
         // v2.13: spots on this path where the memory has seen you die a lot.
         if (buf.learn && !memory.empty()) {
@@ -3705,7 +3789,7 @@ namespace {
         bool down = !buf.appliedInput;
         int releaseAfter = down && !wave && !ship ? holdEstimate() : -1;
 
-        buf.pathNode->clear();
+        clearPathNode();
         bool idleDied = false;
         buf.skipPress = true;
         auto idle = recordRun(layer, p1, p2, dual, 0, down, horizon, -1, &idleDied);
@@ -4268,7 +4352,7 @@ namespace {
             // v2.47: path view marks inputs that skipped prediction (gray dot on you), so a
             // missing path isn't mistaken for a broken mod
             if (buf.showPath && buf.pathNode) {
-                buf.pathNode->clear();
+                clearPathNode();
                 buf.pathNode->drawDot(p1->getPosition(), 4.f, { 0.6f, 0.6f, 0.65f, 0.9f });
             }
             // v2.63.2: waiting inputs are played one per tick, in order, starting next tick, with
@@ -4996,6 +5080,7 @@ class BufferMenu : public geode::Popup {
     };
     static constexpr Option VISUALS[] = {
         { "show-path", "Path view at start" },
+        { "ghost-compare", "Ghost comparison" },
         { "death-heatmap", "Death heatmap" },
         { "save-ding", "Ding on save" },
     };
@@ -5530,7 +5615,7 @@ private:
             act.push_back({ "Moving objects (exp.)", amber });
         }
         if (buf.showPath) {
-            act.push_back({ "Path view", m_text });
+            act.push_back({ on("ghost-compare") ? "Ghost comparison" : "Path view", m_text });
         }
         if (act.empty()) {
             act.push_back({ "Nothing extra", m_muted });
@@ -5745,7 +5830,8 @@ private:
         label(m_page, "Background image", 0.5f, m_muted, { SIDE + 20.f, y }, { 0.f, 0.5f });
         button(m_pageMenu, "Choose", menu_selector(BufferMenu::onAllSettings), { W - 58.f, y }, 84.f, false, 0, 16.f);
         note("Pick a picture under Menu background in Settings. It is dimmed for readability.", y - 20.f, m_muted);
-        note("Path view: red = this input as pressed, green = what the game gets, dot = where it fires.", y - 33.f, m_muted);
+        note("Ghost comparison: dashed amber = your input as pressed, solid cyan = what the game gets.", y - 33.f, m_muted);
+        note("White dot = where a delayed input fires, red dot = crash. Shown with the path view (F10).", y - 46.f, m_muted);
     }
 
     void pageTools() {
@@ -6117,7 +6203,7 @@ private:
         else {
             buf.showPath = value;
             if (buf.pathNode) {
-                buf.pathNode->clear();
+                clearPathNode();
             }
         }
         say("{} {}", o.label, value ? "on" : "off");
@@ -6577,7 +6663,13 @@ class $modify(BufPlayLayer, PlayLayer) {
         buf.pathNode = CCDrawNode::create();
         // v2.48: above the level's shader effects when it has that layer; inside the shader
         // layer, dark or glow shaders could hide the path completely.
-        (m_aboveShaderObjectLayer ? m_aboveShaderObjectLayer : m_objectLayer)->addChild(buf.pathNode, 9999);
+        auto* pathParent = m_aboveShaderObjectLayer ? m_aboveShaderObjectLayer : m_objectLayer;
+        pathParent->addChild(buf.pathNode, 9999);
+        // v3.3 ghost comparison: a small plain-font verdict next to the player
+        buf.ghostLabel = CCLabelBMFont::create("", "chatFont.fnt");
+        buf.ghostLabel->setScale(0.55f);
+        buf.ghostLabel->setVisible(false);
+        pathParent->addChild(buf.ghostLabel, 9999);
 
         buf.realInput = false;
         buf.appliedInput = false;
@@ -6625,7 +6717,7 @@ class $modify(BufPlayLayer, PlayLayer) {
         forgetPress();
         refreshAutoTag();
         if (buf.pathNode) {
-            buf.pathNode->clear();
+            clearPathNode();
         }
         buf.autoReleased = false;
         buf.autoClicked = false;
@@ -6994,7 +7086,7 @@ namespace {
             case 4:
                 buf.showPath = !buf.showPath;
                 if (buf.pathNode) {
-                    buf.pathNode->clear();
+                    clearPathNode();
                 }
                 say("path view {}", buf.showPath ? "on" : "off");
                 break;
