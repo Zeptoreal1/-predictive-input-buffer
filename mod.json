@@ -6,11 +6,11 @@
 		"mac": "2.2081",
 		"ios": "2.2081"
 	},
-	"version": "v2.99.5",
-	"id": "basu.input-buffer",
-	"name": "Click Before Frames",
-	"developer": "BASU",
-	"description": "Trajectory-based input buffer: delays early clicks/releases by up to 8+ frames, with orb, pad and portal-aware prediction. github.com/raresdalas1009/-predictive-input-buffer",
+	"version": "v3.2.0",
+	"id": "aliou.aliousbuffer",
+	"name": "Aliou's Buffer",
+	"developer": "Aliou",
+	"description": "Predictive input buffer for Geometry Dash: delays early clicks and releases by a few frames using orb, pad and portal-aware trajectory prediction. Practice use only.",
 	"settings": {
 		"custom-ticks": {
 			"type": "int",
@@ -194,6 +194,18 @@
 			"name": "Level memory (learns from your runs)",
 			"description": "Remembers, per level and per spot, which delays worked, where saves ended in deaths and where you keep dying. Delays that worked before are tried first; spots where saves keep failing are left alone; orange dots in the path view mark spots where you die a lot. F11 forgets the current level.",
 			"default": true
+		},
+		"section-learning": {
+			"type": "bool",
+			"name": "Section learning (practice only)",
+			"description": "In practice mode, level memory only learns inside the sections you picked in the menu (Sections). What it learns is reused in every later attempt and in full runs. Nothing is replayed: every input stays yours.",
+			"default": false
+		},
+		"section-loop": {
+			"type": "bool",
+			"name": "Restart at section end (practice only)",
+			"description": "In practice mode, when you run past the end of the section you picked, the attempt restarts at your last checkpoint. Plant a checkpoint at the start of the section.",
+			"default": false
 		},
 		"auto-release-normal-runs": {
 			"type": "bool",
@@ -390,15 +402,32 @@
 		"menu-theme": {
 			"type": "string",
 			"name": "Menu theme",
-			"description": "Colours of the in-game menu.",
-			"default": "Purple",
+			"description": "Menu colours: AMOLED (pure black), Light (white with dark text) or Graphite. Changes at once from the Visuals page.",
+			"default": "AMOLED",
 			"one-of": [
-				"Purple",
-				"Pink",
-				"Blue",
-				"Green",
-				"Dark"
+				"AMOLED",
+				"Light",
+				"Graphite"
 			]
+		},
+		"menu-background": {
+			"type": "file",
+			"name": "Menu background",
+			"description": "An optional picture shown behind the menu (PNG or JPG). It is dimmed so text stays readable. Applies the next time the menu opens. Leave empty for a plain background.",
+			"default": "",
+			"control": {
+				"dialog": "open",
+				"filters": [
+					{
+						"files": [
+							"*.png",
+							"*.jpg",
+							"*.jpeg"
+						],
+						"description": "Images"
+					}
+				]
+			}
 		},
 		"bind-stage": {
 			"type": "keybind",
@@ -476,17 +505,17 @@
 			"resources/*.png"
 		],
 		"fonts": {
-			"orbitron": {
-				"path": "resources/fonts/Orbitron.ttf",
+			"sans": {
+				"path": "resources/fonts/Poppins-Regular.ttf",
 				"size": 64
 			},
-			"exo2": {
-				"path": "resources/fonts/Exo2.ttf",
+			"sans-bold": {
+				"path": "resources/fonts/Poppins-Bold.ttf",
 				"size": 64
 			}
 		}
 	},
 	"links": {
-		"source": "https://github.com/raresdalas1009/-predictive-input-buffer"
+		"source": "https://github.com/Zeptoreal1/-predictive-input-buffer"
 	}
 }

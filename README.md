@@ -1,17 +1,69 @@
-# Click Before Frames (Geode)
+<p align="center"><img src="logo.png" width="120" alt="Aliou's Buffer logo"></p>
 
-## Keys
-6 cycle stage | 7 menu | F8 copy the console log | F9 open/close the in-game console | F10 path view | F11 forget this level's memory
+# Aliou's Buffer
 
-Practice use only; do not use for verified or leaderboard runs.
+A predictive input-buffering [Geode](https://geode-sdk.org) mod for Geometry Dash. When you click or release a little too early, a hidden "ghost" player is simulated ahead; if it would crash, your input is held back by a few physics ticks so it lands safely. It understands orbs, pads, portals, moving objects and every game mode.
 
-## v2.4 options (mod settings)
-- Wave auto-release (practice only, off by default): lets go for you when holding would crash within the window and letting go survives.
-- Orbs: also try the other choice: if a prediction dies after touching an orb, it is retried with the opposite click/skip choice.
-- Don't buffer near moving objects (experimental, off by default): inputs are left untouched when the ghost's path hits recently moved spikes/blocks.
-- Drift check (debug): logs in the in-game console how far you strayed from the prediction after each input.
-- Wave (v2.7): cube-style. A crash you could still turn away from counts as safe; the smallest delay that clears the obstacle wins; inputs during a delay keep their rhythm. "Wave: old v4.6 logic" brings back the v4.6 rules. Platformer levels are never buffered.
-- Orb alignment (v2.6): a press made up to 4 frames before an orb is held back until you're inside the orb, so it hits.
+> **Practice use only.** Runs that use input assistance (buffering, auto-click, auto-release, non-240 TPS) are **not legitimate** and must never be submitted for verification or leaderboards. The mod shows an on-screen tag while it is active in normal runs.
+
+## Features
+- Trajectory prediction with orb, pad, portal and moving-object awareness
+- Buffered presses and releases for cube, ship, ball, UFO, wave, robot, spider and swing
+- Orb alignment and orb timing, plan-two-clicks-ahead, robust saves
+- Level memory, death heatmap, per-level settings
+- Percentage-based section learning: split a level into sections (0-25%, 25-50%, ...), pick several, and practise them. In practice mode the mod learns timings only inside the picked sections, saves them per level, and reuses them in later attempts and full runs. It never replays inputs; every click stays yours.
+- Practice-only auto-click and auto-release (wave, robot, dash)
+- Training mode (hints only), performance mode, low-latency mode, no-hitch searches
+- Live path view, drift check, death log, in-game console and log export
+- Update checker (GitHub releases)
+
+## Screenshots
+_Screenshots will be added here._
+
+## Installation
+1. Install Geode for Geometry Dash 2.2081.
+2. Download `aliou.aliousbuffer.geode` from the [latest release](https://github.com/Zeptoreal1/-predictive-input-buffer/releases/latest).
+3. Put it in the `geode/mods` folder (or install it from the Geode mods menu) and restart the game.
+
+## Keyboard shortcuts
+| Key | Action |
+|---|---|
+| 6 | Cycle stage |
+| 7 | Open the Aliou's Buffer menu (pause-menu button on mobile) |
+| F8 | Copy the console log |
+| F9 | Show / hide the in-game console |
+| F10 | Path view |
+| F11 | Forget this level's memory |
+
+All keys can be changed in the mod settings or Geode's keybinds.
+
+## Configuration
+Open the menu in a level (key 7 or the pause-menu button) or from the logo button on the main menu, or use the mod settings. The menu is a dashboard with a sidebar of ten sections (Overview, Prediction, Game Modes, Automation, Memory, Sections, Performance, Visuals, Tools, About) and a live status panel showing whether the buffer is on, the prediction mode, active features and performance. The **Menu theme** setting offers AMOLED (pure black, default), Light (white with dark text) and Graphite, and **Menu background** can show your own picture behind the menu. The menu uses the Poppins font. Settings marked experimental or practice-only say so in their descriptions.
+
+## Supported platforms
+Windows, macOS, Android and iOS (as configured in `mod.json` and the CI workflow). See "Build status" below for what has actually been tested.
+
+## Build
+```
+export GEODE_SDK=/path/to/geode
+cmake -B build && cmake --build build --config RelWithDebInfo
+```
+Requires the Geode SDK 5.11.2 and a C++23 compiler. CI builds all platforms via `.github/workflows/build.yml`.
+
+## Troubleshooting
+- No buffering: check the mod is enabled and, if "Practice mode only" is on, that you are in practice mode.
+- Clicks feel late: turn on Low latency mode, or lower the prediction budget.
+- FPS drops: turn on Performance mode.
+- Bad saves near moving parts: turn off "Predict move triggers" or "Predict moving objects", then use F8 and the death log to report it.
+- Startup crash: send the Geode log (it contains startup checkpoints).
+
+## Build status
+v3.1.0 (rebrand, dashboard menu, section learning) was written without a Geode SDK, so it has not been compiled or run in-game yet; the CI workflow is the first real build. Expect to fix small compile errors in the new menu code.
+
+## Credits and licence
+Developer: Aliou. Aliou's Buffer is a fork of the predictive input buffer mod originally published as "Click Before Frames" by BASU (https://github.com/raresdalas1009/-predictive-input-buffer). The prediction engine is inherited from that project. The upstream repository contains no licence file at the time of this fork; see NOTICE.md. Font: Poppins (SIL OFL, see `resources/fonts`).
+
+## Changelog
 - v2.8: the ghost copies the full player state (slopes, reverse, sideways, forces, dash), size portals are simulated and mirror portals no longer stop the prediction.
 - v2.10: wave tries 3 turn-away points, stops runs as soon as they are good enough (faster), and centers saves with a 1-tick safety margin. Console is see-through.
 - v2.12 robot: presses count as safe if some hold length survives; robot auto-release (practice only).
@@ -35,7 +87,7 @@ Practice use only; do not use for verified or leaderboard runs.
 - v2.43: more time at death spots - where you keep dying, react-only-safe inputs get the delay that pushes the crash furthest away.
 - v2.44: in-game menu (pause menu 'Buffer' button or F7): stage, main switches, status, all settings / copy log / forget level. Ship: own spam gap (feathering is buffered), max delay 4, on by default.
 - v2.45 ball: short flips count as landings, landings must last 8 ticks, spam guard for fast flipping; menu switch.
-- v2.46 watermark (always on, not configurable): 'Basu Input Buffer | stage' in the level while the buffer is on, and 'Basu Input Buffer was on' on the level complete screen if it was on during the attempt.
+- v2.46 watermark (always on, not configurable): 'Aliou's Buffer | stage' in the level while the buffer is on, and 'Aliou's Buffer was on' on the level complete screen if it was on during the attempt.
 - v2.49: ghost no longer touches collision blocks (could break collision triggers); spam guard sends waiting inputs instead of dropping them (lost clicks broke click/event triggers).
 - v2.50: cuter menu: pink theme, pulsing hearts, floating hearts and sparkles, your own icon in the corner; switches turn pink when on.
 - v2.51: cube jumps that bump a ceiling count as landings (buffer works under blocks); smart swing (flip-back scoring + spam guard); per-level settings; practice stats (per attempt + Stats button); training mode (hints only, no delays); death heatmap on the progress bar.
@@ -76,7 +128,7 @@ Practice use only; do not use for verified or leaderboard runs.
 - v2.86: fixed a crash when leaving a level and opening one again (v2.84/v2.85 could send a button to a level that was still loading); leaving a level now also forgets the button state.
 - v2.87: Android crash when leaving a level fixed: the hidden ghost players were deleted while the level was still being torn down; on Android they're now only let go of.
 - v2.88: dash orbs no longer flash before you reach them: effects a prediction ghost added to the real level (the dash start effect) are removed after each prediction.
-- v2.90: v2.89 reverted (the full "Click Before Frames" watermark is back, no progress bar end cap).
+- v2.90: v2.89 reverted (the full "Aliou's Buffer" watermark is back, no progress bar end cap).
 - v2.92 (merged from the other build): new menu: a draggable window with tabs (Buffer, Prediction, Modes, Custom, Tools) in a space theme (black sky full of twinkling stars, sparkles, shooting stars), Orbitron / Exo 2 fonts, and a heart button on the main menu to open it outside levels too. Custom tab: per-mode frames, a slider for each game mode (your own icons) to pick how many frames cube, ship, ball, UFO, wave, robot, spider and swing can be held back. Prediction: move / rotate / toggle / spawn triggers ahead of you are predicted (with easing, group-parent pivots and spawn delays) and a self-check turns it off on levels where it keeps being wrong; predictions go through teleport, dual and solo portals; plan two clicks ahead (a crash your next click would handle isn't blamed on this one); smarter robot (tries other hold lengths); no-hitch searches (a search out of time goes on next tick instead of giving up). Pads no longer animate before you reach them.
 - v2.93: auto update: the update popup's "Update now" downloads the .geode from the latest GitHub release, checks it's this mod and newer, and installs it (restart to use it).
 - v2.94: the pause menu has a button (purple heart, bottom right) for the menu again, so phones can open it inside a level.
@@ -85,7 +137,6 @@ Practice use only; do not use for verified or leaderboard runs.
 - v2.98: auto update fixed: the update popup now comes from the newest GitHub release (the same file 'Update now' installs), not from the code's version, which could be ahead of the release and made the install fail.
 - v2.99: iOS support. The iOS build needed the FMOD header forced into Geode's generated iOS bindings, arm64-only for iOS, and the menu's title shine no longer uses CCPlace (not available to mods on iOS).
 - v2.99.1: startup checkpoints in the Geode log (to find where some iPhones crash on start); the main menu button is skipped instead of crashing if its image is missing.
-- v2.99.2: iOS: the mod's file is now code-signed (ad-hoc), some iOS launchers refused to load it ("missing code signature").
-- v2.99.3: iOS/macOS: one orb hook was too short to patch safely on Apple chips and corrupted the next game function, so it is skipped there (orbs still wait for the real press); one more startup checkpoint in the log.
-- v2.99.4: iOS: the purple heart button in the pause menu was missing (the game builds the pause menu differently on iOS), it is now also added when the game pauses.
-- v2.99.5: iOS without JIT works: 8 ghost-visual hooks that crashed the no-JIT launcher on the loading screen are left out on iOS (no effect on buffering; other platforms unchanged).
+- v3.0.0: rebranded as Aliou's Buffer: new mod ID (aliou.aliousbuffer), logo and menu icon, new update source. New dashboard menu: nine sections, icon sidebar, live status panel, Aliou Blue theme (default), fits small screens. Prediction logic unchanged.
+- v3.1.0: percentage-based section learning: split a level into percentage sections, pick several, and practise them (Sections page). In practice mode, level memory only learns inside the picked sections and per-section saves/deaths are counted; learned timings are saved per level and reused in later attempts and full runs. Optional restart at section end (practice only). New settings: section-learning, section-loop.
+- v3.2.0: menu revamp: flat, clean look instead of the space/neon theme. Themes: AMOLED (pure black), Light (white, dark text) and Graphite. Optional custom background picture, Poppins sans-serif font, repeated options removed.
