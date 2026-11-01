@@ -6,11 +6,11 @@
 		"mac": "2.2081",
 		"ios": "2.2081"
 	},
-	"version": "v2.99.1",
-	"id": "basu.input-buffer",
-	"name": "Click Before Frames",
-	"developer": "BASU",
-	"description": "Trajectory-based input buffer: delays early clicks/releases by up to 8+ frames, with orb, pad and portal-aware prediction. github.com/raresdalas1009/-predictive-input-buffer",
+	"version": "v3.0.0",
+	"id": "aliou.aliousbuffer",
+	"name": "Aliou's Buffer",
+	"developer": "Aliou",
+	"description": "Predictive input buffer for Geometry Dash: delays early clicks and releases by a few frames using orb, pad and portal-aware trajectory prediction. Practice use only.",
 	"settings": {
 		"custom-ticks": {
 			"type": "int",
@@ -390,9 +390,10 @@
 		"menu-theme": {
 			"type": "string",
 			"name": "Menu theme",
-			"description": "Colours of the in-game menu.",
-			"default": "Purple",
+			"description": "Colours of the in-game menu. Aliou Blue follows the Aliou's Buffer logo.",
+			"default": "Aliou Blue",
 			"one-of": [
+				"Aliou Blue",
 				"Purple",
 				"Pink",
 				"Blue",
@@ -487,6 +488,6 @@
 		}
 	},
 	"links": {
-		"source": "https://github.com/raresdalas1009/-predictive-input-buffer"
+		"source": "https://github.com/Zeptoreal1/-predictive-input-buffer"
 	}
 }
