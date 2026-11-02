@@ -6,7 +6,7 @@
 		"mac": "2.2081",
 		"ios": "2.2081"
 	},
-	"version": "v3.5.0",
+	"version": "v3.7.0",
 	"id": "aliou.aliousbuffer",
 	"name": "Aliou's Buffer",
 	"developer": "Aliou",
@@ -170,6 +170,50 @@
 			"name": "Review last decision after a death",
 			"description": "With ghost comparison and the path view on, a death redraws the last decision's two paths (yours dashed amber, buffered solid cyan) and keeps them up through the next attempt until you pass that spot. Shows why a save did or did not work.",
 			"default": true
+		},
+		"collision-forecast": {
+			"type": "bool",
+			"name": "Collision forecast",
+			"description": "Shows a line on screen with how long until the next crash if you do nothing, and whether a click right now is safe. Uses the prediction engine; sends no inputs.",
+			"default": true
+		},
+		"death-explain": {
+			"type": "bool",
+			"name": "Death explanation",
+			"description": "After a death, shows one line on what killed you (hazard or block, from which side, the percent) and what the buffer had just decided.",
+			"default": true
+		},
+		"ghost-counterfactual": {
+			"type": "bool",
+			"name": "Counterfactual review",
+			"description": "With the death review on, also tests the same click one frame earlier and one frame later, and shows whether each would have been safe. Costs two extra predictions per delayed click.",
+			"default": true
+		},
+		"spam-meter": {
+			"type": "bool",
+			"name": "Spam meter",
+			"description": "Shows your clicks per second and how even your spam rhythm is. It only measures your own clicks.",
+			"default": false
+		},
+		"route-record": {
+			"type": "bool",
+			"name": "Record routes (practice only)",
+			"description": "In practice mode, from the start of the level with no checkpoints, notes the inputs the game receives. A run that completes the level is saved as this level's route.",
+			"default": true
+		},
+		"route-replay": {
+			"type": "bool",
+			"name": "Replay saved route (practice only)",
+			"description": "In practice mode, from the start of the level, sends the saved route's inputs for you. Your own clicks are ignored while it plays. A big BOT tag shows on screen and cannot be turned off. Never works outside practice mode.",
+			"default": false
+		},
+		"analyze-attempt-limit": {
+			"type": "int",
+			"name": "Auto-analyze attempt limit",
+			"description": "How many attempts an auto-analyze session may use before it stops. Practice mode only.",
+			"default": 200,
+			"min": 10,
+			"max": 5000
 		},
 		"orb-align-ground": {
 			"type": "bool",
