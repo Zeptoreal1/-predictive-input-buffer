@@ -308,10 +308,21 @@ namespace {
         bool ghostCompare = true;        // v3.3: show your input and the buffered input side by side
         bool reviewOn = true;            // v3.5: after a death, show the last decision's comparison again
         bool reviewShown = false;        // the review is on screen now (kept until you pass it)
+        bool forecast = true;            // v3.6: next-hazard forecast on the HUD
+        bool deathExplain = true;        // v3.6: one line on what killed you
+        bool counterfactual = true;      // v3.6: would a frame earlier / later have saved it?
+        bool spamMeter = false;          // v3.6: CPS and how steady your spam is
+        CCLabelBMFont* hudLabel = nullptr;
+        std::string hudForecast, hudSpam, hudDeath, hudAnalyze;
+        bool routeRecord = true;         // v3.7: practice mode only
+        bool routeReplay = false;        // v3.7: practice mode only
+        int analyzeLimit = 200;          // v3.7: attempts an auto-analyze session may use
+        CCLabelBMFont* botTag = nullptr; // v3.7: big tag while inputs are sent for you
         struct Review {
             std::vector<CCPoint> original, buffered;
             bool originalDied = false, bufferedDied = false, valid = false;
             int delay = 0, tick = 0;
+            int cfEarlier = -1, cfLater = -1;  // one frame earlier / later: -1 unknown, 0 safe, 1 crash
             float gap = 0.f, maxX = 0.f;
             CCPoint labelPos {};
         } review;
@@ -616,6 +627,13 @@ namespace {
         buf.learn = mod->getSettingValue<bool>("level-memory");
         buf.ghostCompare = mod->getSettingValue<bool>("ghost-compare");
         buf.reviewOn = mod->getSettingValue<bool>("ghost-review");
+        buf.forecast = mod->getSettingValue<bool>("collision-forecast");
+        buf.deathExplain = mod->getSettingValue<bool>("death-explain");
+        buf.counterfactual = mod->getSettingValue<bool>("ghost-counterfactual");
+        buf.spamMeter = mod->getSettingValue<bool>("spam-meter");
+        buf.routeRecord = mod->getSettingValue<bool>("route-record");
+        buf.routeReplay = mod->getSettingValue<bool>("route-replay");
+        buf.analyzeLimit = static_cast<int>(std::clamp<int64_t>(mod->getSettingValue<int64_t>("analyze-attempt-limit"), 10, 5000));
         buf.sectionLearn = mod->getSettingValue<bool>("section-learning");
         buf.sectionLoop = mod->getSettingValue<bool>("section-loop");
         buf.robotSmart = mod->getSettingValue<bool>("robot-smart");
@@ -855,6 +873,12 @@ namespace {
         buf.panelLines.clear();
         buf.pathNode = nullptr;
         buf.ghostLabel = nullptr;
+        buf.hudLabel = nullptr;
+        buf.hudForecast.clear();
+        buf.hudSpam.clear();
+        buf.hudDeath.clear();
+        buf.hudAnalyze.clear();
+        buf.botTag = nullptr;
         buf.review = {};
         buf.reviewShown = false;
         buf.autoTag = nullptr;
@@ -2173,6 +2197,196 @@ namespace {
         bool skipped = false;  // v2.64: a save was held back here because of memory
     } pending;
 
+    // ---------- v3.6 analysis tools ----------
+    float sectionPercent(PlayLayer* layer, PlayerObject* p);  // defined with the sections below
+
+    // None of these send an input or search for a route: they only read what the prediction
+    // engine, the level objects and your own clicks already show.
+
+    // the small HUD text block (top left): forecast, spam meter and the death explanation
+    void updateHud() {
+        if (!buf.hudLabel) {
+            return;
+        }
+        std::string text;
+        for (auto const* part : { &buf.hudAnalyze, &buf.hudForecast, &buf.hudSpam, &buf.hudDeath }) {
+            if (!part->empty()) {
+                text += text.empty() ? "" : "\n";
+                text += *part;
+            }
+        }
+        buf.hudLabel->setString(text.c_str());
+        buf.hudLabel->setVisible(!text.empty());
+    }
+
+    std::vector<double> spamTimes;
+
+    double nowSeconds() {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    // Spam meter: clicks per second and how even the gaps between your clicks are
+    void spamNote(bool down) {
+        if (!buf.spamMeter || !down) {
+            return;
+        }
+        double now = nowSeconds();
+        spamTimes.push_back(now);
+        while (spamTimes.size() > 12 || (!spamTimes.empty() && now - spamTimes.front() > 2.0)) {
+            spamTimes.erase(spamTimes.begin());
+        }
+        if (spamTimes.size() < 4) {
+            return;
+        }
+        int recent = 0;
+        std::vector<double> gaps;
+        for (size_t i = 0; i < spamTimes.size(); ++i) {
+            recent += now - spamTimes[i] <= 1.0 ? 1 : 0;
+            if (i > 0) {
+                gaps.push_back(spamTimes[i] - spamTimes[i - 1]);
+            }
+        }
+        double mean = 0.0;
+        for (double g : gaps) {
+            mean += g;
+        }
+        mean /= static_cast<double>(gaps.size());
+        double var = 0.0;
+        for (double g : gaps) {
+            var += (g - mean) * (g - mean);
+        }
+        double jitter = mean > 0.0 ? std::sqrt(var / static_cast<double>(gaps.size())) / mean : 0.0;
+        buf.hudSpam = fmt::format("spam: {} CPS, {} ({:.0f}% jitter)", recent, jitter < 0.12 ? "steady" : (jitter < 0.3 ? "a little uneven" : "uneven"), jitter * 100.0);
+        updateHud();
+    }
+
+    void spamTick() {
+        if (!buf.hudSpam.empty() && (spamTimes.empty() || nowSeconds() - spamTimes.back() > 1.5)) {
+            buf.hudSpam.clear();
+            updateHud();
+        }
+    }
+
+    char const* objectKind(GameObject* obj) {
+        if (!obj) {
+            return "the floor, ceiling or level edge";
+        }
+        switch (obj->m_objectType) {
+            case GameObjectType::Hazard: return "a hazard";
+            case GameObjectType::Solid: return "a solid block";
+            case GameObjectType::Slope: return "a slope";
+            default: return "an object";
+        }
+    }
+
+    // Instant death explanation: what killed you, from which side, and what the buffer had just decided
+    void explainDeath(PlayLayer* layer, PlayerObject* player, GameObject* object) {
+        if (!buf.deathExplain || !layer || !player) {
+            return;
+        }
+        std::string how;
+        if (object) {
+            auto r = object->getObjectRect();
+            auto pr = player->getObjectRect();
+            float dx = std::min(pr.getMaxX(), r.getMaxX()) - std::max(pr.getMinX(), r.getMinX());
+            float dy = std::min(pr.getMaxY(), r.getMaxY()) - std::max(pr.getMinY(), r.getMinY());
+            if (object->m_objectType == GameObjectType::Solid || object->m_objectType == GameObjectType::Slope) {
+                how = dx < dy ? ", hit from the side" : ", landed or hit from above or below";
+            }
+            how += fmt::format(" (object {})", object->m_objectID);
+        }
+        std::string decision = ". No buffered decision just before.";
+        if (buf.review.valid && tickCount - buf.review.tick <= st(480)) {
+            decision = fmt::format(". Last decision: held {:g}f, yours would {}, buffered {}.", buf.review.delay * TICK,
+                buf.review.originalDied ? "crash" : "be safe", buf.review.bufferedDied ? "crash" : "be safe");
+        }
+        buf.hudDeath = fmt::format("died at {:.1f}%: {}{}{}", sectionPercent(layer, player), objectKind(object), how, decision);
+        say("{}", buf.hudDeath);
+        updateHud();
+    }
+
+    // Object scanner / level analyzer: reads the level's objects once. The section difficulty is
+    // a rough estimate from object counts (hazards, orbs, pads, mode / gravity / speed changes);
+    // it is not a run and no route is searched.
+    struct ScanChange {
+        float percent;
+        std::string name;
+    };
+    struct LevelScan {
+        bool valid = false;
+        size_t total = 0, hazards = 0, solids = 0, orbs = 0, pads = 0, portals = 0, triggers = 0;
+        std::vector<ScanChange> changes;
+        std::array<float, 10> score {};
+        std::array<int, 10> hazardBins {}, helperBins {}, changeBins {};
+    };
+    LevelScan scan;
+
+    struct PortalInfo {
+        int id;
+        char const* name;
+        float weight;
+    };
+    constexpr PortalInfo PORTALS[] = {
+        { 12, "cube", 3.f }, { 13, "ship", 3.f }, { 47, "ball", 3.f }, { 111, "UFO", 3.f }, { 660, "wave", 3.f },
+        { 745, "robot", 3.f }, { 1331, "spider", 3.f }, { 1933, "swing", 3.f }, { 10, "normal gravity", 2.f },
+        { 11, "flipped gravity", 2.f }, { 45, "mirror on", 1.f }, { 46, "mirror off", 1.f }, { 99, "normal size", 1.f },
+        { 101, "mini", 2.f }, { 286, "dual on", 2.f }, { 287, "dual off", 2.f }, { 200, "0.5x speed", 1.f },
+        { 201, "1x speed", 1.f }, { 202, "2x speed", 2.f }, { 203, "3x speed", 2.f }, { 1334, "4x speed", 3.f },
+    };
+
+    bool isPadId(int id) {
+        return id == 35 || id == 67 || id == 140 || id == 1332;
+    }
+
+    void scanLevel(PlayLayer* layer) {
+        scan = {};
+        if (!layer || !layer->m_objects || layer->m_levelLength <= 0.f) {
+            return;
+        }
+        for (auto* obj : CCArrayExt<GameObject*>(layer->m_objects)) {
+            if (!obj) {
+                continue;
+            }
+            ++scan.total;
+            float pct = std::clamp(obj->getPositionX() / layer->m_levelLength * 100.f, 0.f, 100.f);
+            int bin = std::clamp(static_cast<int>(pct / 10.f), 0, 9);
+            if (obj->m_objectType == GameObjectType::Hazard) {
+                ++scan.hazards;
+                ++scan.hazardBins[bin];
+                scan.score[bin] += 1.f;
+            }
+            else if (obj->m_objectType == GameObjectType::Solid) {
+                ++scan.solids;
+            }
+            if (typeinfo_cast<RingObject*>(obj)) {
+                ++scan.orbs;
+                ++scan.helperBins[bin];
+                scan.score[bin] += 2.f;
+            }
+            else if (isPadId(obj->m_objectID)) {
+                ++scan.pads;
+                ++scan.helperBins[bin];
+                scan.score[bin] += 1.f;
+            }
+            else if (typeinfo_cast<EffectGameObject*>(obj)) {
+                ++scan.triggers;
+            }
+            for (auto const& portal : PORTALS) {
+                if (portal.id == obj->m_objectID) {
+                    ++scan.portals;
+                    ++scan.changeBins[bin];
+                    scan.score[bin] += portal.weight;
+                    scan.changes.push_back({ pct, portal.name });
+                    break;
+                }
+            }
+        }
+        std::sort(scan.changes.begin(), scan.changes.end(), [](ScanChange const& a, ScanChange const& b) { return a.percent < b.percent; });
+        scan.valid = true;
+        say("scan: {} objects, {} hazards, {} orbs, {} pads, {} portals, {} triggers", scan.total, scan.hazards, scan.orbs, scan.pads,
+            scan.portals, scan.triggers);
+    }
+
     // v3.1 section learning. A level can be cut into percentage sections (0-25, 25-50, ...).
     // Sections are saved per level next to the level memory. With "Section learning" on, in
     // practice mode, level memory only learns inside the sections you switched on. What it
@@ -2332,6 +2546,221 @@ namespace {
         }
     }
 
+    // ---------- v3.7 route recorder, route replay and auto-analyze (PRACTICE MODE ONLY) ----------
+    // Every part here checks for practice mode on every tick and shows a big tag on screen while
+    // it is sending inputs. Practice runs can't be submitted, and the tag can't be turned off.
+    //   Record: in practice, from the start of the level, the inputs the game receives are noted;
+    //           a run that completes the level is saved as this level's route.
+    //   Replay: in practice, from the start, the saved route's inputs are sent at the same ticks.
+    //   Auto-analyze: a session that turns on auto-click and auto-release, restarts the level and
+    //           keeps trying until a run completes it or the attempt limit is reached.
+    struct RouteInput {
+        int tick;
+        bool down;
+    };
+    struct Route {
+        std::vector<RouteInput> inputs;
+        float tickLength = 0.f;
+        bool valid = false;
+    };
+    Route routeSaved;
+    std::vector<RouteInput> routeCur;
+    bool routeRecording = false;
+    bool routeReplaying = false;
+    size_t routeNext = 0;
+
+    struct Analyze {
+        bool running = false;
+        int attempts = 0;
+        float best = 0.f;
+        int routes = 0;
+        bool prevAutoClick = false, prevWave = false, prevRobot = false, prevDash = false;
+    };
+    Analyze analyze;
+
+    std::filesystem::path routeFile() {
+        return Mod::get()->getSaveDir() / "memory" / (memoryKey + "_route.txt");
+    }
+
+    void loadRoute() {
+        routeSaved = {};
+        routeCur.clear();
+        routeRecording = routeReplaying = false;
+        if (memoryKey.empty()) {
+            return;
+        }
+        std::ifstream in(routeFile());
+        std::string word;
+        if (!(in >> word >> routeSaved.tickLength) || word != "tickLength") {
+            routeSaved = {};
+            return;
+        }
+        int tick = 0, down = 0;
+        while (in >> tick >> down) {
+            routeSaved.inputs.push_back({ tick, down != 0 });
+        }
+        routeSaved.valid = !routeSaved.inputs.empty();
+    }
+
+    void saveRoute() {
+        if (memoryKey.empty() || !routeSaved.valid) {
+            return;
+        }
+        std::error_code ec;
+        std::filesystem::create_directories(routeFile().parent_path(), ec);
+        std::ofstream out(routeFile(), std::ios::trunc);
+        out << "tickLength " << routeSaved.tickLength << '\n';
+        for (auto const& in : routeSaved.inputs) {
+            out << in.tick << ' ' << (in.down ? 1 : 0) << '\n';
+        }
+    }
+
+    // the big on-screen tag: shown whenever inputs are being sent for you, practice mode only
+    void refreshBotTag() {
+        if (!buf.botTag) {
+            return;
+        }
+        auto* layer = GameManager::get()->m_playLayer;
+        bool on = layer && layer->m_isPracticeMode && (routeReplaying || analyze.running);
+        buf.botTag->setVisible(on);
+        if (on) {
+            buf.botTag->setString(routeReplaying ? "BOT ROUTE REPLAY | PRACTICE ONLY" : "AUTO-ANALYZE | PRACTICE ONLY");
+        }
+    }
+
+    void updateAnalyzeHud() {
+        if (analyze.running) {
+            buf.hudAnalyze = fmt::format("AUTO-ANALYZE: best {:.0f}%, attempt {}/{}, routes saved {}", analyze.best, analyze.attempts,
+                buf.analyzeLimit, analyze.routes);
+        }
+        else {
+            buf.hudAnalyze.clear();
+        }
+        updateHud();
+    }
+
+    void analyzeStop(char const* why) {
+        if (!analyze.running) {
+            return;
+        }
+        analyze.running = false;
+        auto* mod = Mod::get();
+        mod->setSettingValue<bool>("auto-click", analyze.prevAutoClick);
+        mod->setSettingValue<bool>("wave-auto-release", analyze.prevWave);
+        mod->setSettingValue<bool>("robot-auto-release", analyze.prevRobot);
+        mod->setSettingValue<bool>("dash-auto-release", analyze.prevDash);
+        readSettings();
+        say("auto-analyze stopped ({}): best {:.0f}% in {} attempts, {} route(s) saved", why, analyze.best, analyze.attempts, analyze.routes);
+        updateAnalyzeHud();
+        refreshBotTag();
+    }
+
+    // practice mode only; remembers your auto switches and puts them back when it stops
+    bool analyzeStart(PlayLayer* layer) {
+        if (!layer || !layer->m_isPracticeMode || layer->m_isPlatformer) {
+            say("auto-analyze needs a level in practice mode");
+            return false;
+        }
+        auto* mod = Mod::get();
+        analyze = {};
+        analyze.prevAutoClick = mod->getSettingValue<bool>("auto-click");
+        analyze.prevWave = mod->getSettingValue<bool>("wave-auto-release");
+        analyze.prevRobot = mod->getSettingValue<bool>("robot-auto-release");
+        analyze.prevDash = mod->getSettingValue<bool>("dash-auto-release");
+        mod->setSettingValue<bool>("auto-click", true);
+        mod->setSettingValue<bool>("wave-auto-release", true);
+        mod->setSettingValue<bool>("robot-auto-release", true);
+        mod->setSettingValue<bool>("dash-auto-release", true);
+        readSettings();
+        analyze.running = true;
+        say("auto-analyze started: up to {} attempts, practice mode", buf.analyzeLimit);
+        updateAnalyzeHud();
+        refreshBotTag();
+        return true;
+    }
+
+    void analyzeOnDeath(PlayLayer* layer, PlayerObject* player) {
+        if (!analyze.running) {
+            return;
+        }
+        ++analyze.attempts;
+        analyze.best = std::max(analyze.best, sectionPercent(layer, player));
+        updateAnalyzeHud();
+        if (analyze.attempts >= buf.analyzeLimit) {
+            analyzeStop("attempt limit reached");
+        }
+    }
+
+    // a new attempt: start recording / replaying only from the very start of the level in practice
+    void routeBegin(PlayLayer* layer) {
+        routeCur.clear();
+        routeNext = 0;
+        bool practice = layer && layer->m_isPracticeMode && !layer->m_isPlatformer && layer->m_player1;
+        bool noCheckpoint = layer && (!layer->m_checkpointArray || layer->m_checkpointArray->count() == 0);
+        bool fromStart = practice && noCheckpoint && layer->m_player1->getPositionX() < 600.f;
+        routeRecording = buf.routeRecord && fromStart;
+        bool sameRate = routeSaved.valid && std::abs(routeSaved.tickLength - buf.tickLength) < 0.0001f;
+        routeReplaying = buf.routeReplay && fromStart && sameRate;
+        refreshBotTag();
+    }
+
+    void routeStopReplay(PlayLayer* layer) {
+        if (!routeReplaying) {
+            return;
+        }
+        routeReplaying = false;
+        if (layer && buf.appliedInput) {
+            buf.realInput = false;
+            sendButton(layer, false);
+        }
+        refreshBotTag();
+    }
+
+    void routeRecord(bool down) {
+        if (routeRecording) {
+            routeCur.push_back({ tickCount - attemptStartTick, down });
+        }
+    }
+
+    // per tick: re-checks practice mode, then sends the saved inputs that are due
+    void routeTick(PlayLayer* layer) {
+        if (analyze.running && (!layer->m_isPracticeMode || layer->m_isPlatformer)) {
+            analyzeStop("left practice mode");
+        }
+        if (!routeReplaying) {
+            return;
+        }
+        if (!layer->m_isPracticeMode || layer->m_isPlatformer || !buf.routeReplay || !layer->m_player1 || layer->m_player1->m_isDead) {
+            routeStopReplay(layer);
+            return;
+        }
+        int t = tickCount - attemptStartTick;
+        while (routeNext < routeSaved.inputs.size() && routeSaved.inputs[routeNext].tick <= t) {
+            bool down = routeSaved.inputs[routeNext++].down;
+            buf.realInput = down;  // the game is now "held" by the route, so the buffer does not undo it
+            buf.autoReleased = false;
+            sendButton(layer, down);
+        }
+    }
+
+    // a completed practice run that started at the level's start becomes this level's saved route
+    void routeFinish(PlayLayer* layer) {
+        if (analyze.running) {
+            ++analyze.routes;
+        }
+        if (routeRecording && layer && layer->m_isPracticeMode && !routeCur.empty()) {
+            routeSaved.inputs = routeCur;
+            routeSaved.tickLength = buf.tickLength;
+            routeSaved.valid = true;
+            saveRoute();
+            say("route saved: {} inputs", routeSaved.inputs.size());
+        }
+        if (analyze.running) {
+            analyzeStop("level completed");
+        }
+        routeStopReplay(layer);
+    }
+
     int sliceOf(PlayerObject* p) {
         return static_cast<int>(std::floor(p->getPosition().x / SLICE));
     }
@@ -2433,6 +2862,7 @@ namespace {
             saveMemory();
         }
         loadSections();
+        loadRoute();
         if (!memory.empty()) {
             say("memory: {} spots learned on this level", memory.size());
         }
@@ -3047,13 +3477,16 @@ namespace {
         return gap;
     }
 
-    void showGhostLabel(CCPoint pos, bool originalDied, bool bufferedDied, int delay, float gap, bool review = false) {
+    void showGhostLabel(CCPoint pos, bool originalDied, bool bufferedDied, int delay, float gap, bool review = false, std::string const& extra = "") {
         if (!buf.ghostLabel) {
             return;
         }
         std::string text = fmt::format("{}yours: {}   buffered: {}   {}", review ? "last decision, " : "",
             originalDied ? "crash" : "safe", bufferedDied ? "crash" : "safe",
             delay > 0 ? fmt::format("held {:g}f, gap {:.1f} blocks", delay * TICK, gap / 30.f) : std::string("no delay needed"));
+        if (!extra.empty()) {
+            text += "\n" + extra;
+        }
         buf.ghostLabel->setString(text.c_str());
         buf.ghostLabel->setColor(bufferedDied ? ccColor3B { 255, 110, 110 } : ccColor3B { 255, 255, 255 });
         buf.ghostLabel->setPosition(pos + CCPoint { 0.f, 42.f });
@@ -3071,7 +3504,12 @@ namespace {
         }
         clearPathNode();
         drawGhostComparison(buf.review.original, buf.review.originalDied, buf.review.buffered, buf.review.bufferedDied, buf.review.delay);
-        showGhostLabel(buf.review.labelPos, buf.review.originalDied, buf.review.bufferedDied, buf.review.delay, buf.review.gap, true);
+        std::string extra;
+        if (buf.review.cfEarlier >= 0 || buf.review.cfLater >= 0) {
+            auto word = [](int v) { return v < 0 ? "n/a" : (v ? "crash" : "safe"); };
+            extra = fmt::format("1f earlier: {}   1f later: {}", word(buf.review.cfEarlier), word(buf.review.cfLater));
+        }
+        showGhostLabel(buf.review.labelPos, buf.review.originalDied, buf.review.bufferedDied, buf.review.delay, buf.review.gap, true, extra);
         buf.reviewShown = true;
     }
 
@@ -3120,6 +3558,23 @@ namespace {
             buf.review.maxX = p1->getPosition().x;
             for (auto const& pt : buffered) {
                 buf.review.maxX = std::max(buf.review.maxX, pt.x);
+            }
+            buf.review.cfEarlier = buf.review.cfLater = -1;
+            if (buf.counterfactual && buf.reviewOn && !buf.perfMode && chosen > 0) {
+                // counterfactual: the same click one frame earlier / later
+                int oneFrame = std::max(1, static_cast<int>(std::lround(1.f / TICK)));
+                int earlier = chosen - oneFrame;
+                if (earlier == 0) {
+                    buf.review.cfEarlier = nowDied ? 1 : 0;
+                }
+                else if (earlier > 0) {
+                    bool died = false;
+                    recordRun(layer, p1, p2, dual, earlier, down, horizon, releaseAfter, &died);
+                    buf.review.cfEarlier = died ? 1 : 0;
+                }
+                bool laterDied = false;
+                recordRun(layer, p1, p2, dual, chosen + oneFrame, down, horizon, releaseAfter, &laterDied);
+                buf.review.cfLater = laterDied ? 1 : 0;
             }
             buf.review.valid = true;
         }
@@ -3814,10 +4269,11 @@ namespace {
     // blue = where you go if you do nothing, yellow = where a click right now takes you.
     // After a click, that click's path (red / green) stays up briefly first.
     void livePath(PlayLayer* layer, PlayerObject* p1) {
-        if (!buf.showPath || buf.perfMode || !buf.pathNode || !buf.ghost1 || buf.simulating || p1->m_isDead || layer->m_isPlatformer) {
+        if ((!buf.showPath && !buf.forecast) || buf.perfMode || !buf.ghost1 || buf.simulating || p1->m_isDead || layer->m_isPlatformer) {
             return;
         }
-        if (buf.reviewShown) {
+        bool draw = buf.showPath && buf.pathNode;
+        if (buf.reviewShown && draw) {
             if (p1->getPosition().x > buf.review.maxX + 30.f) {
                 buf.reviewShown = false;
                 clearPathNode();
@@ -3838,15 +4294,37 @@ namespace {
         bool down = !buf.appliedInput;
         int releaseAfter = down && !wave && !ship ? holdEstimate() : -1;
 
-        clearPathNode();
+        if (draw) {
+            clearPathNode();
+        }
         bool idleDied = false;
         buf.skipPress = true;
         auto idle = recordRun(layer, p1, p2, dual, 0, down, horizon, -1, &idleDied);
         buf.skipPress = false;
-        drawPath(idle, 0, { 0.45f, 0.7f, 1.f, 0.6f }, idleDied);
+        if (draw) {
+            drawPath(idle, 0, { 0.45f, 0.7f, 1.f, 0.6f }, idleDied);
+        }
         bool clickDied = false;
         auto click = recordRun(layer, p1, p2, dual, 0, down, horizon, releaseAfter, &clickDied);
-        drawPath(click, 0, { 1.f, 0.85f, 0.3f, 0.85f }, clickDied);
+        if (draw) {
+            drawPath(click, 0, { 1.f, 0.85f, 0.3f, 0.85f }, clickDied);
+        }
+        if (buf.forecast) {
+            // collision forecast / hazard warning: when the next crash comes if you do nothing
+            std::string text;
+            if (idleDied) {
+                float frames = static_cast<float>(idle.size()) * TICK;
+                text = fmt::format("hazard in {:.0f}f ({:.2f}s) if you do nothing, {}", frames, frames / 60.f,
+                    clickDied ? "a click now also crashes" : "a click now is safe");
+            }
+            else if (clickDied) {
+                text = "clear if you do nothing, a click now would crash";
+            }
+            if (text != buf.hudForecast) {
+                buf.hudForecast = text;
+                updateHud();
+            }
+        }
     }
 
     void queueInput(int ticks, bool down) {
@@ -5117,6 +5595,16 @@ class BufferMenu : public geode::Popup {
         { "more-time-death-spots", "More time at deaths" },
         { "per-level-settings", "Per-level settings" },
     };
+    static constexpr Option ROUTE_OPTS[] = {
+        { "route-record", "Record routes" },
+        { "route-replay", "Replay saved route" },
+    };
+    static constexpr Option ANALYZER_OPTS[] = {
+        { "collision-forecast", "Collision forecast" },
+        { "death-explain", "Death explanation" },
+        { "ghost-counterfactual", "Counterfactual review" },
+        { "spam-meter", "Spam meter" },
+    };
     static constexpr Option SECTION_OPTS[] = {
         { "section-learning", "Section learning" },
         { "section-loop", "Restart at section end" },
@@ -5146,7 +5634,7 @@ class BufferMenu : public geode::Popup {
         { "check-updates", "Update checker" },
     };
     static constexpr char const* TABS[] = { "Overview", "Prediction", "Game Modes", "Automation", "Memory", "Sections", "Performance",
-        "Visuals", "Tools", "About" };
+        "Visuals", "Tools", "Analyzer", "About" };
     static constexpr char const* THEMES[] = { "AMOLED", "Light", "Graphite", "Midnight", "Ocean", "Forest", "Rose", "Paper", "Custom" };
     static constexpr char const* ABOUT_URL = "https://github.com/Zeptoreal1/-predictive-input-buffer";
 
@@ -5248,6 +5736,7 @@ private:
     static inline CCPoint s_pos {};
     static inline int s_modeSub = 0;
     static inline int s_secPage = 0;
+    static inline int s_anaSub = 0;
     static inline int s_newFrom = 0;
     static inline int s_newTo = 25;
 
@@ -5590,6 +6079,10 @@ private:
                 seg(5.6f, 0.f, 4.2f, 0.f);
                 seg(-5.6f, 0.f, -4.2f, 0.f);
                 break;
+            case 9:  // analyzer: a magnifier
+                circle(d, c + CCPoint { -1.f, 1.f }, 3.8f, { 0, 0, 0, 0 }, 16, 0.8f, k);
+                seg(1.8f, -1.8f, 5.2f, -5.2f);
+                break;
             default:  // about: an "i" in a ring
                 circle(d, c, 5.2f, { 0, 0, 0, 0 }, 18, 0.8f, k);
                 seg(0.f, -2.8f, 0.f, 0.8f);
@@ -5608,22 +6101,22 @@ private:
         menu->setPosition({ 0.f, 0.f });
         m_tabsNode->addChild(menu);
         for (int i = 0; i < static_cast<int>(std::size(TABS)); ++i) {
-            float y = H - TITLE - 18.f - i * 22.f;
+            float y = H - TITLE - 18.f - i * 20.f;
             bool active = i == s_tab;
             auto* node = CCNode::create();
-            node->setContentSize({ SIDE - 16.f, 21.f });
+            node->setContentSize({ SIDE - 16.f, 19.f });
             auto* d = CCDrawNode::create();
             if (active) {
-                roundRect(d, { 0.f, 0.f, SIDE - 16.f, 21.f }, 7.f, col(m_t.accent, m_t.light ? 0.13f : 0.2f));
+                roundRect(d, { 0.f, 0.f, SIDE - 16.f, 19.f }, 7.f, col(m_t.accent, m_t.light ? 0.13f : 0.2f));
                 roundRect(d, { 0.f, 4.f, 2.5f, 13.f }, 1.2f, col(m_t.accent, 1.f));
             }
-            navIcon(d, i, { 13.f, 10.5f }, col(active ? m_t.accent : m_muted, 1.f));
+            navIcon(d, i, { 13.f, 9.5f }, col(active ? m_t.accent : m_muted, 1.f));
             node->addChild(d);
             auto* l = CCLabelBMFont::create(TABS[i], active ? headFont() : bodyFont());
             l->setScale(0.44f * (active ? HEAD_K : BODY_K));
             l->setColor(active ? m_text : m_muted);
             l->setAnchorPoint({ 0.f, 0.5f });
-            l->setPosition({ 25.f, 10.5f });
+            l->setPosition({ 25.f, 9.5f });
             l->limitLabelWidth(SIDE - 16.f - 29.f, 0.44f * (active ? HEAD_K : BODY_K), 0.15f);
             node->addChild(l);
             auto* item = CCMenuItemSpriteExtra::create(node, this, menu_selector(BufferMenu::onTab));
@@ -5962,6 +6455,100 @@ private:
         note("Debug options only log; they change nothing about the decisions.", y - 20.f, m_muted);
     }
 
+    void pageAutopilot() {
+        float top = pageTop() - 40.f;
+        card(top + 12.f, ROW + 4.f);
+        optionGrid(ROUTE_OPTS, std::size(ROUTE_OPTS), top);
+        float y = top - ROW - 14.f;
+        std::string state = analyze.running
+            ? fmt::format("Running: best {:.0f}%, attempt {}/{}, routes saved {}", analyze.best, analyze.attempts, buf.analyzeLimit, analyze.routes)
+            : (analyze.attempts > 0 ? fmt::format("Stopped: best {:.0f}% in {} attempts, routes saved {}", analyze.best, analyze.attempts, analyze.routes)
+                                    : std::string("Idle. Open a level in practice mode, then start."));
+        label(m_page, state, 0.44f, m_hi, { SIDE + 14.f, y }, { 0.f, 0.5f })->limitLabelWidth(W - SIDE - 28.f, 0.44f, 0.15f);
+        y -= 22.f;
+        button(m_pageMenu, "Start auto-analyze", menu_selector(BufferMenu::onAnalyzeStart), { SIDE + 80.f, y }, 136.f, true, 0, 16.f);
+        button(m_pageMenu, "Stop", menu_selector(BufferMenu::onAnalyzeStop), { SIDE + 172.f, y }, 44.f, false, 0, 16.f);
+        button(m_pageMenu, "Clear route", menu_selector(BufferMenu::onRouteClear), { SIDE + 244.f, y }, 84.f, false, 0, 16.f);
+        y -= 24.f;
+        card(y + 11.f, 24.f);
+        label(m_page, "Attempt limit", 0.5f, m_muted, { SIDE + 20.f, y }, { 0.f, 0.5f });
+        button(m_pageMenu, "-", menu_selector(BufferMenu::onAnaLimit), { W - 92.f, y }, 22.f, false, -1);
+        button(m_pageMenu, "+", menu_selector(BufferMenu::onAnaLimit), { W - 30.f, y }, 22.f, false, 1);
+        label(m_page, fmt::format("{}", buf.analyzeLimit), 0.55f, m_text, { W - 61.f, y });
+        y -= 22.f;
+        note("Practice mode only, enforced every tick. A big BOT tag shows while inputs are sent; it can't be turned off.", y, m_t.warn, 0.4f);
+        note("Auto-analyze turns on auto-click and auto-release, restarts the level and keeps trying until a run", y - 13.f, m_muted);
+        note("completes it or the limit is reached. Progress is the best percent reached, not a timer.", y - 24.f, m_muted);
+        note("It can't hold ship or wave sections, so those levels may never finish.", y - 35.f, m_muted);
+        note(routeSaved.valid ? fmt::format("Saved route: {} inputs, {:.1f}s. Replay sends them from the level start; your clicks are ignored.",
+                                    routeSaved.inputs.size(), routeSaved.inputs.back().tick * TICK / 60.f)
+                              : std::string("No saved route. A practice run that completes the level from its start is saved."),
+            y - 50.f, m_muted);
+    }
+
+    void pageAnalyzer() {
+        heading("Analyzer", s_anaSub == 0 ? "Reads the level and your runs. Nothing here sends inputs." : "Practice mode only. Sends inputs for you; a big tag shows.");
+        button(m_pageMenu, "Scan", menu_selector(BufferMenu::onAnaSub), { W - 88.f, pageTop() }, 52.f, s_anaSub == 0, 0, 16.f);
+        button(m_pageMenu, "Autopilot", menu_selector(BufferMenu::onAnaSub), { W - 30.f, pageTop() }, 52.f, s_anaSub == 1, 1, 16.f);
+        if (s_anaSub == 1) {
+            pageAutopilot();
+            return;
+        }
+        float top = pageTop() - 40.f;
+        card(top + 12.f, 2 * ROW + 4.f);
+        optionGrid(ANALYZER_OPTS, std::size(ANALYZER_OPTS), top);
+        float y = top - 2 * ROW - 14.f;
+        button(m_pageMenu, "Scan level", menu_selector(BufferMenu::onScan), { SIDE + 52.f, y }, 84.f, true, 0, 16.f);
+        if (!scan.valid) {
+            note("Open a level, then scan it for objects, portals and the hardest-looking parts.", y - 18.f, m_muted, 0.44f);
+            return;
+        }
+        label(m_page, fmt::format("{} objects: {} hazards, {} orbs, {} pads, {} portals, {} triggers", scan.total, scan.hazards, scan.orbs,
+                  scan.pads, scan.portals, scan.triggers), 0.4f, m_text, { SIDE + 100.f, y }, { 0.f, 0.5f })
+            ->limitLabelWidth(W - SIDE - 108.f, 0.4f, 0.15f);
+        // ten bars, one per 10% of the level: a rough difficulty estimate from object counts
+        float chartTop = y - 14.f, chartH = 26.f;
+        float barW = (W - SIDE - 40.f) / 10.f;
+        float maxScore = 1.f;
+        for (float v : scan.score) {
+            maxScore = std::max(maxScore, v);
+        }
+        std::array<int, 10> order {};
+        for (int i = 0; i < 10; ++i) {
+            order[i] = i;
+        }
+        std::sort(order.begin(), order.end(), [](int a, int b) { return scan.score[a] > scan.score[b]; });
+        auto* d = CCDrawNode::create();
+        m_page->addChild(d, 3);
+        for (int i = 0; i < 10; ++i) {
+            bool hard = scan.score[i] > 0.f && (i == order[0] || i == order[1] || i == order[2]);
+            float h = 1.5f + scan.score[i] / maxScore * (chartH - 1.5f);
+            roundRect(d, { SIDE + 20.f + i * barW + 1.f, chartTop - chartH, barW - 3.f, h }, 1.5f, col(hard ? m_t.warn : m_t.accent, hard ? 0.95f : 0.55f));
+        }
+        float ly = chartTop - chartH - 9.f;
+        label(m_page, "0%", 0.36f, m_muted, { SIDE + 20.f, ly }, { 0.f, 0.5f });
+        label(m_page, "100%", 0.36f, m_muted, { W - 20.f, ly }, { 1.f, 0.5f });
+        ly -= 14.f;
+        label(m_page, "Hardest looking sections (estimate from object counts)", 0.42f, m_muted, { SIDE + 14.f, ly }, { 0.f, 0.5f });
+        for (int k = 0; k < 3; ++k) {
+            int i = order[k];
+            ly -= 12.f;
+            if (scan.score[i] <= 0.f) {
+                break;
+            }
+            label(m_page, fmt::format("{}-{}%: {} hazards, {} orbs and pads, {} portals", i * 10, i * 10 + 10, scan.hazardBins[i], scan.helperBins[i],
+                      scan.changeBins[i]), 0.4f, m_text, { SIDE + 14.f, ly }, { 0.f, 0.5f })
+                ->limitLabelWidth(W - SIDE - 28.f, 0.4f, 0.15f);
+        }
+        ly -= 14.f;
+        std::string changes;
+        for (size_t i = 0; i < scan.changes.size() && i < 6; ++i) {
+            changes += fmt::format("{}{:.0f}% {}", i ? ",  " : "", scan.changes[i].percent, scan.changes[i].name);
+        }
+        label(m_page, changes.empty() ? "No portals found." : "Physics changes: " + changes, 0.4f, m_hi, { SIDE + 14.f, ly }, { 0.f, 0.5f })
+            ->limitLabelWidth(W - SIDE - 28.f, 0.4f, 0.15f);
+    }
+
     void pageAbout() {
         heading("About", "A predictive input buffer for Geometry Dash.");
         float top = pageTop() - 22.f;
@@ -6042,7 +6629,8 @@ private:
             case 6: pagePerformance(); break;
             case 7: pageVisuals(); break;
             case 8: pageTools(); break;
-            case 9: pageAbout(); break;
+            case 9: pageAnalyzer(); break;
+            case 10: pageAbout(); break;
             default: pageOverview(); break;
         }
         buildTabs();
@@ -6190,6 +6778,54 @@ private:
 
     void onTab(CCObject* sender) {
         s_tab = sender->getTag();
+        rebuildPage();
+    }
+
+    void onAnaSub(CCObject* sender) {
+        s_anaSub = sender->getTag();
+        rebuildPage();
+    }
+
+    void onAnalyzeStart(CCObject*) {
+        auto* layer = GameManager::get()->m_playLayer;
+        if (analyzeStart(layer)) {
+            keyBackClicked();  // close the menu so the level runs
+            layer->resetLevel();
+        }
+        else {
+            rebuildPage();
+        }
+    }
+
+    void onAnalyzeStop(CCObject*) {
+        analyzeStop("stopped by you");
+        rebuildPage();
+    }
+
+    void onRouteClear(CCObject*) {
+        routeSaved = {};
+        routeReplaying = false;
+        std::error_code ec;
+        std::filesystem::remove(routeFile(), ec);
+        say("saved route cleared");
+        rebuildPage();
+    }
+
+    void onAnaLimit(CCObject* sender) {
+        int64_t v = std::clamp<int64_t>(Mod::get()->getSettingValue<int64_t>("analyze-attempt-limit") + sender->getTag() * 50, 10, 5000);
+        Mod::get()->setSettingValue<int64_t>("analyze-attempt-limit", v);
+        readSettings();
+        rebuildPage();
+    }
+
+    void onScan(CCObject*) {
+        auto* layer = GameManager::get()->m_playLayer;
+        if (!layer) {
+            say("scan: open a level first");
+        }
+        else {
+            scanLevel(layer);
+        }
         rebuildPage();
     }
 
@@ -6624,6 +7260,8 @@ class $modify(BufPlayLayer, PlayLayer) {
         buf.autoClicked = false;
         buf.rapid = 0;
         forgetPress();
+        explainDeath(this, player, object);
+        analyzeOnDeath(this, player);
         showReview();
         memoryDeath();
         benchFinish();
@@ -6770,6 +7408,16 @@ class $modify(BufPlayLayer, PlayLayer) {
         this->addChild(buf.autoTag);
         refreshAutoTag();
 
+        // v3.7: the big tag while a route plays or auto-analyze runs (practice mode only)
+        buf.botTag = CCLabelBMFont::create("BOT ROUTE REPLAY | PRACTICE ONLY", "bigFont.fnt");
+        buf.botTag->setScale(0.5f);
+        buf.botTag->setColor({ 255, 70, 70 });
+        buf.botTag->setOpacity(240);
+        buf.botTag->setPosition({ win.width / 2.f, win.height - 50.f });
+        buf.botTag->setZOrder(1000);
+        buf.botTag->setVisible(false);
+        this->addChild(buf.botTag);
+
         buf.hintLabel = CCLabelBMFont::create("", "bigFont.fnt");
         buf.hintLabel->setColor({ 255, 170, 215 });
         buf.hintLabel->setOpacity(0);
@@ -6795,6 +7443,14 @@ class $modify(BufPlayLayer, PlayLayer) {
         buf.ghostLabel->setScale(0.55f);
         buf.ghostLabel->setVisible(false);
         pathParent->addChild(buf.ghostLabel, 9999);
+        // v3.6 HUD text (forecast, spam meter, death explanation), top left of the screen
+        buf.hudLabel = CCLabelBMFont::create("", "chatFont.fnt");
+        buf.hudLabel->setScale(0.5f);
+        buf.hudLabel->setAnchorPoint({ 0.f, 1.f });
+        buf.hudLabel->setAlignment(kCCTextAlignmentLeft);
+        buf.hudLabel->setPosition({ 8.f, CCDirector::get()->getWinSize().height - 40.f });
+        buf.hudLabel->setVisible(false);
+        (m_uiLayer ? static_cast<CCNode*>(m_uiLayer) : static_cast<CCNode*>(this))->addChild(buf.hudLabel, 100);
 
         buf.realInput = false;
         buf.appliedInput = false;
@@ -6806,7 +7462,14 @@ class $modify(BufPlayLayer, PlayLayer) {
         return true;
     }
 
+    void levelComplete() {
+        routeFinish(this);  // v3.7
+        PlayLayer::levelComplete();
+    }
+
     void onQuit() {
+        analyzeStop("left the level");
+        routeReplaying = false;
         benchFinish();
         benchFlush();
         benchRecording = false;
@@ -6821,6 +7484,9 @@ class $modify(BufPlayLayer, PlayLayer) {
 
     void resetLevel() {
         sectionBlockEnd = -1;  // v3.1
+        buf.hudDeath.clear();  // v3.6
+        buf.hudForecast.clear();
+        updateHud();
         triggerChecks.clear();  // v2.84
         attemptStartTick = tickCount;  // v2.84.3
         benchFinish();
@@ -6848,6 +7514,7 @@ class $modify(BufPlayLayer, PlayLayer) {
         buf.autoClicked = false;
         drift.active = false;
         PlayLayer::resetLevel();
+        routeBegin(this);  // v3.7
         // v2.85: start every attempt from the game's own button state. A release you made while
         // your icon was dead never reached the mod, so it still thought you were holding and
         // pressed for you as the attempt started (the cube jumped by itself until you clicked).
@@ -6856,6 +7523,10 @@ class $modify(BufPlayLayer, PlayLayer) {
     }
 
     void togglePracticeMode(bool practiceMode) {
+        if (!practiceMode) {
+            analyzeStop("practice mode off");
+            routeStopReplay(this);
+        }
         PlayLayer::togglePracticeMode(practiceMode);
         refreshWatermark();
         refreshAutoTag();
@@ -7031,6 +7702,8 @@ class $modify(BufPlayerObject, PlayerObject) {
             driftStep(this);
             memoryTick();
             sectionTick(layer);
+            spamTick();
+            routeTick(layer);
             if (buf.enabled) {
                 deliverPending(layer, this);
                 livePath(layer, this);
@@ -7686,12 +8359,16 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
     }
 
     void handleButton(bool down, int button, bool isPlayer1) {
+        if (routeReplaying && !buf.simulating && !buf.injecting && button == 1) {
+            return;  // v3.7: while a saved route plays (practice only) it is in control
+        }
         if (!buf.simulating && button == 1 && !buf.injecting) {
             auto* p1 = this->m_player1;
             if (down || (p1 && (p1->m_isDart || p1->m_isRobot))) {
                 finishDrift("");
             }
             recordRealInput(down, p1);
+            spamNote(down);
         }
         if (!buf.simulating && button == 1 && !buf.injecting) {
             // v2.21 performance log: what this click cost, measured around the whole decision.
@@ -7711,6 +8388,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
         }
         if (!buf.simulating && button == 1) {
             benchInput(down);  // v2.75: what the game really gets (your clicks and delayed ones)
+            routeRecord(down);
         }
         GJBaseGameLayer::handleButton(down, button, isPlayer1);
     }
