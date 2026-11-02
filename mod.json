@@ -6,7 +6,7 @@
 		"mac": "2.2081",
 		"ios": "2.2081"
 	},
-	"version": "v3.5.0",
+	"version": "v3.6.0",
 	"id": "aliou.aliousbuffer",
 	"name": "Aliou's Buffer",
 	"developer": "Aliou",
@@ -540,6 +540,66 @@
 				"arrow-step": 10,
 				"big-arrows": false
 			}
+		},
+		"spam-engine": {
+			"type": "bool",
+			"name": "Smart Spam Engine",
+			"description": "Practice only. Watches spam sections: detects the pattern (steady, speeding up, slowing down, bursts, uneven), suggests a click rate for the mode and section, and remembers spam patterns that worked per 5% section.",
+			"default": true
+		},
+		"spam-predict": {
+			"type": "bool",
+			"name": "Spam prediction (branching + collision forecast)",
+			"description": "While spamming, the next press is tried at several timings on the hidden ghost; warns when your rhythm will crash and which timing survives. Costs some prediction time per press.",
+			"default": true
+		},
+		"spam-branches": {
+			"type": "int",
+			"name": "Spam prediction branches",
+			"description": "How many next-press timings are simulated per spam press.",
+			"default": 4,
+			"min": 1,
+			"max": 8
+		},
+		"spam-warnings": {
+			"type": "bool",
+			"name": "Spam warnings in the console",
+			"description": "Show rate suggestions, rhythm and failure warnings in the console.",
+			"default": true
+		},
+		"spam-limiter": {
+			"type": "bool",
+			"name": "Spam rate limiter",
+			"description": "Drops presses that come faster than the current mode can register.",
+			"default": false
+		},
+		"spam-limiter-ticks": {
+			"type": "int",
+			"name": "Rate limiter: min ticks between presses",
+			"description": "0 = automatic per game mode.",
+			"default": 0,
+			"min": 0,
+			"max": 20
+		},
+		"spam-stabilizer": {
+			"type": "bool",
+			"name": "Spam stabilizer",
+			"description": "During spam, drops accidental double taps much shorter than your rhythm.",
+			"default": false
+		},
+		"spam-stabilizer-ticks": {
+			"type": "int",
+			"name": "Stabilizer: double-tap window (ticks)",
+			"description": "A press this many ticks or fewer after the previous one counts as a double tap.",
+			"default": 1,
+			"min": 1,
+			"max": 6
+		},
+		"spam-rhythm-lock": {
+			"type": "bool",
+			"name": "Spam rhythm lock",
+			"description": "Locks onto your rhythm once it settles in a long spam and warns when you drift off it.",
+			"default": false
 		}
 	},
 	"resources": {
