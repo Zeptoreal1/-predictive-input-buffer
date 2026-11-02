@@ -6,7 +6,7 @@
 		"mac": "2.2081",
 		"ios": "2.2081"
 	},
-	"version": "v3.2.0",
+	"version": "v3.5.0",
 	"id": "aliou.aliousbuffer",
 	"name": "Aliou's Buffer",
 	"developer": "Aliou",
@@ -158,6 +158,18 @@
 			"name": "Path view on at start",
 			"description": "Draw the predicted path in the level after each input (toggle any time with F10). Red = what the input would do right now, green = what the game actually gets, white dot = where a delayed input fires, red dot = crash. Costs two extra predictions per click while on.",
 			"default": false
+		},
+		"ghost-compare": {
+			"type": "bool",
+			"name": "Ghost comparison",
+			"description": "With the path view on, draws two paths at once: your input as you pressed it (dashed, amber) and the input the game gets after buffering (solid, cyan), joined at the same moments, with a one-line verdict by the player. Practice use only.",
+			"default": true
+		},
+		"ghost-review": {
+			"type": "bool",
+			"name": "Review last decision after a death",
+			"description": "With ghost comparison and the path view on, a death redraws the last decision's two paths (yours dashed amber, buffered solid cyan) and keeps them up through the next attempt until you pass that spot. Shows why a save did or did not work.",
+			"default": true
 		},
 		"orb-align-ground": {
 			"type": "bool",
@@ -402,12 +414,18 @@
 		"menu-theme": {
 			"type": "string",
 			"name": "Menu theme",
-			"description": "Menu colours: AMOLED (pure black), Light (white with dark text) or Graphite. Changes at once from the Visuals page.",
+			"description": "Menu colours: AMOLED (pure black), Light (white, dark text), Graphite, Midnight, Ocean, Forest, Rose, Paper, or Custom to use your own colours below. Changes at once.",
 			"default": "AMOLED",
 			"one-of": [
 				"AMOLED",
 				"Light",
-				"Graphite"
+				"Graphite",
+				"Midnight",
+				"Ocean",
+				"Forest",
+				"Rose",
+				"Paper",
+				"Custom"
 			]
 		},
 		"menu-background": {
@@ -428,6 +446,30 @@
 					}
 				]
 			}
+		},
+		"custom-main": {
+			"type": "color",
+			"name": "Custom: main colour",
+			"description": "Window background of the Custom theme.",
+			"default": "#0B0F1A"
+		},
+		"custom-secondary": {
+			"type": "color",
+			"name": "Custom: secondary colour",
+			"description": "Panels, cards and the sidebar of the Custom theme.",
+			"default": "#161C2D"
+		},
+		"custom-accent": {
+			"type": "color",
+			"name": "Custom: accent colour",
+			"description": "Active tab, switches, buttons and highlights of the Custom theme.",
+			"default": "#3B82F6"
+		},
+		"custom-text": {
+			"type": "color",
+			"name": "Custom: text colour",
+			"description": "Text of the Custom theme. Muted text and borders are worked out from it.",
+			"default": "#F2F4FA"
 		},
 		"bind-stage": {
 			"type": "keybind",

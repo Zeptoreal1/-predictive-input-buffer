@@ -14,7 +14,7 @@ A predictive input-buffering [Geode](https://geode-sdk.org) mod for Geometry Das
 - Percentage-based section learning: split a level into sections (0-25%, 25-50%, ...), pick several, and practise them. In practice mode the mod learns timings only inside the picked sections, saves them per level, and reuses them in later attempts and full runs. It never replays inputs; every click stays yours.
 - Practice-only auto-click and auto-release (wave, robot, dash)
 - Training mode (hints only), performance mode, low-latency mode, no-hitch searches
-- Live path view with **ghost comparison**: your original input trajectory (dashed amber) and the buffered trajectory (solid cyan) shown at the same time, joined at matching moments, with a verdict ("yours: crash, buffered: safe, held 2f")
+- Live path view with **ghost comparison**: your original input trajectory (dashed amber) and the buffered trajectory (solid cyan) shown at the same time, joined at matching moments, with a verdict ("yours: crash, buffered: safe, held 2f"), and a **death review** that redraws the last decision after you die so you can see why it did or did not work
 - Drift check, death log, in-game console and log export
 - Update checker (GitHub releases)
 
@@ -39,7 +39,7 @@ _Screenshots will be added here._
 All keys can be changed in the mod settings or Geode's keybinds.
 
 ## Configuration
-Open the menu in a level (key 7 or the pause-menu button) or from the logo button on the main menu, or use the mod settings. The menu is a dashboard with a sidebar of ten sections (Overview, Prediction, Game Modes, Automation, Memory, Sections, Performance, Visuals, Tools, About) and a live status panel showing whether the buffer is on, the prediction mode, active features and performance. The **Menu theme** setting offers AMOLED (pure black, default), Light (white with dark text) and Graphite, and **Menu background** can show your own picture behind the menu. The menu uses the Poppins font. Settings marked experimental or practice-only say so in their descriptions.
+Open the menu in a level (key 7 or the pause-menu button) or from the logo button on the main menu, or use the mod settings. The menu is a dashboard with a sidebar of ten sections (Overview, Prediction, Game Modes, Automation, Memory, Sections, Performance, Visuals, Tools, About) and a live status panel showing whether the buffer is on, the prediction mode, active features and performance. The **Menu theme** setting offers AMOLED (pure black, default), Light (white with dark text), Graphite, Midnight, Ocean, Forest, Rose, Paper and Custom (pick your own main, secondary, accent and text colours), and **Menu background** can show your own picture behind the menu. The menu uses the Poppins font. Settings marked experimental or practice-only say so in their descriptions.
 
 ## Supported platforms
 Windows, macOS, Android and iOS (as configured in `mod.json` and the CI workflow). See "Build status" below for what has actually been tested.
@@ -142,3 +142,5 @@ Developer: Aliou. Aliou's Buffer is a fork of the predictive input buffer mod or
 - v3.1.0: percentage-based section learning: split a level into percentage sections, pick several, and practise them (Sections page). In practice mode, level memory only learns inside the picked sections and per-section saves/deaths are counted; learned timings are saved per level and reused in later attempts and full runs. Optional restart at section end (practice only). New settings: section-learning, section-loop.
 - v3.2.0: menu revamp: flat, clean look instead of the space/neon theme. Themes: AMOLED (pure black), Light (white, dark text) and Graphite. Optional custom background picture, Poppins sans-serif font, repeated options removed.
 - v3.3.0: ghost comparison: with the path view on, both trajectories are drawn at once, your input as pressed (dashed amber) and the buffered input (solid cyan), joined at matching moments, with a one-line verdict by the player. New setting: ghost-compare (on by default, only visible while the path view is on).
+- v3.4.0: five new menu themes (Midnight, Ocean, Forest, Rose, Paper) and a Custom theme with your own main, secondary, accent and text colours; the menu updates live when you change them in the settings.
+- v3.5.0: death review: after a death the last decision's ghost comparison is drawn again and stays up through the next attempt until you pass that spot (setting ghost-review). Fixed the Visuals page layout, where the Ghost comparison switch was drawn under the Menu theme card and could not be tapped properly.

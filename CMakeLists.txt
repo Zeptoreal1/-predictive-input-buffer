@@ -7,7 +7,7 @@ endif()
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-project(AliousBuffer VERSION 3.2.0)
+project(AliousBuffer VERSION 3.5.0)
 
 file(GLOB SOURCES CONFIGURE_DEPENDS src/*.cpp)
 add_library(${PROJECT_NAME} SHARED ${SOURCES})
