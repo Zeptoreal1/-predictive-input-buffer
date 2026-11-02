@@ -1,3 +1,4 @@
+// Aliou's Buffer v3.6: Smart Spam Engine and spam-aware prediction in SpamEngine.hpp / spamPredict()
 // Aliou's Buffer v2.9 (cube-style wave, wave auto-release, orb alignment, full ghost state, drift check, in-game console on F9)
 //
 // When you click (or release, in wave / robot), a hidden "ghost" player is simulated
@@ -16,6 +17,7 @@
 //    dead flipGravity hook priority, optional console, in-game console (stage + live log, hidden by default).
 
 #include <Geode/Geode.hpp>
+#include "SpamEngine.hpp"
 #include <Geode/utils/web.hpp>
 #include <Geode/modify/EffectGameObject.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
@@ -592,6 +594,16 @@ namespace {
 
     void readSettings() {
         auto* mod = Mod::get();
+        {  // v3.6 Smart Spam Engine
+            auto& se = spam::engine();
+            se.enabled = mod->getSettingValue<bool>("spam-engine");
+            se.limiter = mod->getSettingValue<bool>("spam-limiter");
+            se.limiterMin = static_cast<int>(mod->getSettingValue<int64_t>("spam-limiter-ticks"));
+            se.stabilizer = mod->getSettingValue<bool>("spam-stabilizer");
+            se.stabilizerJitter = static_cast<int>(mod->getSettingValue<int64_t>("spam-stabilizer-ticks"));
+            se.rhythmLock = mod->getSettingValue<bool>("spam-rhythm-lock");
+            se.warnings = mod->getSettingValue<bool>("spam-warnings");
+        }
         buf.smart = mod->getSettingValue<bool>("smart-prediction");
         buf.portalPredict = mod->getSettingValue<bool>("predict-through-portals");
         buf.budgetMs = mod->getSettingValue<double>("sim-budget-ms");
@@ -4269,6 +4281,77 @@ namespace {
         return text;
     }
 
+    // v3.6 spam-aware prediction, run after a real press while you are spamming (practice only).
+    //  - Predictive branching: the next press is tried at several timings (your rhythm, faster,
+    //    slower, the section's remembered rate) on the hidden ghost.
+    //  - Collision forecasting: how many ticks until the ghost crashes on your current rhythm.
+    //  - Prediction rollback: a forecast made for a press tick is thrown away when you press
+    //    earlier than it assumed, so stale warnings never fire.
+    //  - Spam failure predictor: warns when your rhythm's branch crashes and another survives.
+    struct SpamForecast {
+        int64_t madeAt = -1;
+        int64_t assumedPress = -1;
+        int ticksToCrash = -1;
+        int bestInterval = 0;
+    };
+    SpamForecast spamForecast;
+
+    void spamPredict(PlayLayer* layer) {
+        auto& se = spam::engine();
+        if (!se.enabled || !layer || !layer->m_isPracticeMode || !se.inBurst() || !buf.ghost1 || layer->m_isPlatformer) {
+            return;
+        }
+        if (!Mod::get()->getSettingValue<bool>("spam-predict")) {
+            return;
+        }
+        int64_t now = logClock;
+        if (spamForecast.assumedPress > now) {  // rollback: you pressed before the forecast's press
+            say("spam: forecast rolled back (pressed {}t early)", spamForecast.assumedPress - now);
+        }
+        spamForecast = {};
+        auto* p1 = layer->m_player1;
+        if (!p1 || p1->m_isDead) {
+            return;
+        }
+        bool dual = layer->m_gameState.m_isDualMode && layer->m_player2 && !layer->m_levelSettings->m_twoPlayerMode;
+        auto* p2 = dual ? layer->m_player2 : nullptr;
+        int horizon = 96;
+        int count = static_cast<int>(Mod::get()->getSettingValue<int64_t>("spam-branches"));
+        auto branches = se.branches(count, horizon);
+        int mine = -1, best = -1, bestIv = 0;
+        for (size_t i = 0; i < branches.size(); ++i) {
+            auto& b = branches[i];
+            if (b.presses.empty()) {
+                continue;
+            }
+            int first = b.presses.front();
+            int hold = std::max(1, first / 2);
+            SimEnd e;
+            b.survived = simulate(layer, p1, p2, dual, first, true, horizon, hold, horizon, &e);
+            if (i == 0) {
+                mine = b.survived;
+            }
+            if (b.survived > best) {
+                best = b.survived;
+                bestIv = first;
+            }
+        }
+        sweepGhostLayer();
+        if (mine < 0) {
+            return;
+        }
+        spamForecast.madeAt = now;
+        spamForecast.assumedPress = now + branches[0].presses.front();
+        spamForecast.ticksToCrash = mine;
+        spamForecast.bestInterval = bestIv;
+        if (mine < horizon) {
+            se.onForecast(mine, horizon);
+            if (best > mine && bestIv > 0) {
+                say("spam: collision in {}t on your rhythm; next press at +{}t survives {}t", mine, bestIv, best);
+            }
+        }
+    }
+
     bool intercept(GJBaseGameLayer* self, bool down, bool isPlayer1) {
         ClickTimer timer;
         clickBudget();
@@ -6820,6 +6903,18 @@ class $modify(BufPlayLayer, PlayLayer) {
     }
 
     void resetLevel() {
+        {  // v3.6: the spam burst ends here (a death counts against its section)
+            auto& se = spam::engine();
+            bool died = m_player1 && m_player1->m_isDead;
+            se.endBurst(died);
+            se.reset();
+            if (!memoryKey.empty()) {
+                auto path = (Mod::get()->getSaveDir() / "memory" / (memoryKey + "_spam.txt")).string();
+                if (path != se.memoryPath) {
+                    se.load(path);
+                }
+            }
+        }
         sectionBlockEnd = -1;  // v3.1
         triggerChecks.clear();  // v2.84
         attemptStartTick = tickCount;  // v2.84.3
@@ -7686,6 +7781,24 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
     }
 
     void handleButton(bool down, int button, bool isPlayer1) {
+        bool spamPress = false;
+        if (!buf.simulating && button == 1 && !buf.injecting) {  // v3.6 Smart Spam Engine
+            auto* pl = typeinfo_cast<PlayLayer*>(static_cast<GJBaseGameLayer*>(this));
+            if (pl && pl->m_isPracticeMode && !pl->m_isPlatformer && this->m_player1) {
+                auto& se = spam::engine();
+                int pct = std::clamp(static_cast<int>(pl->getCurrentPercent()), 0, 100);
+                auto advice = se.onInput(down, logClock, modeIndex(this->m_player1, nullptr), pct);
+                auto w = se.takeWarning();
+                if (!w.empty()) {
+                    say("{}", w);
+                }
+                if (advice.drop) {
+                    say("spam: press dropped ({})", advice.reason);
+                    return;
+                }
+                spamPress = down && se.inBurst();
+            }
+        }
         if (!buf.simulating && button == 1 && !buf.injecting) {
             auto* p1 = this->m_player1;
             if (down || (p1 && (p1->m_isDart || p1->m_isRobot))) {
@@ -7713,6 +7826,13 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
             benchInput(down);  // v2.75: what the game really gets (your clicks and delayed ones)
         }
         GJBaseGameLayer::handleButton(down, button, isPlayer1);
+        if (spamPress) {
+            spamPredict(typeinfo_cast<PlayLayer*>(static_cast<GJBaseGameLayer*>(this)));
+            auto w = spam::engine().takeWarning();
+            if (!w.empty()) {
+                say("{}", w);
+            }
+        }
     }
 
     void playerTouchedRing(PlayerObject* player, RingObject* ring) {
