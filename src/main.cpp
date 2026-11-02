@@ -306,6 +306,15 @@ namespace {
         CCDrawNode* pathNode = nullptr;  // v2.11: owned by the level's object layer
         CCLabelBMFont* ghostLabel = nullptr;  // v3.3: one-line verdict of the ghost comparison
         bool ghostCompare = true;        // v3.3: show your input and the buffered input side by side
+        bool reviewOn = true;            // v3.5: after a death, show the last decision's comparison again
+        bool reviewShown = false;        // the review is on screen now (kept until you pass it)
+        struct Review {
+            std::vector<CCPoint> original, buffered;
+            bool originalDied = false, bufferedDied = false, valid = false;
+            int delay = 0, tick = 0;
+            float gap = 0.f, maxX = 0.f;
+            CCPoint labelPos {};
+        } review;
         int pathHoldUntil = 0;       // v2.65: live path waits while a click's path is on screen
 
         std::unordered_set<GameObject*> simUsed;
@@ -606,6 +615,7 @@ namespace {
         buf.fullState = mod->getSettingValue<bool>("full-ghost-state");
         buf.learn = mod->getSettingValue<bool>("level-memory");
         buf.ghostCompare = mod->getSettingValue<bool>("ghost-compare");
+        buf.reviewOn = mod->getSettingValue<bool>("ghost-review");
         buf.sectionLearn = mod->getSettingValue<bool>("section-learning");
         buf.sectionLoop = mod->getSettingValue<bool>("section-loop");
         buf.robotSmart = mod->getSettingValue<bool>("robot-smart");
@@ -845,6 +855,8 @@ namespace {
         buf.panelLines.clear();
         buf.pathNode = nullptr;
         buf.ghostLabel = nullptr;
+        buf.review = {};
+        buf.reviewShown = false;
         buf.autoTag = nullptr;
         buf.watermark = nullptr;
         buf.simulating = false;
@@ -3035,17 +3047,32 @@ namespace {
         return gap;
     }
 
-    void showGhostLabel(PlayerObject* p1, bool originalDied, bool bufferedDied, int delay, float gap) {
-        if (!buf.ghostLabel || !p1) {
+    void showGhostLabel(CCPoint pos, bool originalDied, bool bufferedDied, int delay, float gap, bool review = false) {
+        if (!buf.ghostLabel) {
             return;
         }
-        std::string text = fmt::format("yours: {}   buffered: {}   {}",
+        std::string text = fmt::format("{}yours: {}   buffered: {}   {}", review ? "last decision, " : "",
             originalDied ? "crash" : "safe", bufferedDied ? "crash" : "safe",
             delay > 0 ? fmt::format("held {:g}f, gap {:.1f} blocks", delay * TICK, gap / 30.f) : std::string("no delay needed"));
         buf.ghostLabel->setString(text.c_str());
         buf.ghostLabel->setColor(bufferedDied ? ccColor3B { 255, 110, 110 } : ccColor3B { 255, 255, 255 });
-        buf.ghostLabel->setPosition(p1->getPosition() + CCPoint { 0.f, 42.f });
+        buf.ghostLabel->setPosition(pos + CCPoint { 0.f, 42.f });
         buf.ghostLabel->setVisible(true);
+    }
+
+    // v3.5 death review: when you die, the last decision's two paths are drawn again and stay
+    // up through the next attempt until you pass that spot (or make a new decision there)
+    void showReview() {
+        if (!buf.showPath || !buf.ghostCompare || !buf.reviewOn || !buf.pathNode || !buf.review.valid) {
+            return;
+        }
+        if (tickCount - buf.review.tick > st(480)) {  // only a recent decision explains this death
+            return;
+        }
+        clearPathNode();
+        drawGhostComparison(buf.review.original, buf.review.originalDied, buf.review.buffered, buf.review.bufferedDied, buf.review.delay);
+        showGhostLabel(buf.review.labelPos, buf.review.originalDied, buf.review.bufferedDied, buf.review.delay, buf.review.gap, true);
+        buf.reviewShown = true;
     }
 
     void drawPath(std::vector<CCPoint> const& path, int delay, ccColor4F color, bool died) {
@@ -3065,6 +3092,7 @@ namespace {
             return;
         }
         clearPathNode();
+        buf.reviewShown = false;  // a new decision replaces the review
         buf.pathHoldUntil = tickCount + st(45);
         bool nowDied = false;
         auto now = recordRun(layer, p1, p2, dual, 0, down, horizon, releaseAfter, &nowDied);
@@ -3079,7 +3107,21 @@ namespace {
                 buffered = now;
             }
             float gap = drawGhostComparison(now, nowDied, buffered, bufferedDied, chosen);
-            showGhostLabel(p1, nowDied, bufferedDied, chosen, gap);
+            showGhostLabel(p1->getPosition(), nowDied, bufferedDied, chosen, gap);
+            // v3.5: remember this decision for the death review
+            buf.review.original = now;
+            buf.review.buffered = buffered;
+            buf.review.originalDied = nowDied;
+            buf.review.bufferedDied = bufferedDied;
+            buf.review.delay = chosen;
+            buf.review.gap = gap;
+            buf.review.tick = tickCount;
+            buf.review.labelPos = p1->getPosition();
+            buf.review.maxX = p1->getPosition().x;
+            for (auto const& pt : buffered) {
+                buf.review.maxX = std::max(buf.review.maxX, pt.x);
+            }
+            buf.review.valid = true;
         }
         else {
             ccColor4F red { 1.f, 0.3f, 0.3f, 0.85f };
@@ -3773,6 +3815,13 @@ namespace {
     // After a click, that click's path (red / green) stays up briefly first.
     void livePath(PlayLayer* layer, PlayerObject* p1) {
         if (!buf.showPath || buf.perfMode || !buf.pathNode || !buf.ghost1 || buf.simulating || p1->m_isDead || layer->m_isPlatformer) {
+            return;
+        }
+        if (buf.reviewShown) {
+            if (p1->getPosition().x > buf.review.maxX + 30.f) {
+                buf.reviewShown = false;
+                clearPathNode();
+            }
             return;
         }
         if (tickCount < buf.pathHoldUntil || !buf.queue.empty() || tickCount % st(12) != 0) {
@@ -5081,6 +5130,7 @@ class BufferMenu : public geode::Popup {
     static constexpr Option VISUALS[] = {
         { "show-path", "Path view at start" },
         { "ghost-compare", "Ghost comparison" },
+        { "ghost-review", "Review last decision" },
         { "death-heatmap", "Death heatmap" },
         { "save-ding", "Ding on save" },
     };
@@ -5097,7 +5147,7 @@ class BufferMenu : public geode::Popup {
     };
     static constexpr char const* TABS[] = { "Overview", "Prediction", "Game Modes", "Automation", "Memory", "Sections", "Performance",
         "Visuals", "Tools", "About" };
-    static constexpr char const* THEMES[] = { "AMOLED", "Light", "Graphite" };
+    static constexpr char const* THEMES[] = { "AMOLED", "Light", "Graphite", "Midnight", "Ocean", "Forest", "Rose", "Paper", "Custom" };
     static constexpr char const* ABOUT_URL = "https://github.com/Zeptoreal1/-predictive-input-buffer";
 
     struct Theme {
@@ -5106,10 +5156,71 @@ class BufferMenu : public geode::Popup {
         char const* button;
     };
 
+    static ccColor3B mixColor(ccColor3B a, ccColor3B b, float t) {
+        auto ch = [&](GLubyte x, GLubyte y) { return static_cast<GLubyte>(std::clamp(x + (y - x) * t, 0.f, 255.f)); };
+        return { ch(a.r, b.r), ch(a.g, b.g), ch(a.b, b.b) };
+    }
+
+    static int luminance(ccColor3B c) {
+        return (c.r * 299 + c.g * 587 + c.b * 114) / 1000;
+    }
+
+    // a whole theme from four colours: window (main), panels (secondary), text and accent;
+    // the lines, muted text, switch-off colour and text-on-accent are worked out from them
+    static Theme makeTheme(ccColor3B bg, ccColor3B surface, ccColor3B text, ccColor3B accent) {
+        Theme t {};
+        bool light = luminance(bg) > 140;
+        t.bg = bg;
+        t.surface = surface;
+        t.text = text;
+        t.accent = accent;
+        t.line = mixColor(surface, text, 0.16f);
+        t.muted = mixColor(text, bg, 0.45f);
+        t.onAccent = luminance(accent) > 150 ? ccColor3B { 12, 14, 20 } : ccColor3B { 255, 255, 255 };
+        t.off = mixColor(surface, text, 0.28f);
+        t.warn = light ? ccColor3B { 180, 95, 6 } : ccColor3B { 245, 175, 50 };
+        t.bad = light ? ccColor3B { 200, 40, 40 } : ccColor3B { 248, 113, 113 };
+        t.light = light;
+        t.button = "GJ_button_06.png";
+        return t;
+    }
+
+    // changes whenever the theme, the custom colours or the background picture change
+    static std::string themeKey() {
+        auto* mod = Mod::get();
+        auto hex = [&](char const* key) {
+            auto c = mod->getSettingValue<ccColor3B>(key);
+            return fmt::format("{:02x}{:02x}{:02x}", static_cast<int>(c.r), static_cast<int>(c.g), static_cast<int>(c.b));
+        };
+        return mod->getSettingValue<std::string>("menu-theme") + hex("custom-main") + hex("custom-secondary") + hex("custom-accent")
+            + hex("custom-text") + mod->getSettingValue<std::filesystem::path>("menu-background").string();
+    }
+
 public:
-    // the "Menu theme" setting: AMOLED (pure black), Light (white, dark text) or Graphite
+    // the "Menu theme" setting: AMOLED (pure black), Light, Graphite, Midnight, Ocean, Forest,
+    // Rose, Paper, or Custom (your own main, secondary, accent and text colours)
     static Theme currentTheme() {
         auto name = Mod::get()->getSettingValue<std::string>("menu-theme");
+        if (name == "Midnight") {
+            return makeTheme({ 8, 12, 28 }, { 16, 22, 46 }, { 232, 238, 255 }, { 99, 132, 255 });
+        }
+        if (name == "Ocean") {
+            return makeTheme({ 6, 20, 26 }, { 12, 34, 44 }, { 226, 244, 248 }, { 34, 211, 238 });
+        }
+        if (name == "Forest") {
+            return makeTheme({ 9, 18, 13 }, { 16, 32, 24 }, { 228, 244, 234 }, { 74, 222, 128 });
+        }
+        if (name == "Rose") {
+            return makeTheme({ 20, 10, 16 }, { 36, 18, 28 }, { 252, 232, 240 }, { 251, 113, 133 });
+        }
+        if (name == "Paper") {
+            return makeTheme({ 250, 247, 240 }, { 240, 235, 224 }, { 40, 36, 30 }, { 194, 98, 32 });
+        }
+        if (name == "Custom") {
+            auto* mod = Mod::get();
+            return makeTheme(mod->getSettingValue<ccColor3B>("custom-main"), mod->getSettingValue<ccColor3B>("custom-secondary"),
+                mod->getSettingValue<ccColor3B>("custom-text"), mod->getSettingValue<ccColor3B>("custom-accent"));
+        }
         if (name == "Light") {
             return { { 255, 255, 255 }, { 243, 245, 249 }, { 214, 219, 228 }, { 17, 19, 26 }, { 96, 103, 118 }, { 37, 99, 235 },
                 { 255, 255, 255 }, { 200, 206, 217 }, { 180, 95, 6 }, { 200, 40, 40 }, true, "GJ_button_06.png" };
@@ -5146,6 +5257,7 @@ private:
     ccColor3B m_hi = m_t.accent;  // highlight: values, active marks
     bool m_hasImage = false;
     CCNode* m_chrome = nullptr;   // the window frame, rebuilt when the theme changes
+    std::string m_themeKey = themeKey();
 
     void applyTheme() {
         m_t = currentTheme();
@@ -5819,17 +5931,19 @@ private:
     void pageVisuals() {
         heading("Visuals", "Path display, indicators and how the menu looks.");
         float top = pageTop() - 40.f;
-        card(top + 12.f, 2 * ROW + 4.f);
+        float rows = static_cast<float>((std::size(VISUALS) + 1) / 2);  // the layout follows the option count
+        card(top + 12.f, rows * ROW + 4.f);
         optionGrid(VISUALS, std::size(VISUALS), top);
-        float y = top - 2 * ROW - 16.f;
+        float y = top - rows * ROW - 16.f;
         card(y + 11.f, 24.f);
         label(m_page, "Menu theme", 0.5f, m_muted, { SIDE + 20.f, y }, { 0.f, 0.5f });
         button(m_pageMenu, Mod::get()->getSettingValue<std::string>("menu-theme"), menu_selector(BufferMenu::onTheme), { W - 58.f, y }, 84.f, true, 0, 16.f);
         y -= 28.f;
         card(y + 11.f, 24.f);
-        label(m_page, "Background image", 0.5f, m_muted, { SIDE + 20.f, y }, { 0.f, 0.5f });
-        button(m_pageMenu, "Choose", menu_selector(BufferMenu::onAllSettings), { W - 58.f, y }, 84.f, false, 0, 16.f);
-        note("Pick a picture under Menu background in Settings. It is dimmed for readability.", y - 20.f, m_muted);
+        label(m_page, "Custom colours, image", 0.5f, m_muted, { SIDE + 20.f, y }, { 0.f, 0.5f });
+        button(m_pageMenu, "Colours", menu_selector(BufferMenu::onAllSettings), { W - 92.f, y }, 62.f, false, 0, 16.f);
+        button(m_pageMenu, "Image", menu_selector(BufferMenu::onAllSettings), { W - 30.f, y }, 52.f, false, 0, 16.f);
+        note("Choose the Custom theme, then set main, secondary, accent and text colours in Settings.", y - 20.f, m_muted);
         note("Ghost comparison: dashed amber = your input as pressed, solid cyan = what the game gets.", y - 33.f, m_muted);
         note("White dot = where a delayed input fires, red dot = crash. Shown with the path view (F10).", y - 46.f, m_muted);
     }
@@ -6008,6 +6122,10 @@ private:
         m_infoTimer -= dt;
         if (m_infoTimer <= 0.f) {
             m_infoTimer = 0.5f;
+            if (themeKey() != m_themeKey) {  // changed in the settings: custom colours, theme, picture
+                reloadTheme();
+                return;
+            }
             refreshInfo();
         }
     }
@@ -6175,6 +6293,12 @@ private:
         }
         Mod::get()->setSettingValue<std::string>("menu-theme", THEMES[(idx + 1) % std::size(THEMES)]);
         say("menu theme: {}", THEMES[(idx + 1) % std::size(THEMES)]);
+        reloadTheme();
+    }
+
+    // re-reads the theme and rebuilds the window frame and the page in the new colours
+    void reloadTheme() {
+        m_themeKey = themeKey();
         applyTheme();
         if (m_chrome) {
             m_chrome->removeFromParent();
@@ -6500,6 +6624,7 @@ class $modify(BufPlayLayer, PlayLayer) {
         buf.autoClicked = false;
         buf.rapid = 0;
         forgetPress();
+        showReview();
         memoryDeath();
         benchFinish();
         refreshHeatmap();
@@ -6716,7 +6841,7 @@ class $modify(BufPlayLayer, PlayLayer) {
         resetPending();
         forgetPress();
         refreshAutoTag();
-        if (buf.pathNode) {
+        if (buf.pathNode && !buf.reviewShown) {
             clearPathNode();
         }
         buf.autoReleased = false;
