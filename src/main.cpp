@@ -49,6 +49,7 @@
 #include <filesystem>
 #include <functional>
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <thread>
 #include <unordered_map>
@@ -313,7 +314,10 @@ namespace {
         bool counterfactual = true;      // v3.6: would a frame earlier / later have saved it?
         bool spamMeter = false;          // v3.6: CPS and how steady your spam is
         CCLabelBMFont* hudLabel = nullptr;
-        std::string hudForecast, hudSpam, hudDeath, hudAnalyze;
+        std::string hudForecast, hudSpam, hudDeath, hudAnalyze, hudOptimal;
+        bool spamLimiter = false, spamStabilizer = false, spamLock = false, spamAdaptive = false;  // v3.9, practice only
+        bool spamLearn = true;
+        float spamMinGap = 2.f, spamStabCap = 1.5f;  // in frames
         bool routeRecord = true;         // v3.7: practice mode only
         bool routeReplay = false;        // v3.7: practice mode only
         int analyzeLimit = 200;          // v3.7: attempts an auto-analyze session may use
@@ -631,6 +635,13 @@ namespace {
         buf.deathExplain = mod->getSettingValue<bool>("death-explain");
         buf.counterfactual = mod->getSettingValue<bool>("ghost-counterfactual");
         buf.spamMeter = mod->getSettingValue<bool>("spam-meter");
+        buf.spamLimiter = mod->getSettingValue<bool>("spam-limiter");
+        buf.spamStabilizer = mod->getSettingValue<bool>("spam-stabilizer");
+        buf.spamLock = mod->getSettingValue<bool>("spam-rhythm-lock");
+        buf.spamAdaptive = mod->getSettingValue<bool>("spam-adaptive");
+        buf.spamLearn = mod->getSettingValue<bool>("spam-learn");
+        buf.spamMinGap = static_cast<float>(mod->getSettingValue<double>("spam-min-gap"));
+        buf.spamStabCap = static_cast<float>(mod->getSettingValue<double>("spam-stabilizer-cap"));
         buf.routeRecord = mod->getSettingValue<bool>("route-record");
         buf.routeReplay = mod->getSettingValue<bool>("route-replay");
         buf.analyzeLimit = static_cast<int>(std::clamp<int64_t>(mod->getSettingValue<int64_t>("analyze-attempt-limit"), 10, 5000));
@@ -878,6 +889,7 @@ namespace {
         buf.hudSpam.clear();
         buf.hudDeath.clear();
         buf.hudAnalyze.clear();
+        buf.hudOptimal.clear();
         buf.botTag = nullptr;
         buf.review = {};
         buf.reviewShown = false;
@@ -2209,7 +2221,7 @@ namespace {
             return;
         }
         std::string text;
-        for (auto const* part : { &buf.hudAnalyze, &buf.hudForecast, &buf.hudSpam, &buf.hudDeath }) {
+        for (auto const* part : { &buf.hudAnalyze, &buf.hudForecast, &buf.hudOptimal, &buf.hudSpam, &buf.hudDeath }) {
             if (!part->empty()) {
                 text += text.empty() ? "" : "\n";
                 text += *part;
@@ -2227,7 +2239,7 @@ namespace {
 
     // Spam meter: clicks per second and how even the gaps between your clicks are
     void spamNote(bool down) {
-        if (!buf.spamMeter || !down) {
+        if (!(buf.spamMeter || buf.spamLearn || buf.spamLimiter || buf.spamStabilizer || buf.spamLock) || !down) {
             return;
         }
         double now = nowSeconds();
@@ -2256,6 +2268,9 @@ namespace {
             var += (g - mean) * (g - mean);
         }
         double jitter = mean > 0.0 ? std::sqrt(var / static_cast<double>(gaps.size())) / mean : 0.0;
+        if (!buf.spamMeter) {
+            return;
+        }
         buf.hudSpam = fmt::format("spam: {} CPS, {} ({:.0f}% jitter)", recent, jitter < 0.12 ? "steady" : (jitter < 0.3 ? "a little uneven" : "uneven"), jitter * 100.0);
         updateHud();
     }
@@ -2546,6 +2561,296 @@ namespace {
         }
     }
 
+    // ---------- v3.9 spam engine (PRACTICE MODE ONLY) ----------
+    // Changes how your own clicks are timed, so every part checks for practice mode and the big
+    // tag shows while it is on. Runs that use it are never legitimate.
+    //   Rate limiter   drops a press that comes closer than the minimum gap after the last one
+    //   Stabilizer     delays a spam press (never earlier) so the gaps match your own average rhythm
+    //   Rhythm lock    after steady spam, keep the button held and the mod keeps tapping at that rhythm
+    //   Adaptive rate  the lock uses the best clicks per second learned for this part of the level
+    //   CPS learning   notes, per 5% of the level, which spam rates got through and which died
+    bool spamEngineOn() {
+        return buf.spamLimiter || buf.spamStabilizer || buf.spamLock;
+    }
+
+    bool spamPractice(PlayLayer* layer) {
+        return layer && layer->m_isPracticeMode && !layer->m_isPlatformer && layer->m_player1;
+    }
+
+    float tickFrames() {
+        return buf.tickLength > 0.001f ? buf.tickLength : TICK;  // frames (of 1/60 s) per physics tick
+    }
+
+    double ticksPerSecond() {
+        return 60.0 / tickFrames();
+    }
+
+    int spamLastAccepted = -100000;
+    int spamRawPressTick = -100000;
+    int spamShift = 0;
+    bool spamDropped = false;
+
+    // the steady rhythm of your own taps in seconds between presses, or 0 if there is none
+    double spamInterval() {
+        if (spamTimes.size() < 5 || nowSeconds() - spamTimes.back() > 0.6) {
+            return 0.0;
+        }
+        size_t from = spamTimes.size() > 8 ? spamTimes.size() - 8 : 0;
+        std::vector<double> gaps;
+        for (size_t i = from + 1; i < spamTimes.size(); ++i) {
+            gaps.push_back(spamTimes[i] - spamTimes[i - 1]);
+        }
+        double mean = 0.0;
+        for (double g : gaps) {
+            mean += g;
+        }
+        mean /= static_cast<double>(gaps.size());
+        double var = 0.0;
+        for (double g : gaps) {
+            var += (g - mean) * (g - mean);
+        }
+        double jitter = mean > 0.0 ? std::sqrt(var / static_cast<double>(gaps.size())) / mean : 1.0;
+        return jitter < 0.3 && mean < 0.5 ? mean : 0.0;
+    }
+
+    int currentCps() {
+        double now = nowSeconds();
+        int n = 0;
+        for (double t : spamTimes) {
+            n += now - t <= 1.0 ? 1 : 0;
+        }
+        return n;
+    }
+
+    // ---- optimal CPS finder: per 5% of the level, how often each spam rate got through
+    constexpr int SPAM_BINS = 20;
+    constexpr int SPAM_CPS = 25;
+    std::array<std::array<std::array<uint32_t, 2>, SPAM_CPS>, SPAM_BINS> spamData {};  // [bin][cps] = {passed, died}
+    bool spamDataDirty = false;
+    int spamBin = -1;
+    int spamBinCps = -1;
+    bool lockActive = false;
+    int lockIntervalTicks = 0;
+
+    struct BestCps {
+        int cps = -1;
+        uint32_t passed = 0, total = 0;
+    };
+
+    BestCps bestCpsFor(int bin) {
+        BestCps best;
+        if (bin < 0 || bin >= SPAM_BINS) {
+            return best;
+        }
+        double bestRate = -1.0;
+        for (int c = 4; c < SPAM_CPS; ++c) {
+            uint32_t passed = spamData[bin][c][0], total = passed + spamData[bin][c][1];
+            if (total < 3) {
+                continue;
+            }
+            double rate = static_cast<double>(passed) / total;
+            if (rate > bestRate || (rate == bestRate && total > best.total)) {
+                bestRate = rate;
+                best = { c, passed, total };
+            }
+        }
+        return best;
+    }
+
+    std::filesystem::path spamFile() {
+        return Mod::get()->getSaveDir() / "memory" / (memoryKey + "_spam.txt");
+    }
+
+    void loadSpam() {
+        spamData = {};
+        spamDataDirty = false;
+        spamBin = spamBinCps = -1;
+        lockActive = false;
+        if (memoryKey.empty()) {
+            return;
+        }
+        std::ifstream in(spamFile());
+        int bin = 0, cps = 0;
+        uint32_t passed = 0, died = 0;
+        while (in >> bin >> cps >> passed >> died) {
+            if (bin >= 0 && bin < SPAM_BINS && cps >= 0 && cps < SPAM_CPS) {
+                spamData[bin][cps] = { passed, died };
+            }
+        }
+    }
+
+    void saveSpam() {
+        if (!spamDataDirty || memoryKey.empty()) {
+            return;
+        }
+        std::error_code ec;
+        std::filesystem::create_directories(spamFile().parent_path(), ec);
+        std::ofstream out(spamFile(), std::ios::trunc);
+        for (int b = 0; b < SPAM_BINS; ++b) {
+            for (int c = 0; c < SPAM_CPS; ++c) {
+                if (spamData[b][c][0] + spamData[b][c][1] > 0) {
+                    out << b << ' ' << c << ' ' << spamData[b][c][0] << ' ' << spamData[b][c][1] << '\n';
+                }
+            }
+        }
+        spamDataDirty = false;
+    }
+
+    void spamLearnReset() {
+        spamBin = spamBinCps = -1;
+        buf.hudOptimal.clear();
+    }
+
+    int spamCpsBucket() {
+        int cps = lockActive && lockIntervalTicks > 0 ? static_cast<int>(std::lround(ticksPerSecond() / lockIntervalTicks)) : currentCps();
+        return std::clamp(cps, 0, SPAM_CPS - 1);
+    }
+
+    void spamLearnTick(PlayLayer* layer) {
+        if (!buf.spamLearn || !layer || !layer->m_player1 || buf.simulating || layer->m_isPlatformer || memoryKey.empty()) {
+            return;
+        }
+        int bin = std::clamp(static_cast<int>(sectionPercent(layer, layer->m_player1) / 5.f), 0, SPAM_BINS - 1);
+        int cps = spamCpsBucket();
+        if (bin != spamBin) {
+            if (spamBin >= 0 && spamBinCps >= 4) {  // left the part alive while spamming at this rate
+                ++spamData[spamBin][spamBinCps][0];
+                spamDataDirty = true;
+            }
+            spamBin = bin;
+            spamBinCps = -1;
+            auto best = bestCpsFor(bin);
+            buf.hudOptimal = best.cps >= 0 ? fmt::format("best spam rate here: {} CPS ({}/{} got through)", best.cps, best.passed, best.total) : std::string();
+            updateHud();
+        }
+        if (cps >= 4) {
+            spamBinCps = cps;
+        }
+    }
+
+    void spamLearnDeath() {
+        if (buf.spamLearn && spamBin >= 0 && spamBinCps >= 4) {
+            ++spamData[spamBin][spamBinCps][1];
+            spamDataDirty = true;
+        }
+        spamBinCps = -1;
+    }
+
+    // ---- limiter and stabilizer: run on your real button presses (practice only)
+    bool spamShape(PlayLayer* layer, bool down) {
+        if (!spamEngineOn() || !spamPractice(layer)) {
+            return false;
+        }
+        int now = tickCount;
+        if (!down) {
+            if (spamDropped) {  // its press was dropped, so drop the release as well
+                spamDropped = false;
+                return true;
+            }
+            if (spamShift > 0) {  // keep the same hold length as the delayed press
+                buf.queue.push_back({ spamShift, false });
+                return true;
+            }
+            return false;
+        }
+        spamDropped = false;
+        spamShift = 0;
+        spamRawPressTick = now;
+        if (buf.spamLimiter) {
+            int minGap = std::max(1, static_cast<int>(std::lround(buf.spamMinGap / tickFrames())));
+            if (now - spamLastAccepted < minGap) {
+                spamDropped = true;
+                return true;
+            }
+        }
+        if (buf.spamStabilizer) {
+            double interval = spamInterval();
+            if (interval > 0.0) {
+                int target = spamLastAccepted + static_cast<int>(std::lround(interval * ticksPerSecond()));
+                int delay = target - now;
+                int cap = std::max(1, static_cast<int>(std::lround(buf.spamStabCap / tickFrames())));
+                if (delay > 0 && delay <= cap) {
+                    spamShift = delay;
+                    spamLastAccepted = target;
+                    buf.queue.push_back({ delay, true });
+                    return true;
+                }
+            }
+        }
+        spamLastAccepted = now;
+        return false;
+    }
+
+    // ---- rhythm lock: after steady spam, keep the button held and the mod keeps tapping
+    bool lockPressed = false;
+    int lockNext = 0;
+    int lockHoldTicks = 1;
+
+    void lockStop(PlayLayer* layer) {
+        if (lockActive && lockPressed && layer) {
+            sendButton(layer, false);
+        }
+        lockActive = lockPressed = false;
+        buf.autoReleased = false;
+    }
+
+    void spamLockTick(PlayLayer* layer) {
+        if (!buf.spamLock || !spamPractice(layer) || layer->m_player1->m_isDead || buf.simulating) {
+            if (lockActive) {
+                lockStop(layer);
+            }
+            return;
+        }
+        int now = tickCount;
+        auto rhythm = [&]() {
+            double interval = spamInterval();
+            int ticks = interval > 0.0 ? static_cast<int>(std::lround(interval * ticksPerSecond())) : lockIntervalTicks;
+            if (buf.spamAdaptive) {
+                auto best = bestCpsFor(std::clamp(static_cast<int>(sectionPercent(layer, layer->m_player1) / 5.f), 0, SPAM_BINS - 1));
+                if (best.cps >= 4) {
+                    ticks = static_cast<int>(std::lround(ticksPerSecond() / best.cps));
+                }
+            }
+            return std::max(2, ticks);
+        };
+        if (!lockActive) {
+            // engage: a steady rhythm is known and the button has now been held longer than one beat
+            double interval = spamInterval();
+            if (!buf.realInput || interval <= 0.0) {
+                return;
+            }
+            int beat = static_cast<int>(std::lround(interval * ticksPerSecond()));
+            if (now - spamRawPressTick < beat * 13 / 10) {
+                return;
+            }
+            lockIntervalTicks = rhythm();
+            lockHoldTicks = std::max(1, lockIntervalTicks * 2 / 5);
+            lockActive = true;
+            lockPressed = true;
+            lockNext = now;  // release first, then press on the beat
+            say("rhythm lock on: {:.1f} CPS", ticksPerSecond() / lockIntervalTicks);
+        }
+        if (!buf.realInput) {  // you let go: the lock ends
+            lockStop(layer);
+            return;
+        }
+        buf.autoReleased = true;  // the mod owns the button now; your hold is the "keep going" signal
+        if (now >= lockNext) {
+            if (lockPressed) {
+                sendButton(layer, false);
+                lockPressed = false;
+                lockNext = now + std::max(1, lockIntervalTicks - lockHoldTicks);
+            }
+            else {
+                lockIntervalTicks = rhythm();
+                lockHoldTicks = std::max(1, lockIntervalTicks * 2 / 5);
+                sendButton(layer, true);
+                lockPressed = true;
+                lockNext = now + lockHoldTicks;
+            }
+        }
+    }
+
     // ---------- v3.7 route recorder, route replay and auto-analyze (PRACTICE MODE ONLY) ----------
     // Every part here checks for practice mode on every tick and shows a big tag on screen while
     // it is sending inputs. Practice runs can't be submitted, and the tag can't be turned off.
@@ -2621,10 +2926,21 @@ namespace {
             return;
         }
         auto* layer = GameManager::get()->m_playLayer;
-        bool on = layer && layer->m_isPracticeMode && (routeReplaying || analyze.running);
-        buf.botTag->setVisible(on);
-        if (on) {
-            buf.botTag->setString(routeReplaying ? "BOT ROUTE REPLAY | PRACTICE ONLY" : "AUTO-ANALYZE | PRACTICE ONLY");
+        bool practice = layer && layer->m_isPracticeMode;
+        int state = !practice ? 0 : (routeReplaying ? 1 : (analyze.running ? 2 : (spamEngineOn() ? 3 : 0)));
+        static int shown = -1;
+        static CCLabelBMFont* lastTag = nullptr;
+        if (lastTag != buf.botTag) {  // a new level made a new tag
+            lastTag = buf.botTag;
+            shown = -1;
+        }
+        if (state == shown) {
+            return;
+        }
+        shown = state;
+        buf.botTag->setVisible(state != 0);
+        if (state != 0) {
+            buf.botTag->setString(state == 1 ? "BOT ROUTE REPLAY | PRACTICE ONLY" : (state == 2 ? "AUTO-ANALYZE | PRACTICE ONLY" : "SPAM ENGINE | PRACTICE ONLY"));
         }
     }
 
@@ -2695,6 +3011,7 @@ namespace {
     void routeBegin(PlayLayer* layer) {
         routeCur.clear();
         routeNext = 0;
+        spamLearnReset();
         bool practice = layer && layer->m_isPracticeMode && !layer->m_isPlatformer && layer->m_player1;
         bool noCheckpoint = layer && (!layer->m_checkpointArray || layer->m_checkpointArray->count() == 0);
         bool fromStart = practice && noCheckpoint && layer->m_player1->getPositionX() < 600.f;
@@ -2724,6 +3041,7 @@ namespace {
 
     // per tick: re-checks practice mode, then sends the saved inputs that are due
     void routeTick(PlayLayer* layer) {
+        refreshBotTag();
         if (analyze.running && (!layer->m_isPracticeMode || layer->m_isPlatformer)) {
             analyzeStop("left practice mode");
         }
@@ -2761,6 +3079,209 @@ namespace {
         routeStopReplay(layer);
     }
 
+    // ---------- v3.8 macro analyzer ----------
+    // Reads a replay file you put in the mod's "macros" folder and reports what is in it: input
+    // counts, duration, clicks per second, hold times and spam sections. It only reads the file;
+    // nothing is replayed. JSON replays (.gdr / .json) are decoded. Binary .gdr2 files are
+    // recognised but their layout is not decoded yet.
+    struct MacroInput {
+        int frame = 0;
+        int button = 1;
+        bool down = false;
+        bool player2 = false;
+    };
+    struct MacroData {
+        bool ok = false;
+        std::string error;
+        double fps = 240.0;
+        std::vector<MacroInput> inputs;
+    };
+
+    std::optional<double> jsonNumber(std::string const& s, size_t from, size_t to, char const* key) {
+        auto pos = s.find(fmt::format("\"{}\"", key), from);
+        if (pos == std::string::npos || pos >= to) {
+            return std::nullopt;
+        }
+        pos = s.find(':', pos);
+        if (pos == std::string::npos || pos >= to) {
+            return std::nullopt;
+        }
+        char const* begin = s.c_str() + pos + 1;
+        char* end = nullptr;
+        double v = std::strtod(begin, &end);
+        return end == begin ? std::nullopt : std::optional<double>(v);
+    }
+
+    std::optional<bool> jsonBool(std::string const& s, size_t from, size_t to, char const* key) {
+        auto pos = s.find(fmt::format("\"{}\"", key), from);
+        if (pos == std::string::npos || pos >= to) {
+            return std::nullopt;
+        }
+        pos = s.find(':', pos);
+        if (pos == std::string::npos || pos >= to) {
+            return std::nullopt;
+        }
+        auto rest = s.find_first_not_of(" \t\r\n", pos + 1);
+        if (rest == std::string::npos) {
+            return std::nullopt;
+        }
+        if (s.compare(rest, 4, "true") == 0) {
+            return true;
+        }
+        if (s.compare(rest, 5, "false") == 0) {
+            return false;
+        }
+        return std::nullopt;
+    }
+
+    MacroData loadMacro(std::filesystem::path const& path) {
+        MacroData out;
+        std::ifstream in(path, std::ios::binary);
+        if (!in) {
+            out.error = "could not open the file";
+            return out;
+        }
+        std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        auto first = text.find_first_not_of(" \t\r\n\xEF\xBB\xBF");
+        if (first == std::string::npos) {
+            out.error = "the file is empty";
+            return out;
+        }
+        if (text[first] != '{') {
+            out.error = "binary replay (.gdr2): this layout isn't decoded yet. Send a sample file to add it.";
+            return out;
+        }
+        if (auto fps = jsonNumber(text, 0, text.size(), "framerate"); fps && *fps > 0) {
+            out.fps = *fps;
+        }
+        auto arr = text.find("\"inputs\"");
+        if (arr == std::string::npos) {
+            out.error = "no inputs found in this file";
+            return out;
+        }
+        size_t pos = text.find('[', arr);
+        while (pos != std::string::npos) {
+            auto open = text.find('{', pos);
+            auto close = open == std::string::npos ? std::string::npos : text.find('}', open);
+            auto endArr = text.find(']', pos);
+            if (open == std::string::npos || close == std::string::npos || (endArr != std::string::npos && endArr < open)) {
+                break;
+            }
+            MacroInput input;
+            auto frame = jsonNumber(text, open, close, "frame");
+            if (frame) {
+                input.frame = static_cast<int>(*frame);
+                input.button = static_cast<int>(jsonNumber(text, open, close, "btn").value_or(1));
+                input.down = jsonBool(text, open, close, "down").value_or(false);
+                input.player2 = jsonBool(text, open, close, "2p").value_or(false);
+                out.inputs.push_back(input);
+            }
+            pos = close + 1;
+        }
+        if (out.inputs.empty()) {
+            out.error = "no inputs found in this file";
+            return out;
+        }
+        std::stable_sort(out.inputs.begin(), out.inputs.end(), [](MacroInput const& a, MacroInput const& b) { return a.frame < b.frame; });
+        out.ok = true;
+        return out;
+    }
+
+    // the report: five short lines for the menu
+    std::vector<std::string> analyzeMacro(MacroData const& m) {
+        std::vector<std::string> lines;
+        if (!m.ok) {
+            lines.push_back(m.error);
+            return lines;
+        }
+        std::vector<double> presses;               // seconds of each jump press
+        std::vector<int> holdFrames;
+        std::array<int, 2> pressFrame { -1, -1 };  // per player
+        size_t other = 0, releases = 0;
+        for (auto const& in : m.inputs) {
+            if (in.button != 1) {
+                ++other;
+                continue;
+            }
+            int p = in.player2 ? 1 : 0;
+            if (in.down) {
+                presses.push_back(in.frame / m.fps);
+                pressFrame[p] = in.frame;
+            }
+            else {
+                ++releases;
+                if (pressFrame[p] >= 0) {
+                    holdFrames.push_back(in.frame - pressFrame[p]);
+                    pressFrame[p] = -1;
+                }
+            }
+        }
+        double duration = m.inputs.back().frame / m.fps;
+        lines.push_back(fmt::format("{} inputs ({} presses, {} releases{}), {:.1f}s, {:g} fps", m.inputs.size(), presses.size(), releases,
+            other ? fmt::format(", {} other buttons", other) : std::string(), duration, m.fps));
+        if (presses.size() < 2) {
+            lines.push_back("Not enough presses to measure clicks per second.");
+            return lines;
+        }
+        // peak clicks per second: most presses inside any one second
+        size_t peak = 0;
+        double peakAt = 0.0;
+        for (size_t i = 0, j = 0; i < presses.size(); ++i) {
+            while (presses[i] - presses[j] >= 1.0) {
+                ++j;
+            }
+            if (i - j + 1 > peak) {
+                peak = i - j + 1;
+                peakAt = presses[j];
+            }
+        }
+        double minGap = 1e9;
+        for (size_t i = 1; i < presses.size(); ++i) {
+            minGap = std::min(minGap, presses[i] - presses[i - 1]);
+        }
+        lines.push_back(fmt::format("Clicks per second: {:.1f} average, {} peak at {:.1f}s. Shortest gap {:.0f} ms ({:.1f} frames).",
+            presses.size() / std::max(duration, 0.001), peak, peakAt, minGap * 1000.0, minGap * m.fps));
+        if (!holdFrames.empty()) {
+            int lo = *std::min_element(holdFrames.begin(), holdFrames.end());
+            int hi = *std::max_element(holdFrames.begin(), holdFrames.end());
+            double avg = 0.0;
+            for (int h : holdFrames) {
+                avg += h;
+            }
+            avg /= static_cast<double>(holdFrames.size());
+            lines.push_back(fmt::format("Holds: shortest {:.0f} ms, average {:.0f} ms, longest {:.0f} ms.", lo * 1000.0 / m.fps, avg * 1000.0 / m.fps,
+                hi * 1000.0 / m.fps));
+        }
+        // spam sections: runs of presses closer than 0.18 s (over 5.5 CPS), at least 6 presses
+        struct Spam {
+            double from, to;
+            size_t count;
+        };
+        std::vector<Spam> spam;
+        size_t start = 0;
+        for (size_t i = 1; i <= presses.size(); ++i) {
+            if (i == presses.size() || presses[i] - presses[i - 1] > 0.18) {
+                if (i - start >= 6) {
+                    spam.push_back({ presses[start], presses[i - 1], i - start });
+                }
+                start = i;
+            }
+        }
+        std::sort(spam.begin(), spam.end(), [](Spam const& a, Spam const& b) { return a.count > b.count; });
+        if (spam.empty()) {
+            lines.push_back("No spam sections (no run of 6 or more presses faster than 5.5 clicks per second).");
+        }
+        else {
+            std::string text = fmt::format("{} spam section(s). Longest: ", spam.size());
+            for (size_t i = 0; i < spam.size() && i < 3; ++i) {
+                text += fmt::format("{}{:.1f}-{:.1f}s at {:.1f} CPS", i ? ";  " : "", spam[i].from, spam[i].to,
+                    (spam[i].count - 1) / std::max(spam[i].to - spam[i].from, 0.001));
+            }
+            lines.push_back(text);
+        }
+        return lines;
+    }
+
     int sliceOf(PlayerObject* p) {
         return static_cast<int>(std::floor(p->getPosition().x / SLICE));
     }
@@ -2793,6 +3314,7 @@ namespace {
 
     void saveMemory() {
         saveSections();
+        saveSpam();
         if (!memoryDirty || memoryKey.empty()) {
             return;
         }
@@ -2863,6 +3385,7 @@ namespace {
         }
         loadSections();
         loadRoute();
+        loadSpam();
         if (!memory.empty()) {
             say("memory: {} spots learned on this level", memory.size());
         }
@@ -5595,6 +6118,13 @@ class BufferMenu : public geode::Popup {
         { "more-time-death-spots", "More time at deaths" },
         { "per-level-settings", "Per-level settings" },
     };
+    static constexpr Option SPAM_OPTS[] = {
+        { "spam-limiter", "Rate limiter" },
+        { "spam-stabilizer", "Stabilizer" },
+        { "spam-rhythm-lock", "Rhythm lock" },
+        { "spam-adaptive", "Adaptive rate" },
+        { "spam-learn", "Optimal CPS learning" },
+    };
     static constexpr Option ROUTE_OPTS[] = {
         { "route-record", "Record routes" },
         { "route-replay", "Replay saved route" },
@@ -5737,6 +6267,10 @@ private:
     static inline int s_modeSub = 0;
     static inline int s_secPage = 0;
     static inline int s_anaSub = 0;
+    static inline std::vector<std::filesystem::path> s_macroFiles;
+    static inline std::string s_macroName;                 // the file analysed now
+    static inline std::filesystem::file_time_type s_macroTime {};
+    static inline std::vector<std::string> s_macroLines;
     static inline int s_newFrom = 0;
     static inline int s_newTo = 25;
 
@@ -6455,6 +6989,96 @@ private:
         note("Debug options only log; they change nothing about the decisions.", y - 20.f, m_muted);
     }
 
+    void pageMacro() {
+        auto dir = Mod::get()->getSaveDir() / "macros";
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        s_macroFiles.clear();
+        for (auto const& entry : std::filesystem::directory_iterator(dir, ec)) {
+            if (!entry.is_regular_file(ec)) {
+                continue;
+            }
+            auto ext = entry.path().extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (ext == ".gdr2" || ext == ".gdr" || ext == ".json") {
+                s_macroFiles.push_back(entry.path());
+            }
+        }
+        std::sort(s_macroFiles.begin(), s_macroFiles.end(), [](auto const& a, auto const& b) {
+            std::error_code e1, e2;
+            return std::filesystem::last_write_time(a, e1) > std::filesystem::last_write_time(b, e2);
+        });
+        // a new or newer file is analysed as soon as this page opens
+        if (!s_macroFiles.empty()) {
+            std::error_code te;
+            auto newest = std::filesystem::last_write_time(s_macroFiles[0], te);
+            if (s_macroName != s_macroFiles[0].filename().string() || newest != s_macroTime) {
+                analyzeMacroFile(s_macroFiles[0]);
+            }
+        }
+        float y = pageTop() - 38.f;
+        button(m_pageMenu, "Open folder", menu_selector(BufferMenu::onMacroFolder), { SIDE + 52.f, y }, 84.f, false, 0, 16.f);
+        label(m_page, fmt::format("{} file(s) in the macros folder", s_macroFiles.size()), 0.42f, m_muted, { SIDE + 108.f, y }, { 0.f, 0.5f });
+        y -= 20.f;
+        for (size_t i = 0; i < s_macroFiles.size() && i < 4; ++i) {
+            bool current = s_macroFiles[i].filename().string() == s_macroName;
+            label(m_page, s_macroFiles[i].filename().string(), 0.44f, current ? m_hi : m_text, { SIDE + 14.f, y }, { 0.f, 0.5f })
+                ->limitLabelWidth(W - SIDE - 100.f, 0.44f, 0.15f);
+            button(m_pageMenu, "Analyze", menu_selector(BufferMenu::onMacroAnalyze), { W - 44.f, y }, 62.f, current, static_cast<int>(i), 16.f);
+            y -= 19.f;
+        }
+        if (s_macroFiles.empty()) {
+            note("No replay files yet. Put a .gdr2, .gdr or .json replay in the macros folder.", y, m_muted, 0.44f);
+            return;
+        }
+        y -= 6.f;
+        card(y + 10.f, 5 * 13.f + 8.f);
+        for (size_t i = 0; i < s_macroLines.size() && i < 5; ++i) {
+            label(m_page, s_macroLines[i], 0.4f, i == 0 ? m_hi : m_text, { SIDE + 16.f, y - 2.f - i * 13.f }, { 0.f, 0.5f })
+                ->limitLabelWidth(W - SIDE - 32.f, 0.4f, 0.15f);
+        }
+        note("Only reads the file. Nothing is replayed.", 20.f, m_muted);
+    }
+
+    void analyzeMacroFile(std::filesystem::path const& path) {
+        std::error_code ec;
+        s_macroName = path.filename().string();
+        s_macroTime = std::filesystem::last_write_time(path, ec);
+        s_macroLines = analyzeMacro(loadMacro(path));
+        say("macro analysed: {}", s_macroName);
+    }
+
+    void pageSpam() {
+        float top = pageTop() - 40.f;
+        float rows = static_cast<float>((std::size(SPAM_OPTS) + 1) / 2);
+        card(top + 12.f, rows * ROW + 4.f);
+        optionGrid(SPAM_OPTS, std::size(SPAM_OPTS), top);
+        float y = top - rows * ROW - 14.f;
+        label(m_page, "Best spam rate learned on this level (per 5% of the level)", 0.42f, m_muted, { SIDE + 14.f, y }, { 0.f, 0.5f });
+        std::vector<std::pair<uint32_t, int>> seen;  // samples, bin
+        for (int b = 0; b < SPAM_BINS; ++b) {
+            auto best = bestCpsFor(b);
+            if (best.cps >= 0) {
+                seen.push_back({ best.total, b });
+            }
+        }
+        std::sort(seen.rbegin(), seen.rend());
+        if (seen.empty()) {
+            y -= 12.f;
+            note("Nothing yet. Spam in practice or normal runs: it learns which rates got through (3 or more tries).", y, m_muted);
+        }
+        for (size_t i = 0; i < seen.size() && i < 4; ++i) {
+            y -= 12.f;
+            auto best = bestCpsFor(seen[i].second);
+            label(m_page, fmt::format("{}-{}%: {} CPS ({} of {} got through)", seen[i].second * 5, seen[i].second * 5 + 5, best.cps, best.passed, best.total),
+                0.4f, m_text, { SIDE + 14.f, y }, { 0.f, 0.5f });
+        }
+        y -= 16.f;
+        note("Limiter, stabilizer and rhythm lock work in practice mode only; a big SPAM ENGINE tag shows. Never legitimate.", y, m_t.warn, 0.4f);
+        note("Rhythm lock: spam steadily, then keep the button held; the mod keeps tapping at your rhythm until you let go.", y - 12.f, m_muted);
+        note("Gap and stabilizer limits are in Settings (spam-min-gap, spam-stabilizer-cap, in frames).", y - 24.f, m_muted);
+    }
+
     void pageAutopilot() {
         float top = pageTop() - 40.f;
         card(top + 12.f, ROW + 4.f);
@@ -6487,11 +7111,23 @@ private:
     }
 
     void pageAnalyzer() {
-        heading("Analyzer", s_anaSub == 0 ? "Reads the level and your runs. Nothing here sends inputs." : "Practice mode only. Sends inputs for you; a big tag shows.");
-        button(m_pageMenu, "Scan", menu_selector(BufferMenu::onAnaSub), { W - 88.f, pageTop() }, 52.f, s_anaSub == 0, 0, 16.f);
-        button(m_pageMenu, "Autopilot", menu_selector(BufferMenu::onAnaSub), { W - 30.f, pageTop() }, 52.f, s_anaSub == 1, 1, 16.f);
+        heading("Analyzer", s_anaSub == 0 ? "Reads the level and your runs. Nothing here sends inputs."
+                          : (s_anaSub == 1 ? "Practice mode only. Sends inputs for you; a big tag shows."
+                              : (s_anaSub == 2 ? "Drop a replay file in the macros folder to analyse it." : "Practice mode only. Shapes your clicks; a big tag shows.")));
+        button(m_pageMenu, "Scan", menu_selector(BufferMenu::onAnaSub), { W - 198.f, pageTop() }, 50.f, s_anaSub == 0, 0, 16.f);
+        button(m_pageMenu, "Auto", menu_selector(BufferMenu::onAnaSub), { W - 142.f, pageTop() }, 50.f, s_anaSub == 1, 1, 16.f);
+        button(m_pageMenu, "Macro", menu_selector(BufferMenu::onAnaSub), { W - 86.f, pageTop() }, 50.f, s_anaSub == 2, 2, 16.f);
+        button(m_pageMenu, "Spam", menu_selector(BufferMenu::onAnaSub), { W - 30.f, pageTop() }, 50.f, s_anaSub == 3, 3, 16.f);
+        if (s_anaSub == 3) {
+            pageSpam();
+            return;
+        }
         if (s_anaSub == 1) {
             pageAutopilot();
+            return;
+        }
+        if (s_anaSub == 2) {
+            pageMacro();
             return;
         }
         float top = pageTop() - 40.f;
@@ -6778,6 +7414,21 @@ private:
 
     void onTab(CCObject* sender) {
         s_tab = sender->getTag();
+        rebuildPage();
+    }
+
+    void onMacroFolder(CCObject*) {
+        std::error_code ec;
+        auto dir = Mod::get()->getSaveDir() / "macros";
+        std::filesystem::create_directories(dir, ec);
+        geode::utils::file::openFolder(dir);
+    }
+
+    void onMacroAnalyze(CCObject* sender) {
+        size_t i = static_cast<size_t>(sender->getTag());
+        if (i < s_macroFiles.size()) {
+            analyzeMacroFile(s_macroFiles[i]);
+        }
         rebuildPage();
     }
 
@@ -7262,6 +7913,7 @@ class $modify(BufPlayLayer, PlayLayer) {
         forgetPress();
         explainDeath(this, player, object);
         analyzeOnDeath(this, player);
+        spamLearnDeath();
         showReview();
         memoryDeath();
         benchFinish();
@@ -7704,6 +8356,10 @@ class $modify(BufPlayerObject, PlayerObject) {
             sectionTick(layer);
             spamTick();
             routeTick(layer);
+            if (!routeReplaying) {
+                spamLockTick(layer);
+            }
+            spamLearnTick(layer);
             if (buf.enabled) {
                 deliverPending(layer, this);
                 livePath(layer, this);
@@ -8384,6 +9040,9 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
             }
             if (held) {
                 return;
+            }
+            if (spamShape(this, down)) {
+                return;  // v3.9: limited or re-timed (practice only)
             }
         }
         if (!buf.simulating && button == 1) {
