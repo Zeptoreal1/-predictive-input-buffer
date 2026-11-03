@@ -9041,7 +9041,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
             if (held) {
                 return;
             }
-            if (spamShape(this, down)) {
+            if (spamShape(GameManager::get()->m_playLayer, down)) {
                 return;  // v3.9: limited or re-timed (practice only)
             }
         }
