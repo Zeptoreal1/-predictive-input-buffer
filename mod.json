@@ -6,7 +6,7 @@
 		"mac": "2.2081",
 		"ios": "2.2081"
 	},
-	"version": "v3.7.0",
+	"version": "v3.9.0",
 	"id": "aliou.aliousbuffer",
 	"name": "Aliou's Buffer",
 	"developer": "Aliou",
@@ -193,6 +193,52 @@
 			"type": "bool",
 			"name": "Spam meter",
 			"description": "Shows your clicks per second and how even your spam rhythm is. It only measures your own clicks.",
+			"default": false
+		},
+		"spam-learn": {
+			"type": "bool",
+			"name": "Optimal CPS learning",
+			"description": "Notes, per 5% of the level, which spam rates got through and which ended in a death, and shows the best rate for the part you are in. Only reads your own clicks.",
+			"default": true
+		},
+		"spam-limiter": {
+			"type": "bool",
+			"name": "Spam rate limiter (practice only)",
+			"description": "Practice mode only. Drops a press that comes closer than the minimum gap after the last one, since it could not register. A big SPAM ENGINE tag shows.",
+			"default": false
+		},
+		"spam-min-gap": {
+			"type": "float",
+			"name": "Spam limiter: minimum gap (frames)",
+			"description": "Smallest gap between presses the limiter lets through.",
+			"default": 2.0,
+			"min": 0.25,
+			"max": 10.0
+		},
+		"spam-stabilizer": {
+			"type": "bool",
+			"name": "Spam stabilizer (practice only)",
+			"description": "Practice mode only. Delays a spam press (never makes it earlier) so the gaps match your own average rhythm.",
+			"default": false
+		},
+		"spam-stabilizer-cap": {
+			"type": "float",
+			"name": "Spam stabilizer: most it may delay (frames)",
+			"description": "The most the stabilizer will hold a press back.",
+			"default": 1.5,
+			"min": 0.25,
+			"max": 6.0
+		},
+		"spam-rhythm-lock": {
+			"type": "bool",
+			"name": "Spam rhythm lock (practice only)",
+			"description": "Practice mode only. After steady spam, keep the button held and the mod keeps tapping at your rhythm until you let go. A big SPAM ENGINE tag shows.",
+			"default": false
+		},
+		"spam-adaptive": {
+			"type": "bool",
+			"name": "Adaptive spam rate (practice only)",
+			"description": "With the rhythm lock on, uses the best clicks per second learned for this part of the level instead of your own rhythm, when enough has been learned.",
 			"default": false
 		},
 		"route-record": {
