@@ -6,7 +6,7 @@
 		"mac": "2.2081",
 		"ios": "2.2081"
 	},
-	"version": "v3.9.0",
+	"version": "v3.11.0",
 	"id": "aliou.aliousbuffer",
 	"name": "Aliou's Buffer",
 	"developer": "Aliou",
@@ -165,6 +165,12 @@
 			"description": "With the path view on, draws two paths at once: your input as you pressed it (dashed, amber) and the input the game gets after buffering (solid, cyan), joined at the same moments, with a one-line verdict by the player. Practice use only.",
 			"default": true
 		},
+		"ghost-icon": {
+			"type": "bool",
+			"name": "Ghost icon on path",
+			"description": "With the path view and ghost comparison on, a translucent copy of your icon (for the mode you are in) replays the buffered run slowly on a loop, with a few faint snapshots along the way.",
+			"default": true
+		},
 		"ghost-review": {
 			"type": "bool",
 			"name": "Review last decision after a death",
@@ -176,6 +182,12 @@
 			"name": "Collision forecast",
 			"description": "Shows a line on screen with how long until the next crash if you do nothing, and whether a click right now is safe. Uses the prediction engine; sends no inputs.",
 			"default": true
+		},
+		"predictive-branching": {
+			"type": "bool",
+			"name": "Predictive branching",
+			"description": "At each decision (with the path view and ghost comparison on), also simulates the click at 0, 1, 2, 3, 4, 6 and 8 frames of delay side by side, draws each faintly (green = safe, red = crash) and lists them on screen. Costs up to five extra predictions per decision; off in performance mode.",
+			"default": false
 		},
 		"death-explain": {
 			"type": "bool",
