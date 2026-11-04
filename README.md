@@ -1,160 +1,407 @@
-<p align="center"><img src="logo.png" width="120" alt="Aliou's Buffer logo"></p>
+<p align="center">
+  <img src="logo.png" width="120" alt="Aliou's Buffer logo">
+</p>Aliou's Buffer
 
-# Aliou's Buffer
+Predictive input buffering and gameplay analysis for Geometry Dash.
 
-A predictive input-buffering [Geode](https://geode-sdk.org) mod for Geometry Dash. When you click or release a little too early, a hidden "ghost" player is simulated ahead; if it would crash, your input is held back by a few physics ticks so it lands safely. It understands orbs, pads, portals, moving objects and every game mode.
+Aliou's Buffer is a "Geode" (https://geode-sdk.org) mod that predicts upcoming player movement and adjusts input timing to help prevent avoidable collisions.
 
-> **Practice use only.** Runs that use input assistance (buffering, auto-click, auto-release, non-240 TPS) are **not legitimate** and must never be submitted for verification or leaderboards. The mod shows an on-screen tag while it is active in normal runs.
+When a press or release is predicted to cause a collision, the mod can delay that input by a configurable number of physics ticks. Its prediction system accounts for orbs, pads, portals, moving objects, triggers, and all supported game modes.
 
-## Features
-- Trajectory prediction with orb, pad, portal and moving-object awareness
-- Buffered presses and releases for cube, ship, ball, UFO, wave, robot, spider and swing
-- Orb alignment and orb timing, plan-two-clicks-ahead, robust saves
-- Level memory, death heatmap, per-level settings
-- Percentage-based section learning: split a level into sections (0-25%, 25-50%, ...), pick several, and practise them. In practice mode the mod learns timings only inside the picked sections, saves them per level, and reuses them in later attempts and full runs. It never replays inputs; every click stays yours.
-- Practice-only auto-click and auto-release (wave, robot, dash)
-- Training mode (hints only), performance mode, low-latency mode, no-hitch searches
-- Live path view with **ghost comparison**: your original input trajectory (thin dashed amber) and the buffered trajectory (cyan) shown at the same time, both fading along the run, with a translucent copy of your icon replaying the buffered run, with a verdict ("yours: crash, buffered: safe, held 2f"), and a **death review** that redraws the last decision after you die so you can see why it did or did not work
-- Vision (sidebar): live hitboxes for the player and objects (opacity, per-category filters, custom colours, artwork-vs-collision difference), predicted contact marker with frames remaining, near-miss detection, future vision (2, 5, 10 or 30 seconds ahead if you do nothing), frame advance (F6 freeze, F7 step) and a last-attempt ghost with the gap to it.
-- Timing (sidebar): pre-input control engine, practice mode only: immediate, millisecond delay, frame offset, step offset, pre-tick injection, click before event (collision or next portal) and adaptive, with latency compensation and a latency fingerprint. Methods only hold a click back, never earlier.
-- Predictive branching: at each decision it simulates the click at several delays side by side (0 to 8 frames), draws each faintly and lists which are safe.
-- Analyzer tools that only read, never play: collision forecast and hazard warning, instant death explanation, counterfactual review (would a frame earlier or later have saved it?), spam meter, object scanner, physics-change map and a rough section difficulty estimate
-- Practice-only autopilot tools on the Analyzer page: **auto-analyze** (a session that auto-clicks and auto-releases, restarts and keeps trying until a run completes the level or the attempt limit is reached), route recording and route replay. They work only in practice mode, check it every tick, and show a big BOT tag on screen that cannot be turned off. Runs made with them are never legitimate.
-- Spam engine (Analyzer > Spam): **optimal CPS finder** (learns, per 5% of a level, which spam rates got through and which died, and shows the best one), plus practice-only **rate limiter**, **stabilizer**, **rhythm lock** and **adaptive spam rate**. The practice-only parts re-time or add clicks, check practice mode every tick and show a big SPAM ENGINE tag. Never legitimate.
-- Macro analyzer: put a replay in the mod's `macros` folder (Analyzer > Macro) and it reports the input count, duration, clicks per second, shortest gap, hold times and spam sections. It only reads the file; nothing is replayed. JSON replays (.gdr, .json) are decoded; binary .gdr2 files are detected but their layout is not decoded yet.
-- Drift check, death log, in-game console and log export
-- Update checker (GitHub releases)
+---
 
-## Screenshots
-_Screenshots will be added here._
+Important: Fair-play notice
 
-## Installation
-1. Install Geode for Geometry Dash 2.2081.
-2. Download `aliou.aliousbuffer.geode` from the [latest release](https://github.com/Zeptoreal1/-predictive-input-buffer/releases/latest).
-3. Put it in the `geode/mods` folder (or install it from the Geode mods menu) and restart the game.
+Some features provide gameplay assistance and are intended for practice and experimentation.
 
-## Keyboard shortcuts
-| Key | Action |
-|---|---|
-| 6 | Cycle stage |
-| 7 | Open the Aliou's Buffer menu (pause-menu button on mobile) |
-| F8 | Copy the console log |
-| F9 | Show / hide the in-game console |
-| F10 | Path view |
-| F11 | Forget this level's memory |
+Runs using automated inputs, route replay, input assistance, or a physics rate other than 240 TPS may not qualify as legitimate completions. Do not submit assisted runs for verification or leaderboard placement.
 
-All keys can be changed in the mod settings or Geode's keybinds.
+Practice-only features are restricted to practice mode and display an on-screen indicator while active. Features that only analyse gameplay without sending inputs are separate from automated assistance.
 
-## Configuration
-Open the menu in a level (key 7 or the pause-menu button) or from the logo button on the main menu, or use the mod settings. The menu is a dashboard with a sidebar of thirteen sections (Overview, Prediction, Game Modes, Automation, Memory, Sections, Performance, Visuals, Tools, Analyzer, Vision, Timing, About) and a live status panel showing whether the buffer is on, the prediction mode, active features and performance. The **Menu theme** setting offers AMOLED (pure black, default), Light (white with dark text), Graphite, Midnight, Ocean, Forest, Rose, Paper and Custom (pick your own main, secondary, accent and text colours), and **Menu background** can show your own picture behind the menu. The menu uses the Poppins font. Settings marked experimental or practice-only say so in their descriptions.
+Features
 
-## Supported platforms
-Windows, macOS, Android and iOS (as configured in `mod.json` and the CI workflow). See "Build status" below for what has actually been tested.
+1. Predictive input buffering
 
-## Build
-```
+- Predicts player trajectories before an input is processed.
+- Buffers presses and releases when the predicted input would cause a collision.
+- Supports cube, ship, ball, UFO, wave, robot, spider, and swing.
+- Accounts for orbs, pads, portals, moving objects, and relevant triggers.
+- Supports orb alignment and timing adjustments.
+- Plans multiple clicks ahead to avoid unnecessary delays.
+- Uses robust prediction checks to avoid fragile saves.
+- Includes per-level memory and configurable delay limits.
+
+2. Prediction and visualisation
+
+- Live path view: Displays predicted player movement.
+- Ghost comparison: Compares the original input trajectory with the buffered trajectory.
+- Death review: Reconstructs the last important prediction after a death.
+- Predictive branching: Simulates multiple possible input delays side by side and identifies which predictions survive.
+- Future vision: Previews predicted movement up to 2, 5, 10, or 30 seconds ahead.
+- Hitbox visualisation: Displays player and object collision boxes.
+- Collision markers: Shows predicted contact points and remaining frames.
+- Near-miss detection: Identifies close calls.
+- Frame advance: Freeze gameplay with F6 and advance one frame at a time with F7.
+- Last-attempt ghost: Displays a previous attempt and the difference from the current run.
+
+3. Timing and latency tools
+
+The Timing section contains the Pre-Input Control Engine.
+
+Available timing methods include:
+
+- Immediate input — no intentional delay.
+- Millisecond delay — adds a configurable delay.
+- Frame offset — schedules input relative to a target frame.
+- Step offset — schedules input relative to a physics step.
+- Pre-tick injection — attempts to schedule input before a relevant game update.
+- Click Before Event — schedules input relative to a predicted event, such as a collision or portal transition.
+- Adaptive timing — adjusts scheduling using measured latency.
+
+Additional tools:
+
+- Latency compensation.
+- Latency fingerprinting.
+- Input timing analysis.
+- Configurable timing offsets.
+
+These methods control when an input is processed; they cannot send an input into the past. Actual scheduling precision depends on the game's update and input-processing pipeline.
+
+4. Level memory and section learning
+
+- Remembers successful and unsuccessful input timings.
+- Stores settings and timing information per level.
+- Tracks deaths and successful saves.
+- Displays a death heatmap.
+- Splits levels into percentage-based sections.
+- Lets you select individual sections for focused practice.
+- Learns timings inside selected sections in practice mode.
+- Saves section-specific information for later attempts.
+- Optionally restarts at the end of a selected section.
+
+Section learning does not replay your inputs. It learns timing information from your attempts.
+
+5. Practice automation
+
+These features are restricted to practice mode.
+
+Auto-click and auto-release
+
+- Automatically handles supported inputs when configured.
+- Supports relevant game modes, including wave, robot, and dash interactions.
+- Stops assisting when manual input takes over.
+
+Auto-analysis
+
+- Runs automated practice attempts.
+- Restarts after deaths.
+- Continues until a run completes or the configured attempt limit is reached.
+
+Route recording and replay
+
+- Records completed routes from the level start.
+- Saves routes per level.
+- Replays recorded inputs in practice mode.
+
+Automated features display a persistent BOT indicator while active.
+
+6. Spam engine
+
+Available under Analyzer → Spam.
+
+- Optimal CPS finder: Learns which spam rates succeed or fail in each 5% level segment.
+- Rate limiter: Controls the minimum interval between inputs.
+- Stabilizer: Reduces inconsistent spam timing.
+- Rhythm lock: Maintains a more consistent input rhythm.
+- Adaptive spam rate: Adjusts spam timing based on observed results.
+
+The rate limiter, stabilizer, rhythm lock, and adaptive spam features are practice-only and display a persistent SPAM ENGINE indicator.
+
+7. Analyzer tools
+
+The Analyzer section provides tools that inspect gameplay and level data.
+
+- Collision forecast.
+- Instant death explanations.
+- Counterfactual review: checks whether an input one frame earlier or later would have changed the result.
+- Spam and click-rate analysis.
+- Object scanner.
+- Physics-change map.
+- Estimated section difficulty.
+- Macro analysis.
+
+Macro analyzer
+
+Place a replay file in the mod's "macros" folder and open Analyzer → Macro.
+
+It reports:
+
+- Input count.
+- Replay duration.
+- Clicks per second.
+- Shortest input gap.
+- Hold durations.
+- Spam-heavy sections.
+
+JSON replay formats, including ".gdr" and ".json", are decoded. Binary ".gdr2" files are detected, but their internal layout is not yet decoded.
+
+Macro analysis only reads replay files. It does not execute or replay them.
+
+8. Performance and diagnostics
+
+- Low-latency mode.
+- Performance mode.
+- Configurable prediction budgets.
+- No-hitch prediction searches.
+- Frame-drift checks.
+- Death logs.
+- In-game console.
+- Log export.
+- Update checker using GitHub releases.
+
+---
+
+Screenshots
+
+Screenshots will be added here.
+
+---
+
+Installation
+
+1. Install "Geode" (https://geode-sdk.org) for Geometry Dash 2.2081.
+2. Download "aliou.aliousbuffer.geode" from the "latest GitHub release" (https://github.com/Zeptoreal1/-predictive-input-buffer/releases/latest).
+3. Place the file in your "geode/mods" folder, or install it through Geode's mod menu.
+4. Restart Geometry Dash.
+
+---
+
+Keyboard shortcuts
+
+Key| Action
+"6"| Cycle prediction stage
+"7"| Open Aliou's Buffer menu
+"F6"| Freeze gameplay
+"F7"| Advance one frame
+"F8"| Copy console log
+"F9"| Show or hide the in-game console
+"F10"| Toggle live path view
+"F11"| Forget the current level's memory
+
+On mobile, use the pause-menu button to open the mod menu.
+
+All supported shortcuts can be changed through the mod settings or Geode's keybind settings.
+
+---
+
+Configuration
+
+Open the dashboard using:
+
+- "7" during a level.
+- The Buffer button in the pause menu.
+- The logo button on the main menu.
+- Geode's mod settings.
+
+Dashboard sections
+
+The dashboard is organised into thirteen sections:
+
+Section| Purpose
+Overview| Main controls and live status
+Prediction| Prediction engine configuration
+Game Modes| Individual mode settings
+Automation| Automated practice features
+Memory| Per-level learning and saved data
+Sections| Percentage-based section learning
+Performance| Prediction budgets and performance controls
+Visuals| Path view and visual settings
+Tools| Additional utilities
+Analyzer| Level, input, and macro analysis
+Vision| Hitboxes, future vision, and frame advance
+Timing| Input scheduling and latency tools
+About| Version and mod information
+
+The dashboard includes a live status panel showing whether buffering is enabled, the current prediction stage, active features, and performance information.
+
+Menu customisation
+
+Available themes:
+
+- AMOLED
+- Light
+- Graphite
+- Midnight
+- Ocean
+- Forest
+- Rose
+- Paper
+- Custom
+
+The Custom theme lets you choose your own main, secondary, accent, and text colours.
+
+You can also set a custom background image behind the menu. The interface uses the Poppins font.
+
+Settings marked Experimental or Practice-only are identified in their descriptions.
+
+---
+
+Supported platforms
+
+The project is configured for:
+
+- Windows
+- macOS
+- Android
+- iOS
+
+Actual build and runtime support depends on the current Geode SDK, platform bindings, and CI build results.
+
+---
+
+Building from source
+
+Requirements
+
+- Geode SDK 5.11.2
+- C++23-compatible compiler
+- CMake
+
+Build commands
+
 export GEODE_SDK=/path/to/geode
-cmake -B build && cmake --build build --config RelWithDebInfo
-```
-Requires the Geode SDK 5.11.2 and a C++23 compiler. CI builds all platforms via `.github/workflows/build.yml`.
 
-## Troubleshooting
-- No buffering: check the mod is enabled and, if "Practice mode only" is on, that you are in practice mode.
-- Clicks feel late: turn on Low latency mode, or lower the prediction budget.
-- FPS drops: turn on Performance mode.
-- Bad saves near moving parts: turn off "Predict move triggers" or "Predict moving objects", then use F8 and the death log to report it.
-- Startup crash: send the Geode log (it contains startup checkpoints).
+cmake -B build
+cmake --build build --config RelWithDebInfo
 
-## Build status
-v3.1.0 (rebrand, dashboard menu, section learning) was written without a Geode SDK, so it has not been compiled or run in-game yet; the CI workflow is the first real build. Expect to fix small compile errors in the new menu code.
+The GitHub Actions workflow in ".github/workflows/build.yml" handles platform builds.
 
-## Credits and licence
-Developer: Aliou. Aliou's Buffer is a fork of the predictive input buffer mod originally published as "Click Before Frames" by BASU (https://github.com/raresdalas1009/-predictive-input-buffer). The prediction engine is inherited from that project. The upstream repository contains no licence file at the time of this fork; see NOTICE.md. Font: Poppins (SIL OFL, see `resources/fonts`).
+---
 
-## Changelog
-- v2.8: the ghost copies the full player state (slopes, reverse, sideways, forces, dash), size portals are simulated and mirror portals no longer stop the prediction.
-- v2.10: wave tries 3 turn-away points, stops runs as soon as they are good enough (faster), and centers saves with a 1-tick safety margin. Console is see-through.
-- v2.12 robot: presses count as safe if some hold length survives; robot auto-release (practice only).
-- v2.13 level memory: learns per spot from your runs (delays that worked are tried first, spots where saves failed are left alone, risky spots marked in the path view).
-- v2.15 spider: flips are judged by landing on the new surface, and crashes you could flip away from count as safe.
-- v2.16 orbs: orbs usable on any tick inside them in predictions, orb alignment picks the best tick inside the orb, dash orbs held through in predictions, dash releases buffered, dash auto-release.
-- v2.23 unlocked FPS: all windows (look-ahead, delays, landing, spam gap, auto-release window, memory) are converted from 240/s ticks to the real physics step rate, and the ghost uses the average step length.
-- v2.24 FPS: prediction ghosts no longer spawn visual effects or leave nodes/actions behind (the FPS used to sink a little with every save).
-- v2.25 ship (opt-in): ship presses/releases buffered with recovery-aware scoring, own small max delay, feathering passes through.
-- v2.26 orb timing: presses already inside an orb are re-timed within the orb if that survives, learned orb timings are tried first, predictions try later clicks inside orbs.
-- v2.27: late cube/ball crashes skip the search; experimental moving-object prediction (straight-line motion).
-- v2.28 robust saves: each save is checked with the player slightly ahead/behind; fragile edge saves are swapped for a nearby delay that survives all three.
-- v2.31: hazards overlapping you at the click (player-following spikes, noclip) are ignored by predictions.
-- v2.34: with noclip, being inside a spike no longer makes the mod re-press the held button every tick.
-- v2.35: Click Between Frames sync is back; low latency mode (no chained delays, max 1 frame, 3 ms searches).
-- v2.36 CBF: rest of a split tick is collision-checked like the game does; logs show where in the tick a CBF click landed (@0.43) and separate 'safe' from 'safe only if you react by tX'.
-- v2.37: position read from the per-step node position (CBF sync actually active now, drift check / path view / memory slices correct; memory restarts per level).
-- v2.39: CBF Extrapolate is detected and shown in the console/export (it's visual only; predictions are unaffected).
-- v2.40 UFO: crashes you could have flapped away from count as safe, landing counts as safe, smallest delay wins, spam guard for fast flapping.
-- v2.41 FPS: moving-object tracking drops far objects and keeps a short moving-now list (was checking up to 4096 objects every step and every prediction).
-- v2.43: more time at death spots - where you keep dying, react-only-safe inputs get the delay that pushes the crash furthest away.
-- v2.44: in-game menu (pause menu 'Buffer' button or F7): stage, main switches, status, all settings / copy log / forget level. Ship: own spam gap (feathering is buffered), max delay 4, on by default.
-- v2.45 ball: short flips count as landings, landings must last 8 ticks, spam guard for fast flipping; menu switch.
-- v2.46 watermark (always on, not configurable): 'Aliou's Buffer | stage' in the level while the buffer is on, and 'Aliou's Buffer was on' on the level complete screen if it was on during the attempt.
-- v2.49: ghost no longer touches collision blocks (could break collision triggers); spam guard sends waiting inputs instead of dropping them (lost clicks broke click/event triggers).
-- v2.50: cuter menu: pink theme, pulsing hearts, floating hearts and sparkles, your own icon in the corner; switches turn pink when on.
-- v2.51: cube jumps that bump a ceiling count as landings (buffer works under blocks); smart swing (flip-back scoring + spam guard); per-level settings; practice stats (per attempt + Stats button); training mode (hints only, no delays); death heatmap on the progress bar.
-- v2.52: no popup after a death; attempt stats stay in the console, the Stats button and the level complete screen.
-- v2.53: ghosts respect 'disable controls' from Options triggers (a hidden Player 2 parked under spikes no longer jumps into them in predictions; fixes 'no save: press dies in 0t' on every jump in Relief).
-- v2.54: when the level disables Player 1's controls and you play Player 2 (Relief's wave parts), Player 2 is predicted; death log shows both players' modes.
-- v2.55: in two-player levels, P2-side inputs made outside dual mode move Player 1, and are now buffered as P1 inputs (Relief's wave parts were predicted on the idle Player 2).
-- v2.56: ding when a click is saved (setting + menu switch, on by default); menu opens smaller (78%).
-- v2.57: watermark hidden in practice mode (always shown in normal mode while the buffer is on).
-- v2.58: fix v2.51 regression (every cube landing counted as a ceiling bump, so short hops were called safe too early); settings changed in the settings popup during a level are kept for that level; ding sound preloaded.
-- v2.59: low latency on by default and on every level (not per level); the F6 stage is one setting for every level and is kept between levels and restarts.
-- v2.60: low latency off by default and switched off once on every install (still one setting for all levels).
-- v2.61: prediction back to v2.48 behaviour: collision objects collide again in predictions, spam drops waiting inputs again, no ceiling-bump landing rule.
-- v2.62: per-level settings off by default (switched off once): every level uses the same switches, like v2.43.1.
-- v2.63: late-crash rule only skips clicks whose jump already landed (long jumps like Acheron's first were never saved); cube saves prefer the smallest delay whose jump lands safely.
-- v2.64: a spot memory marked as 'saves failed here' gets saves again after you die there with the input left alone (it no longer blocks a jump forever).
-- v2.65: live path view (F10): between clicks the path keeps updating (blue = do nothing, yellow = click now); a click's own path stays up briefly.
-- v2.66: spam guard no longer drops waiting clicks: they fire one per tick in order, then the new input (no lost wave turns).
-- v2.67: 'more time' at death spots delays wave / ship inputs by at most 1 frame (was up to the full max delay, which made fast zigzags feel late).
-- v2.68: moving-object prediction follows curved / circular paths (rotate triggers) and spinning objects, not only straight lines; objects are put back exactly after each prediction.
-- v2.69: cube / ball jump saves must land safely (no more 8-10 frame 'saves' that only moved the crash later in the same jump); memory delays are only reused if they land safely.
-- v2.70: performance: a click's extra runs (robust check, drift check, path view) are skipped once the click has used its time budget; live path view updates 20x a second instead of 40x.
-- v2.71: performance mode (menu switch): 4 ms per click, no robustness runs, no late orb-click retries, no drift check / live path; in-game console redraws once per step instead of per line.
-- v2.72: searches stop after 4 delays when the crash comes at the same moment however late you click (next obstacle, not this click): far fewer budget hits and frame drops, mostly for robot and UFO.
-- v2.73: robot / UFO / spider searches do a quick pass over every delay first (plain runs only), then the full scoring with the time left: saves further out are no longer missed because the time ran out after a few delays.
-- v2.74: predictions can never change the real level: group toggles / spawns, item pickups, counters and item triggers caused by the hidden ghost are blocked (toggle orbs etc. could break triggers).
-- v2.75: run check (records your longest run from the start, replays it on the hidden player to compare versions); level memory starts fresh (v3 files) and fades after 12 h away; robot / UFO / swing saves must be fully safe; auto time budget from your FPS; eased moving objects predicted; toggle orbs switching groups off are followed in predictions; presets (Safe / Balanced / Aggressive); rebindable keys; menu themes (Pink / Blue / Green / Dark).
-- v2.76: auto budget fixed: no longer caps every click at 45% of a frame (2 ms at 240 fps cut cube searches short); it only lowers the budget to 4 ms while the game is already dropping frames. 'No save' lines say when a click was too late.
-- v2.77: frame drops: each click's prediction time is capped at about one frame at your FPS (at least 4 ms); the run-check recording is saved when you leave or finish the level instead of on every new-best death.
-- v2.78: orb timing for hard orb levels (Orbit): every tick inside the orb is tried, later orbs are clicked in the prediction too (several timings), the middle of the safe timing window is picked, and it must survive being half a tick off.
-- v2.79: auto-click (practice only, off by default: clicks for you when doing nothing would crash and a click now is fully safe; cube / ball / UFO / robot / spider / swing); predictions go through mode portals (the hidden ghost switches mode instead of stopping); 'Spam: inputs in a row' setting; Purple menu theme (new default); stage / menu keys default to 6 / 7, and the console hint shows your keys.
-- v2.80 (merged from the other v2.80 build): physics TPS setting + menu slider (240-1000; anything but 240 isn't legit, the watermark shows it); a mode portal you're still inside at the click no longer stops every prediction at t0 (Amethyst's first pink orb); after a portal switch only surviving the look-ahead counts; orb timings compared by when they crash counted from now (ORBIT), orb scans get 1.75x the time; the whole click shares its time budget (wave saves on GRIEF took 2-3 frames); level memory reuses the last delay that worked instead of the average, and each working save takes back one old failure; ghosts no longer play orb / trigger / destroy effects or leave particles on the real level; low latency's overrides stick (the wave margin was read again after it).
-- v2.81: keys are real Geode keybinds (mod settings or Geode's keybinds popup, modifiers like Shift+ work; defaults 6 / 7 / F8 / F9 / F10 / F11 - keys you changed before go back to these once); update check on game start (setting, on by default) with a popup on the main menu when a newer version is on GitHub.
-- v2.82: Android support (32 and 64-bit builds); a Console button in the menu (phones have no F9); the separate Windows console setting only shows on Windows.
-- v2.83: macOS builds. iOS isn't built yet: Geode's iOS bindings currently fail to compile (missing FMOD types in the generated bindings), so it waits for a Geode update.
-- v2.84: fixed the icon holding by itself at the start of an attempt: a delayed release that was still waiting when you died (or restarted) was dropped, so the game kept the button down. The game now always gets the release.
-- v2.85: the cube no longer jumps by itself at the start of an attempt: a release made while your icon was dead never reached the mod, which then pressed for you when the attempt started. Every attempt now starts from the game's own button state.
-- v2.86: fixed a crash when leaving a level and opening one again (v2.84/v2.85 could send a button to a level that was still loading); leaving a level now also forgets the button state.
-- v2.87: Android crash when leaving a level fixed: the hidden ghost players were deleted while the level was still being torn down; on Android they're now only let go of.
-- v2.88: dash orbs no longer flash before you reach them: effects a prediction ghost added to the real level (the dash start effect) are removed after each prediction.
-- v2.90: v2.89 reverted (the full "Aliou's Buffer" watermark is back, no progress bar end cap).
-- v2.92 (merged from the other build): new menu: a draggable window with tabs (Buffer, Prediction, Modes, Custom, Tools) in a space theme (black sky full of twinkling stars, sparkles, shooting stars), Orbitron / Exo 2 fonts, and a heart button on the main menu to open it outside levels too. Custom tab: per-mode frames, a slider for each game mode (your own icons) to pick how many frames cube, ship, ball, UFO, wave, robot, spider and swing can be held back. Prediction: move / rotate / toggle / spawn triggers ahead of you are predicted (with easing, group-parent pivots and spawn delays) and a self-check turns it off on levels where it keeps being wrong; predictions go through teleport, dual and solo portals; plan two clicks ahead (a crash your next click would handle isn't blamed on this one); smarter robot (tries other hold lengths); no-hitch searches (a search out of time goes on next tick instead of giving up). Pads no longer animate before you reach them.
-- v2.93: auto update: the update popup's "Update now" downloads the .geode from the latest GitHub release, checks it's this mod and newer, and installs it (restart to use it).
-- v2.94: the pause menu has a button (purple heart, bottom right) for the menu again, so phones can open it inside a level.
-- v2.95: watermark back (v2.92 had dropped it) and smaller: "CBF | stage" in the bottom left, smaller still on phones, hidden in practice mode.
-- v2.97: v2.96 reverted (no per-frame time budget, TPS setting read every frame again).
-- v2.98: auto update fixed: the update popup now comes from the newest GitHub release (the same file 'Update now' installs), not from the code's version, which could be ahead of the release and made the install fail.
-- v2.99: iOS support. The iOS build needed the FMOD header forced into Geode's generated iOS bindings, arm64-only for iOS, and the menu's title shine no longer uses CCPlace (not available to mods on iOS).
-- v2.99.1: startup checkpoints in the Geode log (to find where some iPhones crash on start); the main menu button is skipped instead of crashing if its image is missing.
-- v3.0.0: rebranded as Aliou's Buffer: new mod ID (aliou.aliousbuffer), logo and menu icon, new update source. New dashboard menu: nine sections, icon sidebar, live status panel, Aliou Blue theme (default), fits small screens. Prediction logic unchanged.
-- v3.1.0: percentage-based section learning: split a level into percentage sections, pick several, and practise them (Sections page). In practice mode, level memory only learns inside the picked sections and per-section saves/deaths are counted; learned timings are saved per level and reused in later attempts and full runs. Optional restart at section end (practice only). New settings: section-learning, section-loop.
-- v3.2.0: menu revamp: flat, clean look instead of the space/neon theme. Themes: AMOLED (pure black), Light (white, dark text) and Graphite. Optional custom background picture, Poppins sans-serif font, repeated options removed.
-- v3.3.0: ghost comparison: with the path view on, both trajectories are drawn at once, your input as pressed (dashed amber) and the buffered input (solid cyan), joined at matching moments, with a one-line verdict by the player. New setting: ghost-compare (on by default, only visible while the path view is on).
-- v3.4.0: five new menu themes (Midnight, Ocean, Forest, Rose, Paper) and a Custom theme with your own main, secondary, accent and text colours; the menu updates live when you change them in the settings.
-- v3.5.0: death review: after a death the last decision's ghost comparison is drawn again and stays up through the next attempt until you pass that spot (setting ghost-review). Fixed the Visuals page layout, where the Ghost comparison switch was drawn under the Menu theme card and could not be tapped properly.
-- v3.6.0: Analyzer page and tools: collision forecast, death explanation, counterfactual review (one frame earlier / later), spam meter (clicks per second and rhythm jitter), level scan with a physics-change list and a section difficulty estimate. These read the level and your runs; none of them sends inputs or searches for a route.
-- v3.7.0: practice-only autopilot: auto-analyze sessions with an attempt limit, route recording (a completed practice run from the level start is saved per level) and route replay. Always practice mode only, with a big BOT tag on screen that cannot be turned off. New settings: route-record, route-replay, analyze-attempt-limit.
-- v3.8.0: macro analyzer on the Analyzer page: drop a replay file in the macros folder and it is analysed (inputs, duration, CPS, holds, spam sections). JSON replays work; binary .gdr2 layout still to be added.
-- v3.9.0: spam engine: optimal CPS learning (per level, per 5%), spam rate limiter, stabilizer, rhythm lock and adaptive spam rate. The limiter, stabilizer and lock are practice mode only with a big SPAM ENGINE tag. New settings: spam-learn, spam-limiter, spam-min-gap, spam-stabilizer, spam-stabilizer-cap, spam-rhythm-lock, spam-adaptive.
-- v3.10.0: predictive branching (setting predictive-branching): several delays simulated side by side at each decision, drawn faintly and listed on screen. Collision forecast now also says when a click right now would crash. The practice-only tag is now small and sits in the top right corner (still always shown while a practice-only feature is on).
-- v3.11.0: cleaner path view: thin lines that fade along the run, a small x for a crash, and a translucent copy of your icon (cube, ship, ball, UFO, wave or swing) replaying the buffered run slowly on a loop with faint snapshots along the way. New setting: ghost-icon.
-- v3.12.0: Vision and Timing sections: live hitboxes with filters, opacity and custom colours, hitbox difference view, predicted contact, near-miss detection, future vision, frame advance, last-attempt ghost; pre-input control engine (practice only) with latency fingerprint. Auto-click now stands down once you press a button yourself. Fixed a build error (two helper functions had been removed by mistake).
+Troubleshooting
+
+Problem| Suggested fix
+Buffering does not work| Check that the mod is enabled and review any practice-mode restrictions.
+Inputs feel delayed| Try Low Latency mode or reduce the prediction budget.
+FPS drops| Enable Performance mode.
+Predictions are inaccurate around moving objects| Try disabling Predict Move Triggers or Predict Moving Objects.
+Saves fail near moving objects| Review the death log and export the console log with F8.
+Game crashes during startup| Check the Geode log for startup checkpoints.
+
+When reporting an issue, include the Geometry Dash version, Geode version, mod version, relevant settings, and log output.
+
+---
+
+Credits and licence
+
+Developer: Aliou
+
+Aliou's Buffer is a fork of the predictive input buffer project originally published as Click Before Frames by BASU.
+
+- Original repository: https://github.com/raresdalas1009/-predictive-input-buffer
+- Font: Poppins, licensed under the SIL Open Font License.
+- See "NOTICE.md" for upstream attribution and licensing information.
+
+The upstream repository did not contain a licence file at the time this fork was created.
+
+---
+
+Changelog
+
+v3.12.0
+
+- Added Vision and Timing dashboard sections.
+- Added live hitboxes, hitbox filters, opacity controls, custom colours, and collision-difference view.
+- Added predicted contact markers, near-miss detection, future vision, frame advance, and last-attempt ghost.
+- Added the Pre-Input Control Engine and latency fingerprinting.
+- Auto-click now stops assisting when manual input is detected.
+- Fixed a build error involving two removed helper functions.
+
+v3.11.0
+
+- Improved live path visualisation with thinner fading trajectories and crash markers.
+- Added a translucent ghost icon that replays the buffered trajectory.
+- Added the "ghost-icon" setting.
+
+v3.10.0
+
+- Added predictive branching to simulate multiple delays side by side.
+- Improved collision forecasts.
+- Reduced the size of the practice-only indicator and moved it to the top-right corner.
+
+v3.9.0
+
+- Added the Spam Engine.
+- Added optimal CPS learning, rate limiting, stabilisation, rhythm lock, and adaptive spam timing.
+- Practice-only spam controls display a persistent indicator.
+
+v3.8.0
+
+- Added macro analysis for input count, duration, CPS, hold times, and spam sections.
+- Added JSON replay decoding.
+- ".gdr2" detection added; binary decoding remains unfinished.
+
+v3.7.0
+
+- Added practice-only automated analysis, route recording, and route replay.
+- Added configurable attempt limits and a persistent BOT indicator.
+
+v3.6.0
+
+- Added the Analyzer section.
+- Added collision forecasts, death explanations, counterfactual review, spam analysis, object scanning, physics-change mapping, and section difficulty estimates.
+
+v3.5.0
+
+- Added death review to reconstruct the last prediction after a death.
+- Fixed the Ghost Comparison settings layout.
+
+v3.4.0
+
+- Added Midnight, Ocean, Forest, Rose, Paper, and Custom menu themes.
+
+v3.3.0
+
+- Added simultaneous original and buffered trajectory comparison.
+- Added the "ghost-compare" setting.
+
+v3.2.0
+
+- Reworked the dashboard with a cleaner interface.
+- Added AMOLED, Light, and Graphite themes.
+- Added custom background images and the Poppins font.
+
+v3.1.0
+
+- Added percentage-based section learning.
+- Added per-section memory, save/death tracking, and optional practice-mode section restarts.
+
+v3.0.0
+
+- Rebranded the project as Aliou's Buffer.
+- Introduced the "aliou.aliousbuffer" mod ID.
+- Added a new dashboard, logo, menu icon, and update source.
+
+Earlier releases: v2.8–v2.99.1
+
+The v2 series introduced the core prediction engine and progressively added support for game modes, moving objects, orbs, portals, level memory, performance controls, automation, and platform compatibility.
+
+Major milestones included:
+
+- v2.8–v2.16: Improved ghost physics, wave prediction, robot support, level memory, spider flips, and orb timing.
+- v2.23–v2.28: Added unlocked-FPS timing conversion, ship support, moving-object prediction, and robust save checks.
+- v2.31–v2.40: Improved noclip handling, Click Between Frames synchronisation, UFO support, and input timing.
+- v2.41–v2.50: Improved moving-object tracking, performance, the in-game dashboard, Android support, and menu customisation.
+- v2.51–v2.69: Added per-level settings, practice statistics, death heatmaps, dual-player prediction, smarter swing handling, and improved orb and landing logic.
+- v2.70–v2.80: Major performance improvements, adaptive prediction budgets, automated practice tools, expanded trigger prediction, and configurable physics TPS.
+- v2.81–v2.90: Added real Geode keybinds, update installation, Android and macOS support, and fixes for input-state and lifecycle issues.
+- v2.92–v2.99.1: Added the redesigned dashboard, per-mode delay controls, advanced trigger prediction, improved update handling, iOS support, and startup diagnostics.
+
+For detailed historical changes, consult the repository's commit history and releases.
+
+---
+
+<p align="center">
+  <b>Aliou's Buffer</b><br>
+  Predict ahead. Understand every input. Improve your consistency.
+</p>
