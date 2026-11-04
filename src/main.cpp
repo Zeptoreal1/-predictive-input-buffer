@@ -307,6 +307,8 @@ namespace {
         CCDrawNode* pathNode = nullptr;  // v2.11: owned by the level's object layer
         CCLabelBMFont* ghostLabel = nullptr;  // v3.3: one-line verdict of the ghost comparison
         bool ghostCompare = true;        // v3.3: show your input and the buffered input side by side
+        bool ghostIcon = true;           // v3.11: a translucent icon travels the predicted path
+        CCNode* ghostIcons = nullptr;    // v3.11: holds those icons (cleared with the path)
         bool reviewOn = true;            // v3.5: after a death, show the last decision's comparison again
         bool reviewShown = false;        // the review is on screen now (kept until you pass it)
         bool forecast = true;            // v3.6: next-hazard forecast on the HUD
@@ -314,7 +316,8 @@ namespace {
         bool counterfactual = true;      // v3.6: would a frame earlier / later have saved it?
         bool spamMeter = false;          // v3.6: CPS and how steady your spam is
         CCLabelBMFont* hudLabel = nullptr;
-        std::string hudForecast, hudSpam, hudDeath, hudAnalyze, hudOptimal;
+        std::string hudForecast, hudSpam, hudDeath, hudAnalyze, hudOptimal, hudBranches;
+        bool branching = false;          // v3.10: simulate several delays side by side at each decision
         bool spamLimiter = false, spamStabilizer = false, spamLock = false, spamAdaptive = false;  // v3.9, practice only
         bool spamLearn = true;
         float spamMinGap = 2.f, spamStabCap = 1.5f;  // in frames
@@ -630,6 +633,7 @@ namespace {
         buf.fullState = mod->getSettingValue<bool>("full-ghost-state");
         buf.learn = mod->getSettingValue<bool>("level-memory");
         buf.ghostCompare = mod->getSettingValue<bool>("ghost-compare");
+        buf.ghostIcon = mod->getSettingValue<bool>("ghost-icon");
         buf.reviewOn = mod->getSettingValue<bool>("ghost-review");
         buf.forecast = mod->getSettingValue<bool>("collision-forecast");
         buf.deathExplain = mod->getSettingValue<bool>("death-explain");
@@ -640,6 +644,7 @@ namespace {
         buf.spamLock = mod->getSettingValue<bool>("spam-rhythm-lock");
         buf.spamAdaptive = mod->getSettingValue<bool>("spam-adaptive");
         buf.spamLearn = mod->getSettingValue<bool>("spam-learn");
+        buf.branching = mod->getSettingValue<bool>("predictive-branching");
         buf.spamMinGap = static_cast<float>(mod->getSettingValue<double>("spam-min-gap"));
         buf.spamStabCap = static_cast<float>(mod->getSettingValue<double>("spam-stabilizer-cap"));
         buf.routeRecord = mod->getSettingValue<bool>("route-record");
@@ -884,12 +889,14 @@ namespace {
         buf.panelLines.clear();
         buf.pathNode = nullptr;
         buf.ghostLabel = nullptr;
+        buf.ghostIcons = nullptr;
         buf.hudLabel = nullptr;
         buf.hudForecast.clear();
         buf.hudSpam.clear();
         buf.hudDeath.clear();
         buf.hudAnalyze.clear();
         buf.hudOptimal.clear();
+        buf.hudBranches.clear();
         buf.botTag = nullptr;
         buf.review = {};
         buf.reviewShown = false;
@@ -2221,7 +2228,7 @@ namespace {
             return;
         }
         std::string text;
-        for (auto const* part : { &buf.hudAnalyze, &buf.hudForecast, &buf.hudOptimal, &buf.hudSpam, &buf.hudDeath }) {
+        for (auto const* part : { &buf.hudAnalyze, &buf.hudForecast, &buf.hudBranches, &buf.hudOptimal, &buf.hudSpam, &buf.hudDeath }) {
             if (!part->empty()) {
                 text += text.empty() ? "" : "\n";
                 text += *part;
@@ -3953,98 +3960,177 @@ namespace {
         if (buf.pathNode) {
             buf.pathNode->clear();
         }
+        if (buf.ghostIcons) {
+            buf.ghostIcons->removeAllChildrenWithCleanup(true);
+        }
         if (buf.ghostLabel) {
             buf.ghostLabel->setVisible(false);
         }
     }
 
-    // v3.3 ghost comparison: your input as you pressed it (dashed, amber) and the input the
-    // game gets (solid, cyan) at the same time. Thin white lines join the same moment on both
-    // paths; a white dot is where the delayed input fires, a red dot a crash. Returns the
-    // largest gap between the two paths, in level units.
-    float drawGhostComparison(std::vector<CCPoint> const& original, bool originalDied, std::vector<CCPoint> const& buffered, bool bufferedDied, int delay) {
-        ccColor4F amber { 1.f, 0.75f, 0.2f, 0.85f };
-        ccColor4F cyan { 0.25f, 0.9f, 1.f, 0.95f };
-        for (size_t i = 1; i < original.size(); ++i) {
-            if ((i / 3) % 2 == 0) {  // dashed
-                buf.pathNode->drawSegment(original[i - 1], original[i], 0.9f, amber);
+    // v3.11 cleaner path view: thin lines that fade along the run, small x for a crash, and a
+    // translucent copy of your icon that travels the buffered path (plus a few faint snapshots)
+    void drawFading(std::vector<CCPoint> const& path, ccColor4F color, float w0, float w1, float a0, float a1, bool dashed) {
+        if (path.size() < 2) {
+            return;
+        }
+        float n = static_cast<float>(path.size() - 1);
+        for (size_t i = 1; i < path.size(); ++i) {
+            if (dashed && (i / 3) % 2 != 0) {
+                continue;
+            }
+            float t = static_cast<float>(i) / n;
+            ccColor4F c = color;
+            c.a = a0 + (a1 - a0) * t;
+            buf.pathNode->drawSegment(path[i - 1], path[i], w0 + (w1 - w0) * t, c);
+        }
+    }
+
+    void drawCrashMark(CCPoint at) {
+        ccColor4F red { 1.f, 0.25f, 0.25f, 0.95f };
+        buf.pathNode->drawSegment(at + CCPoint { -3.5f, -3.5f }, at + CCPoint { 3.5f, 3.5f }, 0.9f, red);
+        buf.pathNode->drawSegment(at + CCPoint { -3.5f, 3.5f }, at + CCPoint { 3.5f, -3.5f }, 0.9f, red);
+    }
+
+    // a translucent copy of the player's icon for the mode you are in (cube if unsure)
+    CCNode* makeGhostIcon(bool buffered, GLubyte opacity) {
+        auto* gm = GameManager::get();
+        auto* layer = gm->m_playLayer;
+        auto* p1 = layer ? layer->m_player1 : nullptr;
+        int id = gm->getPlayerFrame();
+        IconType type = IconType::Cube;
+        if (p1) {
+            if (p1->m_isShip) {
+                id = gm->getPlayerShip();
+                type = IconType::Ship;
+            }
+            else if (p1->m_isBall) {
+                id = gm->getPlayerBall();
+                type = IconType::Ball;
+            }
+            else if (p1->m_isBird) {
+                id = gm->getPlayerBird();
+                type = IconType::Ufo;
+            }
+            else if (p1->m_isDart) {
+                id = gm->getPlayerDart();
+                type = IconType::Wave;
+            }
+            else if (p1->m_isSwing) {
+                id = gm->getPlayerSwing();
+                type = IconType::Swing;
             }
         }
-        for (size_t i = 1; i < buffered.size(); ++i) {
-            buf.pathNode->drawSegment(buffered[i - 1], buffered[i], 1.5f, cyan);
+        auto* icon = SimplePlayer::create(id);
+        if (!icon) {
+            return nullptr;
         }
+        icon->updatePlayerFrame(id, type);
+        // your own colours would blur the two runs together: cyan for the buffered run, amber for yours
+        ccColor3B a = buffered ? ccColor3B { 90, 220, 255 } : ccColor3B { 255, 190, 70 };
+        icon->setColors(a, { 255, 255, 255 });
+        icon->setCascadeOpacityEnabled(true);
+        icon->setOpacity(opacity);
+        if (p1 && p1->m_vehicleSize < 1.f) {
+            icon->setScale(0.6f);
+        }
+        return icon;
+    }
+
+    bool ghostIconFlies() {
+        auto* layer = GameManager::get()->m_playLayer;
+        auto* p1 = layer ? layer->m_player1 : nullptr;
+        return p1 && (p1->m_isShip || p1->m_isBird || p1->m_isDart || p1->m_isSwing);
+    }
+
+    float ghostTilt(std::vector<CCPoint> const& path, size_t i) {
+        size_t a = i > 0 ? i - 1 : 0, b = std::min(i + 1, path.size() - 1);
+        return -std::atan2(path[b].y - path[a].y, path[b].x - path[a].x) * 180.f / 3.14159265f;
+    }
+
+    // faint snapshots along the path and one icon that replays the run, slowly, on a loop
+    void addGhostIcons(std::vector<CCPoint> const& path, bool buffered, bool died) {
+        if (!buf.ghostIcon || !buf.ghostIcons || path.size() < 4) {
+            return;
+        }
+        bool flies = ghostIconFlies();
+        size_t step = std::max<size_t>(10, path.size() / 5);
+        for (size_t i = step; i < path.size(); i += step) {
+            if (auto* snap = makeGhostIcon(buffered, 45)) {
+                snap->setPosition(path[i]);
+                snap->setRotation(flies ? ghostTilt(path, i) : 0.f);
+                buf.ghostIcons->addChild(snap);
+            }
+        }
+        if (!buffered) {
+            return;
+        }
+        auto* runner = makeGhostIcon(true, 120);
+        if (!runner) {
+            return;
+        }
+        runner->setPosition(path.front());
+        buf.ghostIcons->addChild(runner);
+        float seconds = 4.f * tickFrames() / 60.f / 0.5f;  // four ticks per step, at half speed
+        auto* steps = CCArray::create();
+        steps->addObject(CCPlace::create(path.front()));
+        size_t stride = std::max<size_t>(4, path.size() / 60);
+        for (size_t i = stride; i < path.size(); i += stride) {
+            float dur = seconds * static_cast<float>(stride) / 4.f;
+            if (flies) {
+                steps->addObject(CCSpawn::create(CCMoveTo::create(dur, path[i]), CCRotateTo::create(dur, ghostTilt(path, i)), nullptr));
+            }
+            else {
+                steps->addObject(CCMoveTo::create(dur, path[i]));
+            }
+        }
+        steps->addObject(CCDelayTime::create(died ? 0.2f : 0.6f));
+        runner->runAction(CCRepeatForever::create(CCSequence::create(steps)));
+    }
+
+    // v3.3 ghost comparison, now cleaner: your input (thin, dashed, amber) and what the game
+    // gets (cyan), both fading along the run. A white dot is where a delayed input fires and
+    // an x is a crash. Returns the largest gap between the two paths, in level units.
+    float drawGhostComparison(std::vector<CCPoint> const& original, bool originalDied, std::vector<CCPoint> const& buffered, bool bufferedDied, int delay) {
+        ccColor4F amber { 1.f, 0.75f, 0.2f, 1.f };
+        ccColor4F cyan { 0.25f, 0.9f, 1.f, 1.f };
+        drawFading(original, amber, 0.7f, 0.5f, 0.7f, 0.2f, true);
+        drawFading(buffered, cyan, 1.6f, 0.8f, 0.95f, 0.3f, false);
         float gap = 0.f;
         size_t common = std::min(original.size(), buffered.size());
         for (size_t i = 0; i < common; ++i) {
-            float d = std::hypot(original[i].x - buffered[i].x, original[i].y - buffered[i].y);
-            gap = std::max(gap, d);
-            if (i % 12 == 11 && d > 1.f) {
-                buf.pathNode->drawSegment(original[i], buffered[i], 0.4f, { 1.f, 1.f, 1.f, 0.3f });
-            }
-        }
-        if (!original.empty()) {
-            buf.pathNode->drawDot(original.back(), 2.5f, amber);
-        }
-        if (!buffered.empty()) {
-            buf.pathNode->drawDot(buffered.back(), 2.5f, cyan);
+            gap = std::max(gap, std::hypot(original[i].x - buffered[i].x, original[i].y - buffered[i].y));
         }
         if (delay > 0 && delay <= static_cast<int>(buffered.size())) {
-            buf.pathNode->drawDot(buffered[delay - 1], 3.f, { 1.f, 1.f, 1.f, 0.9f });
+            buf.pathNode->drawDot(buffered[delay - 1], 2.6f, { 1.f, 1.f, 1.f, 0.9f });
         }
         if (originalDied && !original.empty()) {
-            buf.pathNode->drawDot(original.back(), 4.f, { 1.f, 0.2f, 0.2f, 1.f });
+            drawCrashMark(original.back());
+        }
+        else if (!original.empty()) {
+            buf.pathNode->drawDot(original.back(), 1.8f, { amber.r, amber.g, amber.b, 0.5f });
         }
         if (bufferedDied && !buffered.empty()) {
-            buf.pathNode->drawDot(buffered.back(), 4.f, { 1.f, 0.2f, 0.2f, 1.f });
+            drawCrashMark(buffered.back());
+        }
+        else if (!buffered.empty()) {
+            buf.pathNode->drawDot(buffered.back(), 2.f, { cyan.r, cyan.g, cyan.b, 0.6f });
+        }
+        // a translucent icon runs the buffered path; yours only appears where it ends differently
+        addGhostIcons(buffered, true, bufferedDied);
+        if (gap > 8.f) {
+            addGhostIcons(original, false, originalDied);
         }
         return gap;
     }
 
-    void showGhostLabel(CCPoint pos, bool originalDied, bool bufferedDied, int delay, float gap, bool review = false, std::string const& extra = "") {
-        if (!buf.ghostLabel) {
-            return;
-        }
-        std::string text = fmt::format("{}yours: {}   buffered: {}   {}", review ? "last decision, " : "",
-            originalDied ? "crash" : "safe", bufferedDied ? "crash" : "safe",
-            delay > 0 ? fmt::format("held {:g}f, gap {:.1f} blocks", delay * TICK, gap / 30.f) : std::string("no delay needed"));
-        if (!extra.empty()) {
-            text += "\n" + extra;
-        }
-        buf.ghostLabel->setString(text.c_str());
-        buf.ghostLabel->setColor(bufferedDied ? ccColor3B { 255, 110, 110 } : ccColor3B { 255, 255, 255 });
-        buf.ghostLabel->setPosition(pos + CCPoint { 0.f, 42.f });
-        buf.ghostLabel->setVisible(true);
-    }
-
-    // v3.5 death review: when you die, the last decision's two paths are drawn again and stay
-    // up through the next attempt until you pass that spot (or make a new decision there)
-    void showReview() {
-        if (!buf.showPath || !buf.ghostCompare || !buf.reviewOn || !buf.pathNode || !buf.review.valid) {
-            return;
-        }
-        if (tickCount - buf.review.tick > st(480)) {  // only a recent decision explains this death
-            return;
-        }
-        clearPathNode();
-        drawGhostComparison(buf.review.original, buf.review.originalDied, buf.review.buffered, buf.review.bufferedDied, buf.review.delay);
-        std::string extra;
-        if (buf.review.cfEarlier >= 0 || buf.review.cfLater >= 0) {
-            auto word = [](int v) { return v < 0 ? "n/a" : (v ? "crash" : "safe"); };
-            extra = fmt::format("1f earlier: {}   1f later: {}", word(buf.review.cfEarlier), word(buf.review.cfLater));
-        }
-        showGhostLabel(buf.review.labelPos, buf.review.originalDied, buf.review.bufferedDied, buf.review.delay, buf.review.gap, true, extra);
-        buf.reviewShown = true;
-    }
-
     void drawPath(std::vector<CCPoint> const& path, int delay, ccColor4F color, bool died) {
-        for (size_t i = 1; i < path.size(); ++i) {
-            buf.pathNode->drawSegment(path[i - 1], path[i], 1.2f, color);
-        }
+        drawFading(path, color, 1.1f, 0.7f, color.a, color.a * 0.35f, false);
         if (delay > 0 && delay <= static_cast<int>(path.size())) {
-            buf.pathNode->drawDot(path[delay - 1], 3.f, { 1.f, 1.f, 1.f, 0.9f });
+            buf.pathNode->drawDot(path[delay - 1], 2.6f, { 1.f, 1.f, 1.f, 0.9f });
         }
         if (died && !path.empty()) {
-            buf.pathNode->drawDot(path.back(), 4.f, { 1.f, 0.2f, 0.2f, 1.f });
+            drawCrashMark(path.back());
         }
     }
 
@@ -4098,6 +4184,33 @@ namespace {
                 bool laterDied = false;
                 recordRun(layer, p1, p2, dual, chosen + oneFrame, down, horizon, releaseAfter, &laterDied);
                 buf.review.cfLater = laterDied ? 1 : 0;
+            }
+            if (buf.branching && !buf.perfMode) {
+                // predictive branching: the same decision with several delays side by side
+                std::string result;
+                for (int f : { 0, 1, 2, 3, 4, 6, 8 }) {
+                    int d = static_cast<int>(std::lround(f / TICK));
+                    bool died = false;
+                    std::vector<CCPoint> path;
+                    if (d == 0) {
+                        died = nowDied;
+                        path = now;
+                    }
+                    else if (d == chosen) {
+                        died = bufferedDied;
+                        path = buffered;
+                    }
+                    else {
+                        path = recordRun(layer, p1, p2, dual, d, down, horizon, releaseAfter, &died);
+                    }
+                    ccColor4F faint = died ? ccColor4F { 1.f, 0.3f, 0.3f, 0.22f } : ccColor4F { 0.3f, 1.f, 0.5f, 0.22f };
+                    for (size_t i = 1; i < path.size(); ++i) {
+                        buf.pathNode->drawSegment(path[i - 1], path[i], 0.5f, faint);
+                    }
+                    result += fmt::format("{}{}f {}", result.empty() ? "" : "   ", f, died ? "X" : "ok");
+                }
+                buf.hudBranches = fmt::format("branches: {}   (chose {})", result, chosen > 0 ? fmt::format("{:g}f", chosen * TICK) : std::string("now"));
+                updateHud();
             }
             buf.review.valid = true;
         }
@@ -4838,7 +4951,7 @@ namespace {
             if (idleDied) {
                 float frames = static_cast<float>(idle.size()) * TICK;
                 text = fmt::format("hazard in {:.0f}f ({:.2f}s) if you do nothing, {}", frames, frames / 60.f,
-                    clickDied ? "a click now also crashes" : "a click now is safe");
+                    clickDied ? fmt::format("a click now crashes in {:.0f}f", static_cast<float>(click.size()) * TICK) : std::string("a click now is safe"));
             }
             else if (clickDied) {
                 text = "clear if you do nothing, a click now would crash";
@@ -6130,6 +6243,7 @@ class BufferMenu : public geode::Popup {
         { "route-replay", "Replay saved route" },
     };
     static constexpr Option ANALYZER_OPTS[] = {
+        { "predictive-branching", "Predictive branching" },
         { "collision-forecast", "Collision forecast" },
         { "death-explain", "Death explanation" },
         { "ghost-counterfactual", "Counterfactual review" },
@@ -6148,6 +6262,7 @@ class BufferMenu : public geode::Popup {
     static constexpr Option VISUALS[] = {
         { "show-path", "Path view at start" },
         { "ghost-compare", "Ghost comparison" },
+        { "ghost-icon", "Ghost icon on path" },
         { "ghost-review", "Review last decision" },
         { "death-heatmap", "Death heatmap" },
         { "save-ding", "Ding on save" },
@@ -6970,9 +7085,8 @@ private:
         label(m_page, "Custom colours, image", 0.5f, m_muted, { SIDE + 20.f, y }, { 0.f, 0.5f });
         button(m_pageMenu, "Colours", menu_selector(BufferMenu::onAllSettings), { W - 92.f, y }, 62.f, false, 0, 16.f);
         button(m_pageMenu, "Image", menu_selector(BufferMenu::onAllSettings), { W - 30.f, y }, 52.f, false, 0, 16.f);
-        note("Choose the Custom theme, then set main, secondary, accent and text colours in Settings.", y - 20.f, m_muted);
-        note("Ghost comparison: dashed amber = your input as pressed, solid cyan = what the game gets.", y - 33.f, m_muted);
-        note("White dot = where a delayed input fires, red dot = crash. Shown with the path view (F10).", y - 46.f, m_muted);
+        note("Path view (F10): dashed amber = your input as pressed, cyan = what the game gets.", y - 20.f, m_muted);
+        note("A faint icon replays the buffered run, a white dot is where a delayed input fires, an x is a crash.", y - 33.f, m_muted);
     }
 
     void pageTools() {
@@ -7131,9 +7245,10 @@ private:
             return;
         }
         float top = pageTop() - 40.f;
-        card(top + 12.f, 2 * ROW + 4.f);
+        float rows = static_cast<float>((std::size(ANALYZER_OPTS) + 1) / 2);
+        card(top + 12.f, rows * ROW + 4.f);
         optionGrid(ANALYZER_OPTS, std::size(ANALYZER_OPTS), top);
-        float y = top - 2 * ROW - 14.f;
+        float y = top - rows * ROW - 14.f;
         button(m_pageMenu, "Scan level", menu_selector(BufferMenu::onScan), { SIDE + 52.f, y }, 84.f, true, 0, 16.f);
         if (!scan.valid) {
             note("Open a level, then scan it for objects, portals and the hardest-looking parts.", y - 18.f, m_muted, 0.44f);
@@ -8062,10 +8177,11 @@ class $modify(BufPlayLayer, PlayLayer) {
 
         // v3.7: the big tag while a route plays or auto-analyze runs (practice mode only)
         buf.botTag = CCLabelBMFont::create("BOT ROUTE REPLAY | PRACTICE ONLY", "bigFont.fnt");
-        buf.botTag->setScale(0.5f);
+        buf.botTag->setScale(0.26f);
         buf.botTag->setColor({ 255, 70, 70 });
-        buf.botTag->setOpacity(240);
-        buf.botTag->setPosition({ win.width / 2.f, win.height - 50.f });
+        buf.botTag->setOpacity(210);
+        buf.botTag->setAnchorPoint({ 1.f, 1.f });
+        buf.botTag->setPosition({ win.width - 8.f, win.height - 38.f });
         buf.botTag->setZOrder(1000);
         buf.botTag->setVisible(false);
         this->addChild(buf.botTag);
@@ -8095,6 +8211,8 @@ class $modify(BufPlayLayer, PlayLayer) {
         buf.ghostLabel->setScale(0.55f);
         buf.ghostLabel->setVisible(false);
         pathParent->addChild(buf.ghostLabel, 9999);
+        buf.ghostIcons = CCNode::create();
+        pathParent->addChild(buf.ghostIcons, 9998);
         // v3.6 HUD text (forecast, spam meter, death explanation), top left of the screen
         buf.hudLabel = CCLabelBMFont::create("", "chatFont.fnt");
         buf.hudLabel->setScale(0.5f);
@@ -8137,6 +8255,7 @@ class $modify(BufPlayLayer, PlayLayer) {
     void resetLevel() {
         sectionBlockEnd = -1;  // v3.1
         buf.hudDeath.clear();  // v3.6
+        buf.hudBranches.clear();
         buf.hudForecast.clear();
         updateHud();
         triggerChecks.clear();  // v2.84
