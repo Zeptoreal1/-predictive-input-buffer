@@ -49,6 +49,7 @@
 #include <filesystem>
 #include <functional>
 #include <fstream>
+#include <unordered_map>
 #include <optional>
 #include <sstream>
 #include <thread>
@@ -317,6 +318,27 @@ namespace {
         bool spamMeter = false;          // v3.6: CPS and how steady your spam is
         CCLabelBMFont* hudLabel = nullptr;
         std::string hudForecast, hudSpam, hudDeath, hudAnalyze, hudOptimal, hudBranches;
+        std::string hudNear, hudContact, hudFuture, hudTime, hudLatency;
+        bool frozen = false;             // v3.12: frame advance
+        int stepFrames = 0;
+        bool hitboxView = false, hitboxNear = false, hitboxPredict = false, hitboxDiff = false;
+        bool hbHazards = true, hbSolids = true, hbSpecial = true, hbTriggers = false;
+        bool hitDrawn = false;
+        float hitboxOpacity = 0.55f;
+        ccColor3B hbColors[6] = { { 255, 255, 255 }, { 255, 70, 70 }, { 80, 140, 255 }, { 255, 210, 70 }, { 190, 110, 255 }, { 255, 140, 0 } };
+        int futureSeconds = 0;           // 0 = off
+        bool timeGhost = false;
+        CCDrawNode* hitNode = nullptr;
+        CCDrawNode* futureNode = nullptr;
+        CCNode* timeIcon = nullptr;
+        int forecastTicks = -1;          // ticks until the do-nothing run crashes, -1 = it does not
+        bool predValid = false;
+        CCPoint predPoint {};
+        int pieMode = 0;                 // v3.12 pre-input control (practice only)
+        int pieEvent = 0;
+        float pieOffset = 6.f;
+        bool pieComp = false, fingerprint = false;
+        bool autoYield = false;          // auto-click stands down once you press something yourself
         bool branching = false;          // v3.10: simulate several delays side by side at each decision
         bool spamLimiter = false, spamStabilizer = false, spamLock = false, spamAdaptive = false;  // v3.9, practice only
         bool spamLearn = true;
@@ -645,6 +667,40 @@ namespace {
         buf.spamAdaptive = mod->getSettingValue<bool>("spam-adaptive");
         buf.spamLearn = mod->getSettingValue<bool>("spam-learn");
         buf.branching = mod->getSettingValue<bool>("predictive-branching");
+        buf.hitboxView = mod->getSettingValue<bool>("hitbox-view");
+        buf.hitboxNear = mod->getSettingValue<bool>("hitbox-near-miss");
+        buf.hitboxPredict = mod->getSettingValue<bool>("hitbox-predict");
+        buf.hitboxDiff = mod->getSettingValue<bool>("hitbox-difference");
+        buf.hbHazards = mod->getSettingValue<bool>("hitbox-hazards");
+        buf.hbSolids = mod->getSettingValue<bool>("hitbox-solids");
+        buf.hbSpecial = mod->getSettingValue<bool>("hitbox-special");
+        buf.hbTriggers = mod->getSettingValue<bool>("hitbox-triggers");
+        buf.hitboxOpacity = static_cast<float>(mod->getSettingValue<double>("hitbox-opacity"));
+        buf.timeGhost = mod->getSettingValue<bool>("time-ghost");
+        buf.pieComp = mod->getSettingValue<bool>("pie-compensate");
+        buf.fingerprint = mod->getSettingValue<bool>("pie-fingerprint");
+        buf.pieOffset = static_cast<float>(mod->getSettingValue<double>("pie-offset"));
+        {
+            char const* colorKeys[6] = { "hitbox-color-player", "hitbox-color-hazard", "hitbox-color-solid", "hitbox-color-special", "hitbox-color-trigger", "hitbox-color-predicted" };
+            for (int i = 0; i < 6; ++i) {
+                buf.hbColors[i] = mod->getSettingValue<ccColor3B>(colorKeys[i]);
+            }
+            auto index = [&](char const* key, std::initializer_list<char const*> list) {
+                auto value = mod->getSettingValue<std::string>(key);
+                int i = 0, found = 0;
+                for (auto* name : list) {
+                    if (value == name) {
+                        found = i;
+                    }
+                    ++i;
+                }
+                return found;
+            };
+            buf.pieMode = index("pie-mode", { "Immediate", "Millisecond delay", "Frame offset", "Step offset", "Pre-tick injection", "Click before event", "Adaptive" });
+            buf.pieEvent = index("pie-event", { "Collision", "Next portal" });
+            constexpr int SECONDS[] = { 0, 2, 5, 10, 30 };
+            buf.futureSeconds = SECONDS[index("future-vision", { "Off", "2 s", "5 s", "10 s", "30 s" })];
+        }
         buf.spamMinGap = static_cast<float>(mod->getSettingValue<double>("spam-min-gap"));
         buf.spamStabCap = static_cast<float>(mod->getSettingValue<double>("spam-stabilizer-cap"));
         buf.routeRecord = mod->getSettingValue<bool>("route-record");
@@ -897,6 +953,11 @@ namespace {
         buf.hudAnalyze.clear();
         buf.hudOptimal.clear();
         buf.hudBranches.clear();
+        buf.hitNode = nullptr;
+        buf.futureNode = nullptr;
+        buf.timeIcon = nullptr;
+        buf.frozen = false;
+        buf.stepFrames = 0;
         buf.botTag = nullptr;
         buf.review = {};
         buf.reviewShown = false;
@@ -2217,6 +2278,7 @@ namespace {
     } pending;
 
     // ---------- v3.6 analysis tools ----------
+    void drawFuture(PlayLayer* layer, std::vector<CCPoint> const& path, bool died);  // defined with the vision tools
     float sectionPercent(PlayLayer* layer, PlayerObject* p);  // defined with the sections below
 
     // None of these send an input or search for a route: they only read what the prediction
@@ -2228,7 +2290,7 @@ namespace {
             return;
         }
         std::string text;
-        for (auto const* part : { &buf.hudAnalyze, &buf.hudForecast, &buf.hudBranches, &buf.hudOptimal, &buf.hudSpam, &buf.hudDeath }) {
+        for (auto const* part : { &buf.hudAnalyze, &buf.hudFuture, &buf.hudForecast, &buf.hudContact, &buf.hudBranches, &buf.hudNear, &buf.hudTime, &buf.hudLatency, &buf.hudOptimal, &buf.hudSpam, &buf.hudDeath }) {
             if (!part->empty()) {
                 text += text.empty() ? "" : "\n";
                 text += *part;
@@ -2577,7 +2639,7 @@ namespace {
     //   Adaptive rate  the lock uses the best clicks per second learned for this part of the level
     //   CPS learning   notes, per 5% of the level, which spam rates got through and which died
     bool spamEngineOn() {
-        return buf.spamLimiter || buf.spamStabilizer || buf.spamLock;
+        return buf.spamLimiter || buf.spamStabilizer || buf.spamLock || buf.pieMode != 0;
     }
 
     bool spamPractice(PlayLayer* layer) {
@@ -2947,7 +3009,7 @@ namespace {
         shown = state;
         buf.botTag->setVisible(state != 0);
         if (state != 0) {
-            buf.botTag->setString(state == 1 ? "BOT ROUTE REPLAY | PRACTICE ONLY" : (state == 2 ? "AUTO-ANALYZE | PRACTICE ONLY" : "SPAM ENGINE | PRACTICE ONLY"));
+            buf.botTag->setString(state == 1 ? "BOT ROUTE REPLAY | PRACTICE ONLY" : (state == 2 ? "AUTO-ANALYZE | PRACTICE ONLY" : "INPUT ENGINE | PRACTICE ONLY"));
         }
     }
 
@@ -4124,6 +4186,42 @@ namespace {
         return gap;
     }
 
+    void showGhostLabel(CCPoint pos, bool originalDied, bool bufferedDied, int delay, float gap, bool review = false, std::string const& extra = "") {
+        if (!buf.ghostLabel) {
+            return;
+        }
+        std::string text = fmt::format("{}yours: {}   buffered: {}   {}", review ? "last decision, " : "",
+            originalDied ? "crash" : "safe", bufferedDied ? "crash" : "safe",
+            delay > 0 ? fmt::format("held {:g}f, gap {:.1f} blocks", delay * TICK, gap / 30.f) : std::string("no delay needed"));
+        if (!extra.empty()) {
+            text += "\n" + extra;
+        }
+        buf.ghostLabel->setString(text.c_str());
+        buf.ghostLabel->setColor(bufferedDied ? ccColor3B { 255, 110, 110 } : ccColor3B { 255, 255, 255 });
+        buf.ghostLabel->setPosition(pos + CCPoint { 0.f, 42.f });
+        buf.ghostLabel->setVisible(true);
+    }
+
+    // v3.5 death review: when you die, the last decision's two paths are drawn again and stay
+    // up through the next attempt until you pass that spot (or make a new decision there)
+    void showReview() {
+        if (!buf.showPath || !buf.ghostCompare || !buf.reviewOn || !buf.pathNode || !buf.review.valid) {
+            return;
+        }
+        if (tickCount - buf.review.tick > st(480)) {  // only a recent decision explains this death
+            return;
+        }
+        clearPathNode();
+        drawGhostComparison(buf.review.original, buf.review.originalDied, buf.review.buffered, buf.review.bufferedDied, buf.review.delay);
+        std::string extra;
+        if (buf.review.cfEarlier >= 0 || buf.review.cfLater >= 0) {
+            auto word = [](int v) { return v < 0 ? "n/a" : (v ? "crash" : "safe"); };
+            extra = fmt::format("1f earlier: {}   1f later: {}", word(buf.review.cfEarlier), word(buf.review.cfLater));
+        }
+        showGhostLabel(buf.review.labelPos, buf.review.originalDied, buf.review.bufferedDied, buf.review.delay, buf.review.gap, true, extra);
+        buf.reviewShown = true;
+    }
+
     void drawPath(std::vector<CCPoint> const& path, int delay, ccColor4F color, bool died) {
         drawFading(path, color, 1.1f, 0.7f, color.a, color.a * 0.35f, false);
         if (delay > 0 && delay <= static_cast<int>(path.size())) {
@@ -4905,7 +5003,7 @@ namespace {
     // blue = where you go if you do nothing, yellow = where a click right now takes you.
     // After a click, that click's path (red / green) stays up briefly first.
     void livePath(PlayLayer* layer, PlayerObject* p1) {
-        if ((!buf.showPath && !buf.forecast) || buf.perfMode || !buf.ghost1 || buf.simulating || p1->m_isDead || layer->m_isPlatformer) {
+        if ((!buf.showPath && !buf.forecast && !buf.hitboxPredict && buf.futureSeconds == 0 && buf.pieMode != 5) || buf.perfMode || !buf.ghost1 || buf.simulating || p1->m_isDead || layer->m_isPlatformer) {
             return;
         }
         bool draw = buf.showPath && buf.pathNode;
@@ -4960,6 +5058,18 @@ namespace {
                 buf.hudForecast = text;
                 updateHud();
             }
+        }
+        // v3.12: what the do-nothing run says, for the predicted contact and the timing engine
+        buf.forecastTicks = idleDied ? static_cast<int>(idle.size()) : -1;
+        buf.predValid = idleDied && !idle.empty();
+        buf.predPoint = buf.predValid ? idle.back() : CCPoint { 0.f, 0.f };
+        if (buf.futureSeconds > 0 && tickCount % st(120) == 0) {
+            int futureHorizon = std::min(static_cast<int>(buf.futureSeconds * (60.0 / (buf.tickLength > 0.001f ? buf.tickLength : TICK))), 3000);
+            bool futureDied = false;
+            buf.skipPress = true;
+            auto future = recordRun(layer, p1, p2, dual, 0, down, futureHorizon, -1, &futureDied);
+            buf.skipPress = false;
+            drawFuture(layer, future, futureDied);
         }
     }
 
@@ -6054,7 +6164,7 @@ namespace {
     // hold, and swallows your own click if it still comes. Cube, ball, UFO, robot, spider and
     // swing; not wave / ship (constant control) or while dashing.
     void tryAutoClick(PlayLayer* layer, PlayerObject* p1) {
-        if (!buf.autoClick || buf.autoReleased || buf.autoClicked || layer->m_isPlatformer) {
+        if (!buf.autoClick || buf.autoYield || buf.autoReleased || buf.autoClicked || layer->m_isPlatformer) {
             return;
         }
         if (!layer->m_isPracticeMode && !buf.autoNormalRuns) {
@@ -6231,6 +6341,23 @@ class BufferMenu : public geode::Popup {
         { "more-time-death-spots", "More time at deaths" },
         { "per-level-settings", "Per-level settings" },
     };
+    static constexpr Option HITBOX_OPTS[] = {
+        { "hitbox-view", "Hitboxes" },
+        { "hitbox-difference", "Hitbox difference" },
+        { "hitbox-hazards", "Hazards" },
+        { "hitbox-solids", "Blocks and slopes" },
+        { "hitbox-special", "Pads, orbs, portals" },
+        { "hitbox-triggers", "Triggers" },
+    };
+    static constexpr Option VISION_OPTS[] = {
+        { "hitbox-predict", "Predicted contact" },
+        { "hitbox-near-miss", "Near-miss detection" },
+        { "time-ghost", "Last-attempt ghost" },
+    };
+    static constexpr Option PIE_OPTS[] = {
+        { "pie-compensate", "Compensate latency" },
+        { "pie-fingerprint", "Latency fingerprint" },
+    };
     static constexpr Option SPAM_OPTS[] = {
         { "spam-limiter", "Rate limiter" },
         { "spam-stabilizer", "Stabilizer" },
@@ -6279,7 +6406,7 @@ class BufferMenu : public geode::Popup {
         { "check-updates", "Update checker" },
     };
     static constexpr char const* TABS[] = { "Overview", "Prediction", "Game Modes", "Automation", "Memory", "Sections", "Performance",
-        "Visuals", "Tools", "Analyzer", "About" };
+        "Visuals", "Tools", "Analyzer", "Vision", "Timing", "About" };
     static constexpr char const* THEMES[] = { "AMOLED", "Light", "Graphite", "Midnight", "Ocean", "Forest", "Rose", "Paper", "Custom" };
     static constexpr char const* ABOUT_URL = "https://github.com/Zeptoreal1/-predictive-input-buffer";
 
@@ -6382,6 +6509,7 @@ private:
     static inline int s_modeSub = 0;
     static inline int s_secPage = 0;
     static inline int s_anaSub = 0;
+    static inline int s_visSub = 0;
     static inline std::vector<std::filesystem::path> s_macroFiles;
     static inline std::string s_macroName;                 // the file analysed now
     static inline std::filesystem::file_time_type s_macroTime {};
@@ -6732,6 +6860,18 @@ private:
                 circle(d, c + CCPoint { -1.f, 1.f }, 3.8f, { 0, 0, 0, 0 }, 16, 0.8f, k);
                 seg(1.8f, -1.8f, 5.2f, -5.2f);
                 break;
+            case 10:  // vision: a crosshair
+                circle(d, c, 4.6f, { 0, 0, 0, 0 }, 16, 0.8f, k);
+                seg(0.f, -6.f, 0.f, -2.f);
+                seg(0.f, 6.f, 0.f, 2.f);
+                seg(-6.f, 0.f, -2.f, 0.f);
+                seg(6.f, 0.f, 2.f, 0.f);
+                break;
+            case 11:  // timing: a clock
+                circle(d, c, 5.2f, { 0, 0, 0, 0 }, 18, 0.8f, k);
+                seg(0.f, 0.f, 0.f, 3.4f);
+                seg(0.f, 0.f, 2.6f, -1.2f);
+                break;
             default:  // about: an "i" in a ring
                 circle(d, c, 5.2f, { 0, 0, 0, 0 }, 18, 0.8f, k);
                 seg(0.f, -2.8f, 0.f, 0.8f);
@@ -6750,22 +6890,22 @@ private:
         menu->setPosition({ 0.f, 0.f });
         m_tabsNode->addChild(menu);
         for (int i = 0; i < static_cast<int>(std::size(TABS)); ++i) {
-            float y = H - TITLE - 18.f - i * 20.f;
+            float y = H - TITLE - 18.f - i * 17.f;
             bool active = i == s_tab;
             auto* node = CCNode::create();
-            node->setContentSize({ SIDE - 16.f, 19.f });
+            node->setContentSize({ SIDE - 16.f, 16.f });
             auto* d = CCDrawNode::create();
             if (active) {
-                roundRect(d, { 0.f, 0.f, SIDE - 16.f, 19.f }, 7.f, col(m_t.accent, m_t.light ? 0.13f : 0.2f));
+                roundRect(d, { 0.f, 0.f, SIDE - 16.f, 16.f }, 7.f, col(m_t.accent, m_t.light ? 0.13f : 0.2f));
                 roundRect(d, { 0.f, 4.f, 2.5f, 13.f }, 1.2f, col(m_t.accent, 1.f));
             }
-            navIcon(d, i, { 13.f, 9.5f }, col(active ? m_t.accent : m_muted, 1.f));
+            navIcon(d, i, { 13.f, 8.f }, col(active ? m_t.accent : m_muted, 1.f));
             node->addChild(d);
             auto* l = CCLabelBMFont::create(TABS[i], active ? headFont() : bodyFont());
             l->setScale(0.44f * (active ? HEAD_K : BODY_K));
             l->setColor(active ? m_text : m_muted);
             l->setAnchorPoint({ 0.f, 0.5f });
-            l->setPosition({ 25.f, 9.5f });
+            l->setPosition({ 25.f, 8.f });
             l->limitLabelWidth(SIDE - 16.f - 29.f, 0.44f * (active ? HEAD_K : BODY_K), 0.15f);
             node->addChild(l);
             auto* item = CCMenuItemSpriteExtra::create(node, this, menu_selector(BufferMenu::onTab));
@@ -7193,6 +7333,71 @@ private:
         note("Gap and stabilizer limits are in Settings (spam-min-gap, spam-stabilizer-cap, in frames).", y - 24.f, m_muted);
     }
 
+    void pageVision() {
+        heading("Vision", s_visSub == 0 ? "Live hitboxes for the player and the objects around you." : "Predicted contact, future path, near misses and frame advance.");
+        button(m_pageMenu, "View", menu_selector(BufferMenu::onVisSub), { W - 88.f, pageTop() }, 52.f, s_visSub == 0, 0, 16.f);
+        button(m_pageMenu, "Tools", menu_selector(BufferMenu::onVisSub), { W - 30.f, pageTop() }, 52.f, s_visSub == 1, 1, 16.f);
+        float top = pageTop() - 40.f;
+        if (s_visSub == 0) {
+            card(top + 12.f, 3 * ROW + 4.f);
+            optionGrid(HITBOX_OPTS, std::size(HITBOX_OPTS), top);
+            float y = top - 3 * ROW - 14.f;
+            card(y + 11.f, 24.f);
+            label(m_page, "Hitbox opacity", 0.5f, m_muted, { SIDE + 20.f, y }, { 0.f, 0.5f });
+            button(m_pageMenu, "-", menu_selector(BufferMenu::onHbOpacity), { W - 92.f, y }, 22.f, false, -1);
+            button(m_pageMenu, "+", menu_selector(BufferMenu::onHbOpacity), { W - 30.f, y }, 22.f, false, 1);
+            label(m_page, fmt::format("{:.0f}%", buf.hitboxOpacity * 100.f), 0.55f, m_text, { W - 61.f, y });
+            y -= 28.f;
+            card(y + 11.f, 24.f);
+            label(m_page, "Colours: player, hazards, blocks...", 0.5f, m_muted, { SIDE + 20.f, y }, { 0.f, 0.5f });
+            button(m_pageMenu, "Colours", menu_selector(BufferMenu::onAllSettings), { W - 44.f, y }, 62.f, false, 0, 16.f);
+            note("Red = hazards, blue = blocks and slopes, yellow = pads, orbs, portals, purple = triggers.", y - 20.f, m_muted);
+            note("Hitbox difference adds the artwork's own box in grey, so you can see where it differs.", y - 32.f, m_muted);
+            return;
+        }
+        card(top + 12.f, 2 * ROW + 4.f);
+        optionGrid(VISION_OPTS, std::size(VISION_OPTS), top);
+        float y = top - 2 * ROW - 14.f;
+        card(y + 11.f, 24.f);
+        label(m_page, "Future vision (if you do nothing)", 0.5f, m_muted, { SIDE + 20.f, y }, { 0.f, 0.5f });
+        button(m_pageMenu, Mod::get()->getSettingValue<std::string>("future-vision"), menu_selector(BufferMenu::onFuture), { W - 44.f, y }, 62.f, true, 0, 16.f);
+        y -= 28.f;
+        card(y + 11.f, 24.f);
+        label(m_page, buf.frozen ? "Frame advance: frozen" : "Frame advance", 0.5f, m_muted, { SIDE + 20.f, y }, { 0.f, 0.5f });
+        button(m_pageMenu, buf.frozen ? "Resume" : "Freeze", menu_selector(BufferMenu::onFreeze), { W - 100.f, y }, 62.f, false, 0, 16.f);
+        button(m_pageMenu, "Step", menu_selector(BufferMenu::onStep), { W - 36.f, y }, 52.f, true, 0, 16.f);
+        note("Step closes the menu, plays one frame and freezes again. Keys: F6 freeze, F7 step.", y - 20.f, m_muted);
+        note("Predicted contact marks the object the do-nothing run hits. Near miss reports hazards passed by under 3 units.", y - 32.f, m_muted);
+    }
+
+    void pageTiming() {
+        heading("Timing", "Pre-input control: when your click reaches the game. Practice mode only.");
+        float y = pageTop() - 38.f;
+        card(y + 11.f, 24.f);
+        label(m_page, "Timing method", 0.5f, m_muted, { SIDE + 20.f, y }, { 0.f, 0.5f });
+        button(m_pageMenu, Mod::get()->getSettingValue<std::string>("pie-mode"), menu_selector(BufferMenu::onPieMode), { W - 80.f, y }, 130.f, true, 0, 16.f);
+        y -= 26.f;
+        card(y + 11.f, 24.f);
+        label(m_page, "Event (click before event)", 0.5f, m_muted, { SIDE + 20.f, y }, { 0.f, 0.5f });
+        button(m_pageMenu, Mod::get()->getSettingValue<std::string>("pie-event"), menu_selector(BufferMenu::onPieEvent), { W - 60.f, y }, 90.f, false, 0, 16.f);
+        y -= 26.f;
+        card(y + 11.f, 24.f);
+        char const* unit = buf.pieMode == 2 ? "frames" : (buf.pieMode == 3 ? "steps" : "ms");
+        label(m_page, fmt::format("Offset ({})", unit), 0.5f, m_muted, { SIDE + 20.f, y }, { 0.f, 0.5f });
+        button(m_pageMenu, "-", menu_selector(BufferMenu::onPieOffset), { W - 92.f, y }, 22.f, false, -1);
+        button(m_pageMenu, "+", menu_selector(BufferMenu::onPieOffset), { W - 30.f, y }, 22.f, false, 1);
+        label(m_page, fmt::format("{:g}", buf.pieOffset), 0.55f, m_text, { W - 61.f, y });
+        y -= 22.f;
+        card(y + 10.f, ROW + 4.f);
+        optionGrid(PIE_OPTS, std::size(PIE_OPTS), y - 2.f);
+        y -= ROW + 12.f;
+        note("Immediate sends your click untouched. Every other method only holds it back, never earlier.", y, m_t.warn, 0.4f);
+        note("ms, frames and steps differ: 1 frame is 4 steps at 240 TPS. The offset uses the unit shown above.", y - 12.f, m_muted);
+        note("Pre-tick delivers at the start of the next tick. Adaptive aims for the offset as total latency, so", y - 24.f, m_muted);
+        note("compensation is not applied twice. Click before event waits until the offset before the event.", y - 36.f, m_muted);
+        note("Practice mode only, checked every tick; a small INPUT ENGINE tag shows. Never legitimate.", y - 48.f, m_muted);
+    }
+
     void pageAutopilot() {
         float top = pageTop() - 40.f;
         card(top + 12.f, ROW + 4.f);
@@ -7381,7 +7586,9 @@ private:
             case 7: pageVisuals(); break;
             case 8: pageTools(); break;
             case 9: pageAnalyzer(); break;
-            case 10: pageAbout(); break;
+            case 10: pageVision(); break;
+            case 11: pageTiming(); break;
+            case 12: pageAbout(); break;
             default: pageOverview(); break;
         }
         buildTabs();
@@ -7545,6 +7752,64 @@ private:
             analyzeMacroFile(s_macroFiles[i]);
         }
         rebuildPage();
+    }
+
+    void onVisSub(CCObject* sender) {
+        s_visSub = sender->getTag();
+        rebuildPage();
+    }
+
+    void cycleSetting(char const* key, std::initializer_list<char const*> values) {
+        auto cur = Mod::get()->getSettingValue<std::string>(key);
+        size_t idx = 0, i = 0;
+        for (auto* v : values) {
+            if (cur == v) {
+                idx = i;
+            }
+            ++i;
+        }
+        size_t next = (idx + 1) % values.size();
+        Mod::get()->setSettingValue<std::string>(key, *(values.begin() + next));
+        readSettings();
+        rebuildPage();
+    }
+
+    void onFuture(CCObject*) {
+        cycleSetting("future-vision", { "Off", "2 s", "5 s", "10 s", "30 s" });
+    }
+
+    void onPieMode(CCObject*) {
+        cycleSetting("pie-mode", { "Immediate", "Millisecond delay", "Frame offset", "Step offset", "Pre-tick injection", "Click before event", "Adaptive" });
+    }
+
+    void onPieEvent(CCObject*) {
+        cycleSetting("pie-event", { "Collision", "Next portal" });
+    }
+
+    void onPieOffset(CCObject* sender) {
+        double v = std::clamp(Mod::get()->getSettingValue<double>("pie-offset") + sender->getTag(), 0.0, 200.0);
+        Mod::get()->setSettingValue<double>("pie-offset", v);
+        readSettings();
+        rebuildPage();
+    }
+
+    void onHbOpacity(CCObject* sender) {
+        double v = std::clamp(Mod::get()->getSettingValue<double>("hitbox-opacity") + sender->getTag() * 0.1, 0.1, 1.0);
+        Mod::get()->setSettingValue<double>("hitbox-opacity", v);
+        readSettings();
+        rebuildPage();
+    }
+
+    void onFreeze(CCObject*) {
+        buf.frozen = !buf.frozen;
+        say("frame advance: {}", buf.frozen ? "frozen" : "running");
+        rebuildPage();
+    }
+
+    void onStep(CCObject*) {
+        buf.frozen = true;
+        ++buf.stepFrames;
+        keyBackClicked();  // close the menu so the frame can play
     }
 
     void onAnaSub(CCObject* sender) {
@@ -7895,6 +8160,407 @@ public:
 
 // v2.75.1: the level complete screen no longer shows "Aliou's Buffer was on" or the
 // saves count in the top right corner; the attempt is still finished here.
+// ---------- v3.12 vision, timing engine and attempt ghost ----------
+namespace {
+    std::vector<GameObject*> hbSorted;  // every object, sorted by x, so a window around the player is cheap
+    PlayLayer* hbFor = nullptr;
+    std::unordered_map<GameObject*, float> nearMin;
+    int nearUntil = 0;
+    bool portalCacheValid = false;
+    std::vector<float> portalXs;
+
+    struct Rec {
+        float x, y;
+    };
+    std::vector<Rec> curRec;                     // this attempt, one point per rendered frame
+    std::vector<std::vector<Rec>> attempts;      // the last few finished attempts
+
+    bool isPortalId(int id) {
+        for (auto const& portal : PORTALS) {
+            if (portal.id == id) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    ccColor4F rgba(ccColor3B c, float a) {
+        return { c.r / 255.f, c.g / 255.f, c.b / 255.f, a };
+    }
+
+    // 0 = ignore, 1 hazard, 2 solid or slope, 3 pad / orb / portal, 4 trigger
+    int hbKind(GameObject* o) {
+        if (o->m_objectType == GameObjectType::Hazard) {
+            return 1;
+        }
+        if (o->m_objectType == GameObjectType::Solid || o->m_objectType == GameObjectType::Slope) {
+            return 2;
+        }
+        if (typeinfo_cast<RingObject*>(o) || isPadId(o->m_objectID) || isPortalId(o->m_objectID)) {
+            return 3;
+        }
+        if (typeinfo_cast<EffectGameObject*>(o)) {
+            return 4;
+        }
+        return 0;
+    }
+
+    void hbBuild(PlayLayer* layer) {
+        hbSorted.clear();
+        if (layer->m_objects) {
+            for (auto* o : CCArrayExt<GameObject*>(layer->m_objects)) {
+                if (o) {
+                    hbSorted.push_back(o);
+                }
+            }
+        }
+        std::sort(hbSorted.begin(), hbSorted.end(), [](GameObject* a, GameObject* b) { return a->getPositionX() < b->getPositionX(); });
+        hbFor = layer;
+    }
+
+    void hbRect(CCRect const& r, ccColor3B c, float fillA, float lineA) {
+        CCPoint pts[4] = { { r.getMinX(), r.getMinY() }, { r.getMaxX(), r.getMinY() }, { r.getMaxX(), r.getMaxY() }, { r.getMinX(), r.getMaxY() } };
+        buf.hitNode->drawPolygon(pts, 4, rgba(c, fillA), 0.7f, rgba(c, lineA));
+    }
+
+    void hbOutline(CCRect const& r, ccColor4F c) {
+        CCPoint a { r.getMinX(), r.getMinY() }, b { r.getMaxX(), r.getMinY() }, d { r.getMaxX(), r.getMaxY() }, e { r.getMinX(), r.getMaxY() };
+        buf.hitNode->drawSegment(a, b, 0.4f, c);
+        buf.hitNode->drawSegment(b, d, 0.4f, c);
+        buf.hitNode->drawSegment(d, e, 0.4f, c);
+        buf.hitNode->drawSegment(e, a, 0.4f, c);
+    }
+
+    // every rendered frame: live hitboxes, the predicted collision, near misses
+    void hitboxFrame(PlayLayer* layer) {
+        if (!buf.hitNode) {
+            return;
+        }
+        bool predict = buf.hitboxPredict && buf.predValid;
+        if (!buf.hitboxView && !buf.hitboxNear && !predict) {
+            if (buf.hitDrawn) {
+                buf.hitNode->clear();
+                buf.hitDrawn = false;
+            }
+            return;
+        }
+        auto* p1 = layer->m_player1;
+        if (!p1) {
+            return;
+        }
+        buf.hitNode->clear();
+        buf.hitDrawn = true;
+        if (hbFor != layer) {
+            hbBuild(layer);
+        }
+        float px = p1->getPositionX();
+        float winW = CCDirector::get()->getWinSize().width;
+        float lo = px - 140.f, hi = px + winW + 60.f;
+        auto pr = p1->getObjectRect();
+        float opacity = buf.hitboxOpacity;
+        GameObject* predicted = nullptr;
+        CCRect predictedRect;
+        auto first = std::lower_bound(hbSorted.begin(), hbSorted.end(), lo, [](GameObject* o, float x) { return o->getPositionX() < x; });
+        for (auto it = first; it != hbSorted.end() && (*it)->getPositionX() <= hi; ++it) {
+            auto* o = *it;
+            int kind = hbKind(o);
+            if (kind == 0) {
+                continue;
+            }
+            auto r = o->getObjectRect();
+            if (buf.hitboxView) {
+                bool shown = (kind == 1 && buf.hbHazards) || (kind == 2 && buf.hbSolids) || (kind == 3 && buf.hbSpecial) || (kind == 4 && buf.hbTriggers);
+                if (shown) {
+                    hbRect(r, buf.hbColors[kind], opacity * 0.18f, opacity);
+                    if (buf.hitboxDiff) {  // the artwork's own box next to the collision box
+                        hbOutline(o->boundingBox(), { 0.8f, 0.8f, 0.8f, opacity * 0.6f });
+                    }
+                }
+            }
+            if (predict && !predicted && (kind == 1 || kind == 2)) {
+                CCRect big(r.getMinX() - 8.f, r.getMinY() - 8.f, r.size.width + 16.f, r.size.height + 16.f);
+                if (big.containsPoint(buf.predPoint)) {
+                    predicted = o;
+                    predictedRect = r;
+                }
+            }
+            if (buf.hitboxNear && kind == 1 && std::abs(o->getPositionX() - px) < 90.f) {
+                float gapX = std::max({ 0.f, r.getMinX() - pr.getMaxX(), pr.getMinX() - r.getMaxX() });
+                float gapY = std::max({ 0.f, r.getMinY() - pr.getMaxY(), pr.getMinY() - r.getMaxY() });
+                float d = std::hypot(gapX, gapY);
+                auto found = nearMin.find(o);
+                if (found == nearMin.end()) {
+                    nearMin[o] = d;
+                }
+                else {
+                    found->second = std::min(found->second, d);
+                }
+            }
+        }
+        if (buf.hitboxView) {
+            hbRect(pr, buf.hbColors[0], opacity * 0.15f, opacity);
+            if (layer->m_gameState.m_isDualMode && layer->m_player2) {
+                hbRect(layer->m_player2->getObjectRect(), buf.hbColors[0], opacity * 0.15f, opacity);
+            }
+        }
+        if (predicted) {
+            hbRect(predictedRect, buf.hbColors[5], 0.3f, 1.f);
+            auto at = buf.predPoint;
+            ccColor4F c = rgba(buf.hbColors[5], 1.f);
+            buf.hitNode->drawSegment(at + CCPoint { -4.f, -4.f }, at + CCPoint { 4.f, 4.f }, 0.9f, c);
+            buf.hitNode->drawSegment(at + CCPoint { -4.f, 4.f }, at + CCPoint { 4.f, -4.f }, 0.9f, c);
+            std::string text = fmt::format("contact in {:.0f}f with object {}", buf.forecastTicks * TICK, predicted->m_objectID);
+            if (text != buf.hudContact) {
+                buf.hudContact = text;
+                updateHud();
+            }
+        }
+        else if (!buf.hudContact.empty()) {
+            buf.hudContact.clear();
+            updateHud();
+        }
+        // near misses: a hazard that has been passed, and how close it came
+        for (auto it = nearMin.begin(); it != nearMin.end();) {
+            if (it->first->getPositionX() < px - 70.f) {
+                if (it->second > 0.01f && it->second < 3.f) {
+                    buf.hudNear = fmt::format("near miss: {:.1f} units from a hazard at {:.1f}%", it->second, sectionPercent(layer, p1));
+                    nearUntil = tickCount + st(480);
+                    updateHud();
+                }
+                it = nearMin.erase(it);
+            }
+            else {
+                ++it;
+            }
+        }
+        if (!buf.hudNear.empty() && tickCount > nearUntil) {
+            buf.hudNear.clear();
+            updateHud();
+        }
+    }
+
+    // Future vision: where you end up if you do nothing, 2 / 5 / 10 / 30 seconds ahead
+    void drawFuture(PlayLayer* layer, std::vector<CCPoint> const& path, bool died) {
+        (void)layer;
+        if (!buf.futureNode) {
+            return;
+        }
+        buf.futureNode->clear();
+        if (path.size() < 2) {
+            return;
+        }
+        float n = static_cast<float>(path.size() - 1);
+        for (size_t i = 1; i < path.size(); ++i) {
+            float t = static_cast<float>(i) / n;
+            buf.futureNode->drawSegment(path[i - 1], path[i], 1.0f - 0.5f * t, { 0.65f, 0.85f, 1.f, 0.55f - 0.4f * t });
+        }
+        size_t perSecond = std::max<size_t>(1, static_cast<size_t>(ticksPerSecond()));
+        for (size_t i = perSecond; i < path.size(); i += perSecond) {  // a dot for every second ahead
+            buf.futureNode->drawDot(path[i], 1.8f, { 1.f, 1.f, 1.f, 0.5f });
+        }
+        if (died) {
+            ccColor4F red { 1.f, 0.25f, 0.25f, 0.95f };
+            auto at = path.back();
+            buf.futureNode->drawSegment(at + CCPoint { -4.f, -4.f }, at + CCPoint { 4.f, 4.f }, 1.f, red);
+            buf.futureNode->drawSegment(at + CCPoint { -4.f, 4.f }, at + CCPoint { 4.f, -4.f }, 1.f, red);
+        }
+        double seconds = static_cast<double>(path.size()) / ticksPerSecond();
+        buf.hudFuture = died ? fmt::format("danger ahead in {:.1f}s if you do nothing", seconds)
+                             : fmt::format("clear for {}s if you do nothing", buf.futureSeconds);
+        updateHud();
+    }
+
+    // Time machine (read only): your last attempts, a ghost of the previous one and the gap to it
+    void timeReset(PlayLayer* layer) {
+        (void)layer;
+        if (curRec.size() > 30) {
+            attempts.push_back(curRec);
+            if (attempts.size() > 6) {
+                attempts.erase(attempts.begin());
+            }
+        }
+        curRec.clear();
+        if (buf.timeIcon) {
+            buf.timeIcon->setVisible(false);
+        }
+        buf.hudTime.clear();
+        updateHud();
+    }
+
+    void timeFrame(PlayLayer* layer) {
+        auto* p1 = layer->m_player1;
+        if (!p1 || p1->m_isDead || layer->m_isPaused) {
+            return;
+        }
+        if (curRec.size() < 40000) {
+            curRec.push_back({ p1->getPositionX(), p1->getPositionY() });
+        }
+        if (!buf.timeGhost || attempts.empty() || !buf.hitNode) {
+            if (buf.timeIcon) {
+                buf.timeIcon->setVisible(false);
+            }
+            return;
+        }
+        auto const& prev = attempts.back();
+        size_t idx = std::min(curRec.size() - 1, prev.size() - 1);
+        if (!buf.timeIcon) {
+            if (auto* icon = makeGhostIcon(false, 100)) {
+                buf.hitNode->getParent()->addChild(icon, 9996);
+                buf.timeIcon = icon;
+            }
+        }
+        if (buf.timeIcon) {
+            buf.timeIcon->setVisible(true);
+            buf.timeIcon->setPosition({ prev[idx].x, prev[idx].y });
+        }
+        if (curRec.size() % 6 == 0) {
+            float dx = curRec.back().x - prev[idx].x;
+            buf.hudTime = fmt::format("vs last attempt: {:.0f} units {} at {:.1f}s", std::abs(dx), dx >= 0.f ? "ahead" : "behind", curRec.size() / 60.f);
+            updateHud();
+        }
+    }
+
+    // ---- latency fingerprint: how long a click waits between the mod seeing it and the next game tick
+    std::vector<double> latSamples;
+    double lastInputWall = 0.0;
+    bool latPending = false;
+
+    void latencyNoteInput(bool down) {
+        if (down && (buf.fingerprint || buf.pieMode == 6 || buf.pieComp)) {
+            lastInputWall = nowSeconds();
+            latPending = true;
+        }
+    }
+
+    double latencyMedianMs() {
+        if (latSamples.empty()) {
+            return 0.0;
+        }
+        auto copy = latSamples;
+        std::sort(copy.begin(), copy.end());
+        return copy[copy.size() / 2];
+    }
+
+    void latencyTick() {
+        if (!latPending) {
+            return;
+        }
+        latPending = false;
+        latSamples.push_back((nowSeconds() - lastInputWall) * 1000.0);
+        if (latSamples.size() > 64) {
+            latSamples.erase(latSamples.begin());
+        }
+        if (!buf.fingerprint || latSamples.size() < 8) {
+            return;
+        }
+        auto sorted = latSamples;
+        std::sort(sorted.begin(), sorted.end());
+        double all = sorted[sorted.size() / 2], p95 = sorted[std::min(sorted.size() - 1, static_cast<size_t>(sorted.size() * 0.95))];
+        std::vector<double> recent(latSamples.end() - 8, latSamples.end());
+        std::sort(recent.begin(), recent.end());
+        double now = recent[4];
+        if (latSamples.size() >= 24 && std::abs(now - all) > 1.0 && std::abs(now - all) > all * 0.3) {
+            buf.hudLatency = fmt::format("latency changed: {:.1f} ms to {:.1f} ms (mod to game tick)", all, now);
+        }
+        else {
+            buf.hudLatency = fmt::format("input latency {:.1f} ms, p95 {:.1f} ms (mod to game tick)", all, p95);
+        }
+        updateHud();
+    }
+
+    // ---- pre-input control engine (practice mode only)
+    int pieShift = 0;
+
+    int eventTicks(PlayLayer* layer) {
+        if (buf.pieEvent == 0) {
+            return buf.forecastTicks;  // the predicted collision, from the forecast
+        }
+        auto* p1 = layer->m_player1;
+        if (!p1) {
+            return -1;
+        }
+        if (!portalCacheValid) {
+            portalXs.clear();
+            if (layer->m_objects) {
+                for (auto* o : CCArrayExt<GameObject*>(layer->m_objects)) {
+                    if (o && isPortalId(o->m_objectID)) {
+                        portalXs.push_back(o->getPositionX());
+                    }
+                }
+            }
+            std::sort(portalXs.begin(), portalXs.end());
+            portalCacheValid = true;
+        }
+        auto next = std::upper_bound(portalXs.begin(), portalXs.end(), p1->getPositionX());
+        if (next == portalXs.end()) {
+            return -1;
+        }
+        // units per second for the speed portals 0.5x .. 4x (as the game's player speed values)
+        constexpr float SPEEDS[][2] = { { 0.7f, 251.16f }, { 0.9f, 311.58f }, { 1.1f, 387.42f }, { 1.3f, 468.f }, { 1.6f, 576.f } };
+        float units = 311.58f, best = 9.f;
+        for (auto const& s : SPEEDS) {
+            if (std::abs(p1->m_playerSpeed - s[0]) < best) {
+                best = std::abs(p1->m_playerSpeed - s[0]);
+                units = s[1];
+            }
+        }
+        double seconds = (*next - p1->getPositionX()) / units;
+        return static_cast<int>(std::lround(seconds * ticksPerSecond()));
+    }
+
+    // Holds your click back (never earlier) by the chosen method; the release follows by the same time
+    bool pieShape(PlayLayer* layer, bool down) {
+        if (buf.pieMode == 0 || !spamPractice(layer)) {
+            return false;
+        }
+        if (!down) {
+            if (pieShift > 0) {
+                buf.queue.push_back({ pieShift, false });
+                pieShift = 0;
+                return true;
+            }
+            return false;
+        }
+        pieShift = 0;
+        double tps = ticksPerSecond();
+        int compensation = buf.pieComp ? static_cast<int>(std::lround(latencyMedianMs() / 1000.0 * tps)) : 0;
+        int ticks = 0;
+        switch (buf.pieMode) {
+            case 1:  // milliseconds
+                ticks = static_cast<int>(std::lround(buf.pieOffset / 1000.0 * tps)) - compensation;
+                break;
+            case 2:  // frames (of 1/60 s)
+                ticks = static_cast<int>(std::lround(buf.pieOffset / tickFrames())) - compensation;
+                break;
+            case 3:  // physics steps
+                ticks = static_cast<int>(std::lround(buf.pieOffset)) - compensation;
+                break;
+            case 4:  // pre-tick: delivered right at the start of the next tick, before input is sampled
+                ticks = 1;
+                break;
+            case 5: {  // click before a predicted event: land the click this long before it
+                int until = eventTicks(layer);
+                if (until >= 0) {
+                    ticks = std::clamp(until - static_cast<int>(std::lround(buf.pieOffset / 1000.0 * tps)), 0, 120);
+                }
+                break;
+            }
+            case 6:  // adaptive: total latency ends up at the chosen number of milliseconds
+                ticks = static_cast<int>(std::lround((buf.pieOffset - latencyMedianMs()) / 1000.0 * tps));
+                break;
+            default:
+                break;
+        }
+        ticks = std::clamp(ticks, 0, 240);
+        if (ticks <= 0) {
+            return false;
+        }
+        pieShift = ticks;
+        buf.queue.push_back({ ticks, true });
+        return true;
+    }
+}
+
 class $modify(BufEndLevelLayer, EndLevelLayer) {
     void customSetup() {
         EndLevelLayer::customSetup();
@@ -7980,6 +8646,14 @@ class $modify(BufPlayLayer, PlayLayer) {
     static void onModify(auto& self) {
         (void)self.setHookPriority("PlayLayer::destroyPlayer", HOOK_PRIORITY);
         (void)self.setHookPriority("PlayLayer::playEndAnimationToPos", HOOK_PRIORITY);
+    }
+
+    void postUpdate(float dt) {
+        PlayLayer::postUpdate(dt);
+        if (!buf.simulating) {
+            hitboxFrame(this);  // v3.12
+            timeFrame(this);
+        }
     }
 
     void destroyPlayer(PlayerObject* player, GameObject* object) {
@@ -8213,6 +8887,19 @@ class $modify(BufPlayLayer, PlayLayer) {
         pathParent->addChild(buf.ghostLabel, 9999);
         buf.ghostIcons = CCNode::create();
         pathParent->addChild(buf.ghostIcons, 9998);
+        // v3.12: hitboxes and the future path draw into their own layers
+        buf.hitNode = CCDrawNode::create();
+        pathParent->addChild(buf.hitNode, 9997);
+        buf.futureNode = CCDrawNode::create();
+        pathParent->addChild(buf.futureNode, 9996);
+        buf.timeIcon = nullptr;
+        buf.hitDrawn = false;
+        hbFor = nullptr;
+        hbSorted.clear();
+        nearMin.clear();
+        portalCacheValid = false;
+        curRec.clear();
+        attempts.clear();
         // v3.6 HUD text (forecast, spam meter, death explanation), top left of the screen
         buf.hudLabel = CCLabelBMFont::create("", "chatFont.fnt");
         buf.hudLabel->setScale(0.5f);
@@ -8254,6 +8941,9 @@ class $modify(BufPlayLayer, PlayLayer) {
 
     void resetLevel() {
         sectionBlockEnd = -1;  // v3.1
+        timeReset(this);  // v3.12
+        nearMin.clear();
+        buf.autoYield = false;
         buf.hudDeath.clear();  // v3.6
         buf.hudBranches.clear();
         buf.hudForecast.clear();
@@ -8479,6 +9169,7 @@ class $modify(BufPlayerObject, PlayerObject) {
                 spamLockTick(layer);
             }
             spamLearnTick(layer);
+            latencyTick();
             if (buf.enabled) {
                 deliverPending(layer, this);
                 livePath(layer, this);
@@ -8671,12 +9362,20 @@ namespace {
                 saveMemory();
                 say("memory for this level cleared");
                 break;
+            case 6:
+                buf.frozen = !buf.frozen;
+                say("frame advance: {}", buf.frozen ? "frozen" : "running");
+                break;
+            case 7:
+                buf.frozen = true;
+                ++buf.stepFrames;
+                break;
         }
     }
 
     void setupKeybinds() {
-        char const* binds[] = { "bind-stage", "bind-menu", "bind-export", "bind-console", "bind-path", "bind-forget" };
-        for (int i = 0; i < 6; ++i) {
+        char const* binds[] = { "bind-stage", "bind-menu", "bind-export", "bind-console", "bind-path", "bind-forget", "bind-freeze", "bind-step" };
+        for (int i = 0; i < 8; ++i) {
             listenForKeybindSettingPresses(binds[i], [i](Keybind const&, bool down, bool repeat, double) {
                 if (down && !repeat) {
                     keyAction(i);
@@ -8934,6 +9633,15 @@ static double tpsCarry = 0.0;
 
 class $modify(BufBaseGameLayer, GJBaseGameLayer) {
     void update(float dt) {
+        if (buf.frozen && typeinfo_cast<PlayLayer*>(this)) {  // v3.12 frame advance
+            if (buf.stepFrames > 0) {
+                --buf.stepFrames;
+                dt = 1.f / 60.f;
+            }
+            else {
+                return;
+            }
+        }
         int tps = static_cast<int>(Mod::get()->getSettingValue<int64_t>("tps"));
         if (tps <= 240 || tpsDriving || !typeinfo_cast<PlayLayer*>(this)) {
             GJBaseGameLayer::update(dt);
@@ -9144,6 +9852,10 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
             }
             recordRealInput(down, p1);
             spamNote(down);
+            latencyNoteInput(down);
+            if (down && buf.autoClick) {
+                buf.autoYield = true;  // v3.12: auto-click stands down until the next attempt
+            }
         }
         if (!buf.simulating && button == 1 && !buf.injecting) {
             // v2.21 performance log: what this click cost, measured around the whole decision.
@@ -9159,6 +9871,9 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
             }
             if (held) {
                 return;
+            }
+            if (pieShape(GameManager::get()->m_playLayer, down)) {
+                return;  // v3.12: held back by the pre-input engine (practice only)
             }
             if (spamShape(GameManager::get()->m_playLayer, down)) {
                 return;  // v3.9: limited or re-timed (practice only)
