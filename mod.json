@@ -6,7 +6,7 @@
 		"mac": "2.2081",
 		"ios": "2.2081"
 	},
-	"version": "v3.11.0",
+	"version": "v3.12.0",
 	"id": "aliou.aliousbuffer",
 	"name": "Aliou's Buffer",
 	"developer": "Aliou",
@@ -187,6 +187,162 @@
 			"type": "bool",
 			"name": "Predictive branching",
 			"description": "At each decision (with the path view and ghost comparison on), also simulates the click at 0, 1, 2, 3, 4, 6 and 8 frames of delay side by side, draws each faintly (green = safe, red = crash) and lists them on screen. Costs up to five extra predictions per decision; off in performance mode.",
+			"default": false
+		},
+		"hitbox-view": {
+			"type": "bool",
+			"name": "Hitboxes",
+			"description": "Draws the player's and the objects' collision boxes live, in the level. Colours and filters are below.",
+			"default": false
+		},
+		"hitbox-difference": {
+			"type": "bool",
+			"name": "Hitbox difference",
+			"description": "Also draws the artwork's own box in grey next to each collision box, to show where they differ.",
+			"default": false
+		},
+		"hitbox-hazards": {
+			"type": "bool",
+			"name": "Hitboxes: hazards",
+			"description": "Show hazards.",
+			"default": true
+		},
+		"hitbox-solids": {
+			"type": "bool",
+			"name": "Hitboxes: blocks and slopes",
+			"description": "Show blocks and slopes.",
+			"default": true
+		},
+		"hitbox-special": {
+			"type": "bool",
+			"name": "Hitboxes: pads, orbs, portals",
+			"description": "Show pads, orbs and portals.",
+			"default": true
+		},
+		"hitbox-triggers": {
+			"type": "bool",
+			"name": "Hitboxes: triggers",
+			"description": "Show triggers.",
+			"default": false
+		},
+		"hitbox-opacity": {
+			"type": "float",
+			"name": "Hitbox opacity",
+			"description": "How strong the hitboxes are drawn, so the level stays visible.",
+			"default": 0.55,
+			"min": 0.1,
+			"max": 1.0
+		},
+		"hitbox-predict": {
+			"type": "bool",
+			"name": "Predicted contact",
+			"description": "Marks the object the do-nothing run is about to hit, with a cross at the contact point, and says how many frames remain.",
+			"default": false
+		},
+		"hitbox-near-miss": {
+			"type": "bool",
+			"name": "Near-miss detection",
+			"description": "Says when you passed a hazard by under 3 units without dying.",
+			"default": false
+		},
+		"time-ghost": {
+			"type": "bool",
+			"name": "Last-attempt ghost",
+			"description": "Shows a translucent copy of your icon replaying your previous attempt, and how far ahead or behind you are.",
+			"default": false
+		},
+		"hitbox-color-player": {
+			"type": "color",
+			"name": "Hitbox colour: player",
+			"description": "Colour of the player hitbox.",
+			"default": "#FFFFFF"
+		},
+		"hitbox-color-hazard": {
+			"type": "color",
+			"name": "Hitbox colour: hazards",
+			"description": "Colour of hazard hitboxes.",
+			"default": "#FF4646"
+		},
+		"hitbox-color-solid": {
+			"type": "color",
+			"name": "Hitbox colour: blocks",
+			"description": "Colour of block and slope hitboxes.",
+			"default": "#508CFF"
+		},
+		"hitbox-color-special": {
+			"type": "color",
+			"name": "Hitbox colour: pads, orbs, portals",
+			"description": "Colour of pad, orb and portal hitboxes.",
+			"default": "#FFD246"
+		},
+		"hitbox-color-trigger": {
+			"type": "color",
+			"name": "Hitbox colour: triggers",
+			"description": "Colour of trigger hitboxes.",
+			"default": "#BE6EFF"
+		},
+		"hitbox-color-predicted": {
+			"type": "color",
+			"name": "Hitbox colour: predicted contact",
+			"description": "Colour of the object about to be hit.",
+			"default": "#FF8C00"
+		},
+		"future-vision": {
+			"type": "string",
+			"name": "Future vision",
+			"description": "Draws where you end up if you do nothing, this many seconds ahead, with a dot for every second and a cross where it crashes. Long ranges cost more.",
+			"default": "Off",
+			"one-of": [
+				"Off",
+				"2 s",
+				"5 s",
+				"10 s",
+				"30 s"
+			]
+		},
+		"pie-mode": {
+			"type": "string",
+			"name": "Pre-input timing method (practice only)",
+			"description": "Immediate sends your click untouched. Millisecond delay, Frame offset and Step offset hold it back by a fixed time. Pre-tick injection delivers it at the start of the next tick. Click before event holds it until the offset before a predicted event. Adaptive makes the total latency the chosen number of milliseconds. Practice mode only; a small INPUT ENGINE tag shows.",
+			"default": "Immediate",
+			"one-of": [
+				"Immediate",
+				"Millisecond delay",
+				"Frame offset",
+				"Step offset",
+				"Pre-tick injection",
+				"Click before event",
+				"Adaptive"
+			]
+		},
+		"pie-event": {
+			"type": "string",
+			"name": "Pre-input event",
+			"description": "The event Click before event aims at: the predicted collision, or the next portal ahead.",
+			"default": "Collision",
+			"one-of": [
+				"Collision",
+				"Next portal"
+			]
+		},
+		"pie-offset": {
+			"type": "float",
+			"name": "Pre-input offset",
+			"description": "Milliseconds, frames or steps depending on the method (milliseconds for Click before event and Adaptive).",
+			"default": 6.0,
+			"min": 0.0,
+			"max": 200.0
+		},
+		"pie-compensate": {
+			"type": "bool",
+			"name": "Compensate measured latency",
+			"description": "Subtracts the measured mod-to-tick latency from fixed delays. Not applied twice with Adaptive.",
+			"default": false
+		},
+		"pie-fingerprint": {
+			"type": "bool",
+			"name": "Latency fingerprint",
+			"description": "Measures how long a click waits between the mod seeing it and the next game tick, keeps a profile, and shows it on screen; says when it changes.",
 			"default": false
 		},
 		"death-explain": {
@@ -642,6 +798,24 @@
 				"arrow-step": 10,
 				"big-arrows": false
 			}
+		},
+		"bind-freeze": {
+			"type": "keybind",
+			"name": "Key: frame advance freeze",
+			"description": "Works inside a level. Change it here or in Geode's keybinds popup.",
+			"category": "gameplay",
+			"default": [
+				"F6"
+			]
+		},
+		"bind-step": {
+			"type": "keybind",
+			"name": "Key: frame advance step",
+			"description": "Works inside a level. Change it here or in Geode's keybinds popup.",
+			"category": "gameplay",
+			"default": [
+				"F7"
+			]
 		}
 	},
 	"resources": {
