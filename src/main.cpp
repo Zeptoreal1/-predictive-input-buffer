@@ -2546,6 +2546,10 @@ namespace {
     bool aiStart(PlayLayer* layer);
     void aiStop(PlayLayer* layer, char const* why);
     bool aiRunning();
+    // Defined with the adaptive difficulty engine later in this translation unit.
+    // Forward declarations are required by the status tag and UI code above it.
+    bool nerfOn();
+    float nerfStrength();
     void loadAi();
     void saveAi();
 
@@ -3184,12 +3188,14 @@ namespace {
         int tick;
         bool down;
     };
-    struct Route {
+    // A recorded input sequence is distinct from the pathfinder's live Route.
+    // Keeping separate types avoids the duplicate Route definition in this namespace.
+    struct RecordedRoute {
         std::vector<RouteInput> inputs;
         float tickLength = 0.f;
         bool valid = false;
     };
-    Route routeSaved;
+    RecordedRoute routeSaved;
     std::vector<RouteInput> routeCur;
     bool routeRecording = false;
     bool routeReplaying = false;
@@ -10964,6 +10970,36 @@ class BufferMenu : public geode::Popup {
         { nullptr, "Path view (now)" },
         { "training-mode", "Training (hints)" },
     };
+    // Simple mode is only a presentation layer. All saved mod settings and the prediction
+    // engine are shared with Pro; changing views does not change how inputs are handled.
+    static constexpr Option SIMPLE_HOME[] = {
+        { "practice-only", "Practice mode only" },
+        { "smart-prediction", "Smart prediction" },
+        { nullptr, "Show predicted path" },
+    };
+    static constexpr Option SIMPLE_BUFFER[] = {
+        { "smart-prediction", "Predict orbs, pads and portals" },
+        { "robust-saves", "Safer input saves" },
+        { "orb-assume-hit", "Include orb clicks" },
+        { "orb-try-both", "Try both orb choices" },
+        { "low-latency", "Prefer low latency" },
+    };
+    static constexpr Option SIMPLE_PRACTICE[] = {
+        { "practice-only", "Only assist in practice" },
+        { "training-mode", "Show training hints" },
+        { "level-memory", "Remember what works" },
+        { "more-time-death-spots", "Focus on difficult spots" },
+        { "section-learning", "Learn selected sections" },
+    };
+    static constexpr Option SIMPLE_VISUALS[] = {
+        { nullptr, "Show prediction path" },
+        { "ghost-compare", "Compare ghost path" },
+        { "ghost-icon", "Show ghost icon" },
+        { "death-heatmap", "Show death heatmap" },
+        { "fps-overlay", "Show FPS" },
+    };
+    static constexpr int SIMPLE_TAB_IDS[] = { 0, 1, 5, 7, 13 };
+    static constexpr char const* SIMPLE_TAB_LABELS[] = { "Home", "Buffer", "Practice", "Visuals", "About" };
     static constexpr Option TOOLS[] = {
         { "drift-check", "Drift check" },
         { "perf-log", "Performance log" },
@@ -11071,6 +11107,9 @@ private:
     static constexpr float ROW = 22.f;
 
     static inline BufferMenu* s_open = nullptr;
+    static inline bool s_simpleUI = true;
+    static inline int s_simpleTab = 0;
+    static inline int s_proTab = 0;
     static inline int s_tab = 0;
     static inline bool s_moved = false;
     static inline CCPoint s_pos {};
@@ -11267,9 +11306,10 @@ private:
     }
 
     // Whole-row touch targets: tapping the text toggles an option, not just its tiny switch.
-    void optionRow(Option const& o, float x, float y, float width) {
+    // Simple mode uses a taller hit target and single-column rows for smaller screens.
+    void optionRow(Option const& o, float x, float y, float width, float touchHeight = ROW - 2.f) {
         auto* hit = CCNode::create();
-        hit->setContentSize({ width, ROW - 2.f });
+        hit->setContentSize({ width, touchHeight });
         auto* item = CCMenuItemSpriteExtra::create(hit, this, menu_selector(BufferMenu::onToggle));
         item->setTag(static_cast<int>(m_options.size()));
         item->m_scaleMultiplier = 1.f;  // don't move the label/switch when a setting is tapped
@@ -11280,8 +11320,9 @@ private:
         d->setPosition({ x + width - 28.f, y - 6.5f });
         m_page->addChild(d, 4);
         drawSwitch(d, optionValue(o));
-        auto* l = label(m_page, o.label, 0.54f, optionValue(o) ? m_text : m_muted, { x, y }, { 0.f, 0.5f });
-        l->limitLabelWidth(width - 37.f, 0.54f, 0.2f);
+        float textSize = touchHeight >= 26.f ? 0.58f : 0.54f;
+        auto* l = label(m_page, o.label, textSize, optionValue(o) ? m_text : m_muted, { x, y }, { 0.f, 0.5f });
+        l->limitLabelWidth(width - 37.f, textSize, 0.2f);
         m_options.push_back(&o);
         m_switches.push_back(d);
         m_switchLabels.push_back(l);
@@ -11295,6 +11336,15 @@ private:
             float x = left + (i / rows) * (colW + 10.f);
             float y = top - (i % rows) * ROW;
             optionRow(options[i], x, y, colW);
+        }
+    }
+
+    void simpleRows(Option const* options, size_t count, float top) {
+        constexpr float SPACING = 28.f;
+        card(top + 13.f, count * SPACING + 4.f);
+        for (size_t i = 0; i < count; ++i) {
+            float y = top - static_cast<float>(i) * SPACING;
+            optionRow(options[i], SIDE + 20.f, y, W - SIDE - 40.f, 26.f);
         }
     }
 
@@ -11368,8 +11418,39 @@ private:
         auto* close = CCMenuItemSpriteExtra::create(node, this, menu_selector(BufferMenu::onCloseButton));
         close->setPosition({ WIN_W - 18.f, H - TITLE / 2.f });
         m_frameMenu->addChild(close);
+        // A persistent two-way view switch, always visible in the header.
+        // It changes only what is displayed, never individual feature values.
+        auto* switchBg = CCDrawNode::create();
+        roundRect(switchBg, { 279.f, H - TITLE / 2.f - 11.f, 108.f, 22.f }, 7.f,
+            col(m_t.surface, 1.f), 0.6f, col(m_t.line, 0.8f));
+        root->addChild(switchBg, 2);
+        for (int i = 0; i < 2; ++i) {
+            bool active = s_simpleUI == (i == 0);
+            auto* segment = CCNode::create();
+            segment->setContentSize({ 52.f, 19.f });
+            if (active) {
+                auto* fill = CCDrawNode::create();
+                roundRect(fill, { 0.f, 0.f, 52.f, 19.f }, 6.f, col(m_t.accent, 1.f));
+                segment->addChild(fill);
+            }
+            auto* txt = CCLabelBMFont::create(i == 0 ? "Simple" : "Pro", bodyFont());
+            txt->setScale(0.48f * BODY_K);
+            txt->setColor(active ? m_t.onAccent : m_muted);
+            txt->setPosition({ 26.f, 10.f });
+            segment->addChild(txt);
+            auto* choice = CCMenuItemSpriteExtra::create(segment, this, menu_selector(BufferMenu::onUIMode));
+            choice->m_scaleMultiplier = 1.f;
+            choice->setTag(i == 0 ? 1 : 0);
+            choice->setPosition({ 306.f + i * 54.f, H - TITLE / 2.f });
+            m_frameMenu->addChild(choice);
+        }
         button(m_frameMenu, "Settings", menu_selector(BufferMenu::onAllSettings), { WIN_W - 112.f, H - TITLE / 2.f }, 54.f, false, 0, 16.f);
-        buildInfoPanel();
+        if (s_simpleUI) {
+            buildSimpleInfoPanel();
+        }
+        else {
+            buildInfoPanel();
+        }
     }
 
     // a small line icon for each section (drawn, no extra images)
@@ -11475,9 +11556,20 @@ private:
         auto* menu = CCMenu::create();
         menu->setPosition({ 0.f, 0.f });
         m_tabsNode->addChild(menu);
-        constexpr float STEP = 16.8f, ITEM = 15.5f;
-        float activeY = H - TITLE - 18.f - s_tab * STEP - ITEM / 2.f;
-        // one highlight that glides to the active tab instead of jumping
+
+        float step = s_simpleUI ? 39.f : 16.8f;
+        float itemHeight = s_simpleUI ? 29.f : 15.5f;
+        float firstY = H - TITLE - (s_simpleUI ? 30.f : 18.f);
+        int selected = 0;
+        int tabCount = s_simpleUI ? static_cast<int>(std::size(SIMPLE_TAB_IDS)) : static_cast<int>(std::size(TABS));
+        for (int i = 0; i < tabCount; ++i) {
+            int id = s_simpleUI ? SIMPLE_TAB_IDS[i] : i;
+            if (s_tab == id) {
+                selected = i;
+                break;
+            }
+        }
+        float activeY = firstY - selected * step - itemHeight / 2.f;
         auto* hi = static_cast<CCDrawNode*>(m_mainLayer->getChildByTag(7701));
         if (!hi || m_tabHiTheme != m_themeKey) {
             if (hi) {
@@ -11485,40 +11577,76 @@ private:
             }
             hi = CCDrawNode::create();
             hi->setTag(7701);
-            roundRect(hi, { 0.f, 0.f, SIDE - 16.f, ITEM }, 5.f, col(m_t.accent, m_t.light ? 0.1f : 0.14f));
-            roundRect(hi, { 0.f, 3.f, 2.f, ITEM - 6.f }, 1.f, col(m_t.accent, 1.f));
+            roundRect(hi, { 0.f, 0.f, SIDE - 16.f, itemHeight }, 6.f,
+                col(m_t.accent, m_t.light ? 0.1f : 0.14f));
+            roundRect(hi, { 0.f, 5.f, 2.f, itemHeight - 10.f }, 1.f, col(m_t.accent, 1.f));
             hi->setPosition({ 8.f, activeY });
             m_mainLayer->addChild(hi, 3);
             m_tabHiTheme = m_themeKey;
         }
         else {
             hi->stopAllActions();
-            hi->runAction(CCEaseExponentialOut::create(CCMoveTo::create(0.3f, { 8.f, activeY })));
+            hi->runAction(CCEaseSineOut::create(CCMoveTo::create(0.22f, { 8.f, activeY })));
         }
-        for (int i = 0; i < static_cast<int>(std::size(TABS)); ++i) {
-            float y = H - TITLE - 18.f - i * STEP;
-            bool active = i == s_tab;
+        for (int i = 0; i < tabCount; ++i) {
+            int id = s_simpleUI ? SIMPLE_TAB_IDS[i] : i;
+            bool active = id == s_tab;
+            float y = firstY - i * step;
             auto* node = CCNode::create();
-            node->setContentSize({ SIDE - 16.f, ITEM });
+            node->setContentSize({ SIDE - 16.f, itemHeight });
             auto* d = CCDrawNode::create();
-            navIcon(d, i, { 13.f, ITEM / 2.f }, col(active ? m_t.accent : m_muted, 1.f));
+            navIcon(d, id, { 13.f, itemHeight / 2.f }, col(active ? m_t.accent : m_muted, 1.f));
             node->addChild(d);
-            auto* l = CCLabelBMFont::create(TABS[i], active ? headFont() : bodyFont());
-            l->setScale(0.48f * (active ? HEAD_K : BODY_K));
+            auto* l = CCLabelBMFont::create(s_simpleUI ? SIMPLE_TAB_LABELS[i] : TABS[i], active ? headFont() : bodyFont());
+            float fontScale = s_simpleUI ? 0.55f : 0.48f;
+            l->setScale(fontScale * (active ? HEAD_K : BODY_K));
             l->setColor(active ? m_text : m_muted);
             l->setAnchorPoint({ 0.f, 0.5f });
-            l->setPosition({ 25.f, ITEM / 2.f });
-            l->limitLabelWidth(SIDE - 16.f - 29.f, 0.48f * (active ? HEAD_K : BODY_K), 0.15f);
+            l->setPosition({ 25.f, itemHeight / 2.f });
+            l->limitLabelWidth(SIDE - 16.f - 29.f, fontScale * (active ? HEAD_K : BODY_K), 0.15f);
             node->addChild(l);
             auto* item = CCMenuItemSpriteExtra::create(node, this, menu_selector(BufferMenu::onTab));
-            item->m_scaleMultiplier = 1.02f;
-            item->setTag(i);
+            item->m_scaleMultiplier = 1.f;
+            item->setTag(id);
             item->setPosition({ SIDE / 2.f, y });
             menu->addChild(item);
+        }
+        if (s_simpleUI) {
+            label(m_tabsNode, "CLEAN VIEW", 0.38f, m_muted, { SIDE / 2.f, 36.f }, { 0.5f, 0.5f }, true);
+            label(m_tabsNode, "All tools in Pro", 0.32f, m_muted, { SIDE / 2.f, 24.f });
         }
     }
 
     // ---------- right status panel ----------
+
+    // Compact live summary for Simple mode. Pro keeps the original detailed telemetry rail.
+    void buildSimpleInfoPanel() {
+        auto* root = m_chrome;
+        float x0 = W + 5.f, pw = RP - 11.f;
+        auto* bg = CCDrawNode::create();
+        roundRect(bg, { x0, 8.f, pw, H - TITLE - 14.f }, 8.f,
+            col(m_t.surface, m_hasImage ? 0.94f : 1.f), 0.5f, col(m_t.line, 0.7f));
+        root->addChild(bg, -1);
+        float lx = x0 + 10.f, lw = pw - 20.f;
+        label(root, "LIVE STATUS", 0.4f, m_muted, { lx, H - TITLE - 17.f }, { 0.f, 0.5f }, true);
+        m_dotNode = CCNode::create();
+        m_dotNode->setPosition({ lx + 4.f, H - TITLE - 42.f });
+        root->addChild(m_dotNode, 3);
+        m_dot = CCDrawNode::create();
+        m_dotNode->addChild(m_dot);
+        m_infoBuffer = label(root, "", 0.54f, m_text, { lx + 13.f, H - TITLE - 42.f }, { 0.f, 0.5f }, true);
+        m_infoStage = label(root, "", 0.43f, m_muted, { lx, H - TITLE - 62.f }, { 0.f, 0.5f });
+        auto* sep = CCDrawNode::create();
+        sep->drawSegment({ lx, H - TITLE - 83.f }, { lx + lw, H - TITLE - 83.f }, 0.35f, col(m_t.line, 0.6f));
+        root->addChild(sep);
+        label(root, "PREDICTION", 0.4f, m_muted, { lx, H - TITLE - 101.f }, { 0.f, 0.5f }, true);
+        m_infoPred = label(root, "", 0.47f, m_text, { lx, H - TITLE - 120.f }, { 0.f, 0.5f });
+        label(root, "WHERE IT WORKS", 0.39f, m_muted, { lx, H - TITLE - 150.f }, { 0.f, 0.5f }, true);
+        m_infoScope = label(root, "", 0.45f, m_text, { lx, H - TITLE - 169.f }, { 0.f, 0.5f });
+        label(root, "Practice tools", 0.37f, m_t.warn, { lx, 39.f }, { 0.f, 0.5f }, true);
+        label(root, "Runs aren't verified", 0.34f, m_muted, { lx, 24.f }, { 0.f, 0.5f })->limitLabelWidth(lw, 0.34f * BODY_K, 0.15f);
+        refreshInfo();
+    }
 
     void buildInfoPanel() {
         auto* root = m_chrome;
@@ -11565,6 +11693,20 @@ private:
 
     void refreshInfo() {
         if (!m_infoBuffer) {
+            return;
+        }
+        if (s_simpleUI) {
+            bool enabled = buf.enabled;
+            m_dot->clear();
+            circle(m_dot, { 0.f, 0.f }, 4.f, col(enabled ? m_hi : m_t.bad, 1.f), 18);
+            m_infoBuffer->setString(enabled ? "Buffer on" : "Buffer off");
+            m_infoBuffer->setColor(enabled ? m_text : m_t.bad);
+            m_infoStage->setString(stageText().c_str());
+            m_infoStage->limitLabelWidth(RP - 31.f, 0.43f * BODY_K, 0.16f);
+            m_infoPred->setString(Mod::get()->getSettingValue<bool>("smart-prediction") ? "Smart mode" : "Basic mode");
+            bool practice = Mod::get()->getSettingValue<bool>("practice-only");
+            m_infoScope->setString(practice ? "Practice only" : "Every run");
+            m_infoScope->setColor(practice ? m_text : m_t.warn);
             return;
         }
         auto* mod = Mod::get();
@@ -11663,6 +11805,43 @@ private:
     // a short muted line of text on a page
     void note(std::string const& text, float y, ccColor3B color, float scale = 0.4f) {
         label(m_page, text, scale, color, { SIDE + 14.f, y }, { 0.f, 0.5f })->limitLabelWidth(W - SIDE - 28.f, scale, 0.2f);
+    }
+
+    // Five focused screens; all underlying advanced settings remain accessible in Pro.
+    void pageSimpleHome() {
+        heading("Your buffer", "The essentials for your next practice run.");
+        card(215.f, 73.f);
+        label(m_page, "CHOOSE A STARTING POINT", 0.39f, m_muted, { SIDE + 20.f, 204.f }, { 0.f, 0.5f }, true);
+        float pw = (W - SIDE - 50.f) / 3.f;
+        for (int i = 0; i < 3; ++i) {
+            button(m_pageMenu, i == 0 ? "Safe" : i == 1 ? "Balanced" : "Strong",
+                menu_selector(BufferMenu::onPreset), { SIDE + 20.f + pw / 2.f + i * (pw + 5.f), 179.f },
+                pw, false, i, 22.f);
+        }
+        label(m_page, "CURRENT STRENGTH", 0.37f, m_muted, { SIDE + 20.f, 154.f }, { 0.f, 0.5f }, true);
+        m_stage = label(m_page, "", 0.5f, m_hi, { SIDE + 105.f, 154.f }, { 0.f, 0.5f }, true);
+        simpleRows(SIMPLE_HOME, std::size(SIMPLE_HOME), 117.f);
+        note("Want every control? Choose Pro above.", 18.f, m_muted);
+    }
+
+    void pageSimpleBuffer() {
+        heading("Buffer controls", "Smart, reliable inputs without the clutter.");
+        simpleRows(SIMPLE_BUFFER, std::size(SIMPLE_BUFFER), 195.f);
+        note("More precise timing and per-mode options live in Pro.", 37.f, m_muted);
+    }
+
+    void pageSimplePractice() {
+        heading("Practice setup", "Keep the tools that help you improve.");
+        simpleRows(SIMPLE_PRACTICE, std::size(SIMPLE_PRACTICE), 195.f);
+        note("Section picking and auto inputs are available in Pro.", 37.f, m_muted);
+    }
+
+    void pageSimpleVisuals() {
+        heading("Visual feedback", "See what the buffer is learning and predicting.");
+        simpleRows(SIMPLE_VISUALS, std::size(SIMPLE_VISUALS), 195.f);
+        label(m_page, "Theme", 0.5f, m_muted, { SIDE + 20.f, 34.f }, { 0.f, 0.5f });
+        button(m_pageMenu, Mod::get()->getSettingValue<std::string>("menu-theme"),
+            menu_selector(BufferMenu::onTheme), { W - 64.f, 34.f }, 96.f, false, 0, 20.f);
     }
 
     void pageOverview() {
@@ -12276,7 +12455,16 @@ private:
         m_pageMenu->setPosition({ 0.f, 0.f });
         m_page->addChild(m_pageMenu, 5);
 
-        switch (s_tab) {
+        if (s_simpleUI) {
+            switch (s_tab) {
+                case 1: pageSimpleBuffer(); break;
+                case 5: pageSimplePractice(); break;
+                case 7: pageSimpleVisuals(); break;
+                case 13: pageAbout(); break;
+                default: pageSimpleHome(); break;
+            }
+        }
+        else switch (s_tab) {
             case 1: pagePrediction(); break;
             case 2: pageGameModes(); break;
             case 3: pageAutomation(); break;
@@ -12300,7 +12488,7 @@ private:
     void refresh() {
         if (m_stage) {
             m_stage->setString(stageText().c_str());
-            m_stage->limitLabelWidth(W - SIDE - 150.f, 0.55f, 0.2f);
+            m_stage->limitLabelWidth(s_simpleUI ? 195.f : W - SIDE - 150.f, 0.55f, 0.2f);
         }
         if (m_tpsLabel) {
             m_tpsLabel->setString(fmt::format("{}", Mod::get()->getSettingValue<int64_t>("tps")).c_str());
@@ -12393,7 +12581,8 @@ private:
             }
         }
         auto p = m_mainLayer->convertToNodeSpace(touch->getLocation());
-        if (p.x >= 0.f && p.x <= WIN_W - 190.f && p.y >= H - TITLE && p.y <= H) {
+        // Leave the Simple / Pro segmented control free to receive taps.
+        if (p.x >= 0.f && p.x <= 260.f && p.y >= H - TITLE && p.y <= H) {
             m_dragging = true;
             return true;
         }
@@ -12438,7 +12627,32 @@ private:
 
     void onTab(CCObject* sender) {
         s_tab = sender->getTag();
+        if (s_simpleUI) {
+            s_simpleTab = s_tab;
+        }
+        else {
+            s_proTab = s_tab;
+        }
         rebuildPage();
+    }
+
+    void onUIMode(CCObject* sender) {
+        bool next = sender->getTag() == 1;
+        if (next == s_simpleUI) {
+            return;
+        }
+        if (s_simpleUI) {
+            s_simpleTab = s_tab;
+        }
+        else {
+            s_proTab = s_tab;
+        }
+        s_simpleUI = next;
+        s_tab = s_simpleUI ? s_simpleTab : s_proTab;
+        Mod::get()->setSavedValue("ui-simple-mode", s_simpleUI);
+        // The frame holds the segmented control and the information rail, so both are rebuilt.
+        m_tabHiTheme.clear();
+        reloadTheme();
     }
 
     void onMacroFolder(CCObject*) {
@@ -12811,7 +13025,10 @@ private:
             m_chrome->removeFromParent();
             m_chrome = nullptr;
         }
-        m_infoBuffer = nullptr;
+        m_infoBuffer = m_infoStage = m_infoPred = m_infoScope = nullptr;
+        m_dot = nullptr;
+        m_infoActive[0] = m_infoActive[1] = m_infoActive[2] = m_infoActive[3] = m_infoActive[4] = nullptr;
+        m_infoPerf[0] = m_infoPerf[1] = m_infoPerf[2] = nullptr;
         buildFrame();
         rebuildPage();
     }
@@ -12967,6 +13184,8 @@ protected:
             m_mainLayer->setScale(target * 0.97f);
             m_mainLayer->runAction(CCEaseSineOut::create(CCScaleTo::create(0.2f, target)));
         }
+        s_simpleUI = Mod::get()->getSavedValue<bool>("ui-simple-mode", true);
+        s_tab = s_simpleUI ? s_simpleTab : s_proTab;
         s_open = this;
         buildFrame();
         rebuildPage();
