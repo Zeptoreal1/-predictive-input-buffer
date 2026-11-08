@@ -15,6 +15,7 @@
 //  - Fixes: ghost lifetime, init using `this`, time-warp dt, F6 only when GD focused,
 //    dead flipGravity hook priority, optional console, in-game console (stage + live log, hidden by default).
 
+#include <set>
 #include <Geode/Geode.hpp>
 #include <Geode/utils/web.hpp>
 #include <Geode/modify/EffectGameObject.hpp>
@@ -47,12 +48,17 @@
 #include <complex>
 #include <deque>
 #include <filesystem>
+#include <cstring>
+#include <optional>
 #include <functional>
+#include <deque>
 #include <fstream>
 #include <unordered_map>
 #include <optional>
 #include <sstream>
 #include <thread>
+#include <atomic>
+#include <random>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -215,6 +221,10 @@ namespace {
         bool tryBothOrbs = true;     // v2.4: if a run touches an orb and dies, retry with the other orb choice
         bool orbClick = true;        // v2.4: orb choice of the current run
         bool touchedOrb = false;     // v2.4: the current run touched an orb
+        bool fullHorizon = false;
+        std::vector<int> const* plan = nullptr;  // v3.0 autoplay: ticks (from now) at which the ghost flips its button
+        std::vector<std::pair<void*, int>> orbTouches;
+        std::vector<int> orbTouchLast;  // v3.0 test 35: the last tick each of those orbs was still touched  // v3.0 test 8: orbs the planning ghost touched, and when    // v3.0 autoplay: only surviving the whole look-ahead counts (no "landed = safe")
         bool skipPress = false;      // v2.4: run without pressing anything (auto-release hold check)
         bool avoidMovers = true;     // v2.4: don't buffer when the ghost's path has moving objects
         bool sawMover = false;       // v2.4: a run this decision touched a moving object
@@ -262,6 +272,8 @@ namespace {
         // ticks, used instead of the stage's when on. Order: MODE_NAMES.
         bool perMode = false;
         std::array<int, 8> modeTicks { 40, 4, 40, 40, 20, 40, 40, 40 };
+        // v3.0 Modes page: bit (mode * 2 + mini) set = that mode isn't buffered at all (raw clicks)
+        uint32_t modeOff = 0;
         bool perfLog = false;        // v2.21: log time / runs / ghost ticks per click
         int simRuns = 0;             // v2.21: predictions run for the current click
         long simTicks = 0;           // v2.21: ghost ticks stepped for the current click
@@ -339,6 +351,15 @@ namespace {
         float pieOffset = 6.f;
         bool pieComp = false, fingerprint = false;
         bool autoYield = false;          // auto-click stands down once you press something yourself
+        int fxLevel = 0;                 // v3.14: 0 full, 1 no optional visuals/predictions, 2 also no path drawing
+        std::string hudFps, hudAi;
+        CCDrawNode* graphNode = nullptr;
+        bool fpsOverlay = false, fpsGraph = false, fpsSpikeKiller = true, fpsOverload = true, fpsDynamic = true, fpsLong = false;
+        int fpsMode = 1;                 // 0 performance, 1 balanced, 2 maximum stability, 3 custom
+        float fpsSpikeFactor = 2.2f, fpsLowRatio = 0.6f;
+        float nerfMargin = 0.f, nerfSpeed = 1.f, nerfGrace = 0.f;  // difficulty engine (practice only)
+        bool nerfHard = false;
+        float nerfMult[8] = { 1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f };
         bool branching = false;          // v3.10: simulate several delays side by side at each decision
         bool spamLimiter = false, spamStabilizer = false, spamLock = false, spamAdaptive = false;  // v3.9, practice only
         bool spamLearn = true;
@@ -355,6 +376,41 @@ namespace {
             float gap = 0.f, maxX = 0.f;
             CCPoint labelPos {};
         } review;
+        // v3.0 test 26: spots where autoplay really died although the ghost thought it was safe
+        // (something the ghost can't see). Its ghost counts touching them as a death.
+        std::vector<CCRect> autoDangers;
+        // v3.0 test 27, the route: a prediction can start from a saved hidden-player state further
+        // along (simFrom, simOffset ticks from now) instead of from you, and save states on the way
+        PlayerObject* simFrom = nullptr;
+        bool simFromHeld = false;
+        int simOffset = 0;
+        int cpEvery = 0;
+        void (*cpSink)(int, PlayerObject*, bool) = nullptr;
+        std::vector<CCPoint> const* crossPos = nullptr;  // the route's positions (for triggers it already passed)
+        int crossBase = 0;                               // crossPos[k] is after tick crossBase + k (from now)
+        // v3.0 test 27: GD only gives a player the objects near the camera; a hidden player past the
+        // screen gets the rest from this index of the level (built when autoplay starts)
+        bool offscreenFill = false;
+        std::unordered_map<int, std::vector<GameObject*>> objIndex;
+        std::unordered_set<GameObject*> seenThisCheck;
+        bool inCheck = false;
+        // v3.0 test 45: wave / ship routes stay in a band around where the stretch starts (leaving it
+        // counts as a death in the route's tests), so the route flies steadily instead of to the
+        // top and bottom of every corridor
+        // v3.0 test 50: the floor / ceiling a mode portal puts around you (ship, UFO, wave, swing,
+        // ball, spider), for the route's ghost: two invisible solid slabs it collides with
+        bool gBounds = false;
+        float gBoundLo = 0.f, gBoundHi = 0.f;
+        bool simFromBounds = false;
+        float simFromLo = 0.f, simFromHi = 0.f;
+        GameObject* boundSlabs[2] = { nullptr, nullptr };
+        int portalLogs = 0;
+        bool yBand = false;
+        float yBandCenter = 0.f;
+        float yBandHalf = 0.f;
+        bool postCollisionSeen = false;  // test 33: GD called postCollision inside this collision check
+        long long offscreenAdded = 0;    // objects the index added (shown at a death)
+        long long offscreenFallback = 0; // ...of those, added after the check (postCollision never came)
         int pathHoldUntil = 0;       // v2.65: live path waits while a click's path is on screen
 
         std::unordered_set<GameObject*> simUsed;
@@ -499,7 +555,77 @@ namespace {
     // isn't set, so a ship or wave right after a portal is predicted without those bounds.
     // Dual portals still stop the prediction (v2.84: teleport and solo portals are taken, see
     // ghostTeleport). Returns false for those.
-    bool ghostTakePortal(PlayerObject* g, GameObjectType type) {
+    bool boundedMode(GameObjectType t) {
+        return t == GameObjectType::ShipPortal || t == GameObjectType::UfoPortal || t == GameObjectType::WavePortal ||
+            t == GameObjectType::SwingPortal || t == GameObjectType::BallPortal || t == GameObjectType::SpiderPortal;
+    }
+
+    GameObjectType portalTypeOf(PlayerObject* p) {
+        if (p->m_isShip) return GameObjectType::ShipPortal;
+        if (p->m_isBird) return GameObjectType::UfoPortal;
+        if (p->m_isDart) return GameObjectType::WavePortal;
+        if (p->m_isSwing) return GameObjectType::SwingPortal;
+        if (p->m_isBall) return GameObjectType::BallPortal;
+        if (p->m_isSpider) return GameObjectType::SpiderPortal;
+        if (p->m_isRobot) return GameObjectType::RobotPortal;
+        return GameObjectType::CubePortal;
+    }
+
+    // the corridor's height: the game's own number when it gives a sensible one, else 10 blocks
+    // (8 for ball and spider)
+    float corridorHeight(GJBaseGameLayer* layer, GameObjectType t) {
+        float h = layer ? layer->getGroundHeightForMode(static_cast<int>(t)) : 0.f;
+        if (h > 120.f && h < 600.f) {
+            return h;
+        }
+        return (t == GameObjectType::BallPortal || t == GameObjectType::SpiderPortal) ? 240.f : 300.f;
+    }
+
+    bool portalIsFree(GJBaseGameLayer* layer, GameObject* portal) {
+        bool freeMode = layer && layer->m_gameState.m_isFreeMode;
+        if (auto* e = typeinfo_cast<EffectGameObject*>(portal)) {
+            freeMode = freeMode || e->m_cameraIsFreeMode;
+        }
+        return freeMode;
+    }
+
+    // v3.0 test 53: the game snaps the corridor to the block grid (a wave portal at y 268 made the
+    // corridor 90-390: centre 240), and its floor is never below the ground (90). Test 50 centred it
+    // on the portal itself, 28 units too high.
+    void corridorFor(float portalY, float h, float& lo, float& hi) {
+        float c = std::floor(portalY / 30.f) * 30.f;
+        lo = std::max(90.f, c - h * 0.5f);
+        hi = lo + h;
+    }
+
+    void ghostBoundsFromPortal(GameObject* portal, GameObjectType t) {
+        auto* layer = GameManager::get()->m_playLayer;
+        if (!boundedMode(t) || portalIsFree(layer, portal)) {
+            buf.gBounds = false;
+            return;
+        }
+        corridorFor(portal->getPositionY(), corridorHeight(layer, t), buf.gBoundLo, buf.gBoundHi);
+        buf.gBounds = true;
+    }
+
+    // the corridor you're in for real right now
+    void realBounds(PlayLayer* layer, PlayerObject* p, bool& has, float& lo, float& hi) {
+        has = false;
+        if (!layer || !p) {
+            return;
+        }
+        auto t = portalTypeOf(p);
+        auto* portal = layer->m_gameState.m_lastActivatedPortal1;
+        if (!boundedMode(t) || !portal || portalIsFree(layer, portal)) {
+            return;
+        }
+        // test 53: from the last portal you took (m_portalY read 0 in the game's own state)
+        corridorFor(portal->getPositionY(), corridorHeight(layer, t), lo, hi);
+        has = true;
+    }
+
+    bool ghostTakePortal(PlayerObject* g, GameObject* portal) {
+        GameObjectType type = portal->m_objectType;
         switch (type) {
             case GameObjectType::CubePortal:
             case GameObjectType::ShipPortal:
@@ -519,6 +645,7 @@ namespace {
             (type == GameObjectType::SwingPortal && g->m_isSwing) ||
             (type == GameObjectType::CubePortal && !g->m_isShip && !g->m_isBird && !g->m_isBall && !g->m_isDart && !g->m_isRobot &&
                 !g->m_isSpider && !g->m_isSwing);
+        ghostBoundsFromPortal(portal, type);  // test 50 (a portal of the mode you're in sets it again)
         if (already) {
             return true;
         }
@@ -554,8 +681,16 @@ namespace {
             return object->m_objectID == 749;  // touching the orange end does nothing
         }
         auto* t = static_cast<TeleportPortalObject*>(object);
-        if (t->m_staticForceEnabled || t->m_redirectForceEnabled || t->m_gravityMode != 0 || t->m_redirectDash) {
+        if (t->m_staticForceEnabled || t->m_redirectForceEnabled || t->m_redirectDash || t->m_gravityMode < 0 || t->m_gravityMode > 3) {
             return false;
+        }
+        // v3.0 test 46: a teleport that also sets gravity (1 normal, 2 flipped, 3 toggle); the route
+        // stopped at those as "a portal it can't take" (Tidal Wave 14%)
+        if (t->m_gravityMode != 0) {
+            bool want = t->m_gravityMode == 2 ? true : t->m_gravityMode == 1 ? false : !g->m_isUpsideDown;
+            if (want != g->m_isUpsideDown) {
+                g->flipGravity(want, true);
+            }
         }
         double dx = 0.0, dy = t->m_teleportYOffset;
         if (t->m_orangePortal && t->m_orangePortal != t) {
@@ -679,6 +814,28 @@ namespace {
         buf.timeGhost = mod->getSettingValue<bool>("time-ghost");
         buf.pieComp = mod->getSettingValue<bool>("pie-compensate");
         buf.fingerprint = mod->getSettingValue<bool>("pie-fingerprint");
+        buf.fpsOverlay = mod->getSettingValue<bool>("fps-overlay");
+        buf.fpsGraph = mod->getSettingValue<bool>("fps-graph");
+        buf.fpsSpikeKiller = mod->getSettingValue<bool>("fps-spike-killer");
+        buf.fpsOverload = mod->getSettingValue<bool>("fps-overload");
+        buf.fpsDynamic = mod->getSettingValue<bool>("fps-dynamic");
+        buf.fpsLong = mod->getSettingValue<bool>("fps-long-session");
+        buf.fpsSpikeFactor = static_cast<float>(mod->getSettingValue<double>("fps-spike-factor"));
+        buf.fpsLowRatio = static_cast<float>(mod->getSettingValue<double>("fps-low-ratio"));
+        {
+            auto mode = mod->getSettingValue<std::string>("fps-mode");
+            buf.fpsMode = mode == "Performance" ? 0 : (mode == "Maximum stability" ? 2 : (mode == "Custom" ? 3 : 1));
+        }
+        buf.nerfMargin = static_cast<float>(mod->getSettingValue<double>("nerf-margin"));
+        buf.nerfSpeed = static_cast<float>(mod->getSettingValue<double>("nerf-speed")) / 100.f;
+        buf.nerfGrace = static_cast<float>(mod->getSettingValue<double>("nerf-grace"));
+        buf.nerfHard = mod->getSettingValue<bool>("nerf-hard-sections");
+        {
+            char const* multKeys[8] = { "nerf-mult-cube", "nerf-mult-ship", "nerf-mult-ball", "nerf-mult-ufo", "nerf-mult-wave", "nerf-mult-robot", "nerf-mult-spider", "nerf-mult-swing" };
+            for (int i = 0; i < 8; ++i) {
+                buf.nerfMult[i] = static_cast<float>(mod->getSettingValue<double>(multKeys[i]));
+            }
+        }
         buf.pieOffset = static_cast<float>(mod->getSettingValue<double>("pie-offset"));
         {
             char const* colorKeys[6] = { "hitbox-color-player", "hitbox-color-hazard", "hitbox-color-solid", "hitbox-color-special", "hitbox-color-trigger", "hitbox-color-predicted" };
@@ -798,6 +955,7 @@ namespace {
             int fallback = i == 4 ? wave : i == 1 ? ship : all;
             buf.modeTicks[i] = std::clamp(mod->getSavedValue<int>(fmt::format("mode-ticks-{}", i), fallback), 0, MODE_TICKS_MAX);
         }
+        buf.modeOff = static_cast<uint32_t>(mod->getSavedValue<int>("mode-off", 0)) & 0xffffu;
     }
 
     void saveModeTicks() {
@@ -806,6 +964,7 @@ namespace {
         for (int i = 0; i < 8; ++i) {
             mod->setSavedValue(fmt::format("mode-ticks-{}", i), buf.modeTicks[i]);
         }
+        mod->setSavedValue("mode-off", static_cast<int>(buf.modeOff));
     }
 
     // which MODE_NAMES entry a click is for (a wave in dual counts first, like the wave rules)
@@ -887,6 +1046,14 @@ namespace {
             buf.showPath, buf.perfLog, buf.deathLog, buf.ignoreTouching);
         text += fmt::format("explain inputs {} | low latency {} | cbf sync {}{}\n", buf.explain, buf.lowLatency, buf.cbfSync,
             Loader::get()->isModLoaded("syzzi.click_between_frames") ? " (CBF loaded)" : "");
+        // test 78: CBF's own settings (Physics Bypass changes physics even with CBF disabled)
+        if (auto* cbf = Loader::get()->getLoadedMod("syzzi.click_between_frames")) {
+            auto b = [&](char const* k) -> std::string {
+                return cbf->hasSetting(k) ? (cbf->getSettingValue<bool>(k) ? "on" : "off") : "?";
+            };
+            text += fmt::format("CBF: disabled {} | click on steps {} | physics bypass {} | precision fix {}\n", b("soft-toggle"),
+                b("click-on-steps"), b("physics-bypass"), b("precision-fix"));
+        }
         // v2.39: CBF Extrapolate only changes what's drawn (a hidden player run ahead to "now"),
         // never the real player's physics, so predictions aren't affected by it.
         if (Loader::get()->isModLoaded("square3ang.cbfextrapolate")) {
@@ -955,6 +1122,8 @@ namespace {
         buf.hudBranches.clear();
         buf.hitNode = nullptr;
         buf.futureNode = nullptr;
+        buf.graphNode = nullptr;
+        buf.fxLevel = 0;
         buf.timeIcon = nullptr;
         buf.frozen = false;
         buf.stepFrames = 0;
@@ -1441,6 +1610,8 @@ namespace {
         EffectGameObject* trigger;
         double x;
         TriggerKind kind;
+        bool touch = false;  // v3.0 test 31: a touch trigger (goes off when the player touches it)
+        CCRect rect {};
     };
     std::vector<LevelTrigger> levelTriggers;  // the level's position-activated triggers we predict, by x
     GJBaseGameLayer* levelTriggersLayer = nullptr;
@@ -1465,6 +1636,8 @@ namespace {
         CCArray* group = nullptr;  // toggle: the group it switches off (or on)
         bool on = false;           // toggle: switches it on
         bool armed = false;        // v2.85: fired (fireStep is when it acts, maybe after a spawn delay)
+        bool touch = false;        // v3.0 test 31: goes off when the ghost touches `rect`, not at x
+        CCRect rect {};
         int delay = 0;             // v2.85: steps from the ghost reaching x to it acting (spawn delays)
         bool toggled = false;
     };
@@ -1483,6 +1656,10 @@ namespace {
     std::vector<ScriptedObject> scriptedObjects;
     void forgetTriggerChecks();
     constexpr int SCRIPTED_TRIGGER_LIMIT = 48;
+    // v3.0 test 31: autoplay's route looks up to 10 s ahead: room for many more
+    int scriptedTriggerLimit() {
+        return buf.offscreenFill ? 400 : SCRIPTED_TRIGGER_LIMIT;
+    }
     // v2.85: groups the real game spawns after a delay, and the tick that happens
     struct PendingSpawn {
         int group;
@@ -1490,6 +1667,9 @@ namespace {
     };
     std::vector<PendingSpawn> pendingSpawns;
     constexpr int SCRIPTED_OBJECT_LIMIT = 160;
+    size_t scriptedObjectLimit() {
+        return buf.offscreenFill ? 1500 : SCRIPTED_OBJECT_LIMIT;
+    }
     // v2.84.4: what collectScripted found, reused by every run of the same click (it used to
     // scan the trigger groups again for every run: on ORBIT that slowed each run so much that
     // orb searches stopped after 0-2 timings)
@@ -1591,8 +1771,13 @@ namespace {
         if (rotate) {
             return t->m_rotationTargetID <= 0 && (t->m_rotationDegrees != 0.f || t->m_times360 != 0);
         }
-        return !t->m_useMoveTarget && !t->m_lockToPlayerX && !t->m_lockToPlayerY && !t->m_lockToCameraX && !t->m_lockToCameraY &&
-            (t->m_moveOffset.x != 0.f || t->m_moveOffset.y != 0.f);
+        if (t->m_lockToPlayerX || t->m_lockToPlayerY || t->m_lockToCameraX || t->m_lockToCameraY) {
+            return false;
+        }
+        if (t->m_useMoveTarget) {
+            return t->m_targetModCenterID > 0;  // v3.0 test 31: target mode (to another group's spot)
+        }
+        return t->m_moveOffset.x != 0.f || t->m_moveOffset.y != 0.f;
     }
 
     // v2.85: a spawn trigger the prediction can follow: no random delay, no remapped groups, not ordered
@@ -1627,24 +1812,26 @@ namespace {
                 continue;
             }
             auto* t = static_cast<EffectGameObject*>(object);
-            if (t->m_isSpawnTriggered || t->m_isTouchTriggered) {
+            if (t->m_isSpawnTriggered) {
                 continue;
             }
+            bool touch = t->m_isTouchTriggered;
+            CCRect rect = touch ? t->getObjectRect() : CCRect {};
             if (id == 1049) {
                 if (t->m_targetGroupID > 0) {
-                    levelTriggers.push_back({ t, t->m_positionX, TriggerKind::Toggle });  // v2.85: on too
+                    levelTriggers.push_back({ t, t->m_positionX, TriggerKind::Toggle, touch, rect });  // v2.85: on too
                 }
                 continue;
             }
             if (id == 1268) {
                 if (plainSpawn(t)) {
-                    levelTriggers.push_back({ t, t->m_positionX, TriggerKind::Spawn });
+                    levelTriggers.push_back({ t, t->m_positionX, TriggerKind::Spawn, touch, rect });
                 }
                 continue;
             }
             bool rotate = id == 1346;
             if (plainTrigger(t, rotate)) {
-                levelTriggers.push_back({ t, t->m_positionX, rotate ? TriggerKind::Rotate : TriggerKind::Move });
+                levelTriggers.push_back({ t, t->m_positionX, rotate ? TriggerKind::Rotate : TriggerKind::Move, touch, rect });
             }
         }
         std::sort(levelTriggers.begin(), levelTriggers.end(), [](auto const& a, auto const& b) { return a.x < b.x; });
@@ -1667,6 +1854,31 @@ namespace {
         if (kind == TriggerKind::Move) {
             m.dx = t->m_moveOffset.x;
             m.dy = t->m_moveOffset.y;
+            if (t->m_useMoveTarget) {
+                // v3.0 test 31: target mode: the group goes to where the target group is (its group
+                // parent, or its first object), measured from the center group (or the group itself)
+                auto spot = [&](int group) -> GameObject* {
+                    if (group <= 0) {
+                        return nullptr;
+                    }
+                    if (auto* parent = groupParentOf(layer, group)) {
+                        return parent;
+                    }
+                    auto* objects = layer->getGroup(group);
+                    return objects && objects->count() > 0 ? static_cast<GameObject*>(objects->objectAtIndex(0)) : nullptr;
+                };
+                auto* target = spot(t->m_targetModCenterID);
+                auto* from = spot(t->m_centerGroupID > 0 ? t->m_centerGroupID : t->m_targetGroupID);
+                m.dx = m.dy = 0.0;
+                if (target && from) {
+                    if (t->m_moveTargetMode != MoveTargetType::YOnly) {
+                        m.dx = target->m_positionX - from->m_positionX;
+                    }
+                    if (t->m_moveTargetMode != MoveTargetType::XOnly) {
+                        m.dy = target->m_positionY - from->m_positionY;
+                    }
+                }
+            }
             return;
         }
         m.angle = t->m_rotationDegrees + 360.0 * t->m_times360;
@@ -1948,6 +2160,16 @@ namespace {
         }
         double px = buf.ghost1->getPositionX();
         double py = buf.ghost1->getPositionY();
+        double pyLo = py, pyHi = py;
+        if (buf.simFrom && layer->m_player1) {
+            // v3.0 test 31: a route test from further along: the triggers from YOU on (test 27-30
+            // only took them from the test's start, so ones between you and it never moved anything)
+            double rx = layer->m_player1->getPositionX();
+            double ry = layer->m_player1->getPositionY();
+            px = std::min(px, rx);
+            pyLo = std::min(py, ry);
+            pyHi = std::max(py, ry);
+        }
         double reach = (total + 2) * std::max(static_cast<double>(std::abs(buf.tickDx)), 2.0) + 30.0;
         auto& cache = scriptedCache;
         if (cache.layer == layer && cache.tick == tickCount && reach <= cache.reach && std::abs(px - cache.px) < 3.0) {
@@ -1962,7 +2184,7 @@ namespace {
         // v2.84.4: only objects whose motion can come near the ghost's path (it was every object
         // within ~800 units either side, at any height)
         double pathMinX = px - 90.0, pathMaxX = px + reach + 90.0;
-        double pathMinY = py - 450.0, pathMaxY = py + 450.0;
+        double pathMinY = pyLo - 450.0, pathMaxY = pyHi + 450.0;
         auto nearPath = [&](GameObject* object, ScriptedMove const& m) {
             double x = object->m_positionX, y = object->m_positionY;
             double x0 = x, x1 = x, y0 = y, y1 = y;
@@ -1984,9 +2206,10 @@ namespace {
         };
         // adds trigger t: armed = it fires at step `when` (negative: it fired that long ago),
         // else when the ghost gets to x, `when` steps later (a spawn delay)
-        auto addMove = [&](EffectGameObject* t, double x, TriggerKind kind, bool armed, int when) {
+        auto addMove = [&](EffectGameObject* t, double x, TriggerKind kind, bool armed, int when, bool touch = false,
+                           CCRect touchRect = CCRect {}) {
             int elapsed = armed && when < 0 ? -when : -1;
-            if (static_cast<int>(scriptedMoves.size()) >= SCRIPTED_TRIGGER_LIMIT) {
+            if (static_cast<int>(scriptedMoves.size()) >= scriptedTriggerLimit()) {
                 return;
             }
             auto* group = layer->getGroup(t->m_targetGroupID);
@@ -1996,6 +2219,8 @@ namespace {
             ScriptedMove m;
             m.kind = kind;
             m.x = x;
+            m.touch = touch && !armed;
+            m.rect = touchRect;
             m.armed = armed;
             m.fireStep = armed ? when : -1;
             m.delay = armed ? 0 : when;
@@ -2021,7 +2246,7 @@ namespace {
                 }
                 auto [found, added] = index.try_emplace(object, scriptedObjects.size());
                 if (added) {
-                    if (scriptedObjects.size() >= SCRIPTED_OBJECT_LIMIT) {
+                    if (scriptedObjects.size() >= scriptedObjectLimit()) {
                         index.erase(found);
                         continue;
                     }
@@ -2102,10 +2327,12 @@ namespace {
                 continue;
             }
             if (it->kind == TriggerKind::Spawn) {
-                spawnChain(it->trigger->m_targetGroupID, it->x, false, spawnSteps(it->trigger, tickLength), 0);
+                if (!it->touch) {
+                    spawnChain(it->trigger->m_targetGroupID, it->x, false, spawnSteps(it->trigger, tickLength), 0);
+                }
             }
             else {
-                addMove(it->trigger, it->x, it->kind, false, 0);
+                addMove(it->trigger, it->x, it->kind, false, 0, it->touch, it->rect);
             }
         }
         buf.triggersAhead = static_cast<int>(scriptedMoves.size());
@@ -2142,9 +2369,9 @@ namespace {
 
     // the ghost reached x: triggers there go off (v2.85: after their spawn delay); a toggle
     // switches its group off (or on) for the rest of this prediction
-    void fireScripted(double gx, int tick) {
+    void fireScripted(double gx, CCRect const& ghostRect, int tick) {
         for (auto& m : scriptedMoves) {
-            if (!m.armed && gx >= m.x) {
+            if (!m.armed && (m.touch ? ghostRect.intersectsRect(m.rect) : gx >= m.x)) {
                 m.armed = true;
                 m.fireStep = tick + m.delay;
             }
@@ -2279,6 +2506,7 @@ namespace {
 
     // ---------- v3.6 analysis tools ----------
     void drawFuture(PlayLayer* layer, std::vector<CCPoint> const& path, bool died);  // defined with the vision tools
+    void loadNerfLevel();  // defined with the difficulty engine
     float sectionPercent(PlayLayer* layer, PlayerObject* p);  // defined with the sections below
 
     // None of these send an input or search for a route: they only read what the prediction
@@ -2290,7 +2518,7 @@ namespace {
             return;
         }
         std::string text;
-        for (auto const* part : { &buf.hudAnalyze, &buf.hudFuture, &buf.hudForecast, &buf.hudContact, &buf.hudBranches, &buf.hudNear, &buf.hudTime, &buf.hudLatency, &buf.hudOptimal, &buf.hudSpam, &buf.hudDeath }) {
+        for (auto const* part : { &buf.hudFps, &buf.hudAi, &buf.hudAnalyze, &buf.hudFuture, &buf.hudForecast, &buf.hudContact, &buf.hudBranches, &buf.hudNear, &buf.hudTime, &buf.hudLatency, &buf.hudOptimal, &buf.hudSpam, &buf.hudDeath }) {
             if (!part->empty()) {
                 text += text.empty() ? "" : "\n";
                 text += *part;
@@ -2305,6 +2533,30 @@ namespace {
     double nowSeconds() {
         return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
     }
+
+    // the AI autopilot's state (it plays in practice mode only; see the AI autopilot block)
+    struct AiState {
+        bool active = false;
+        int attempts = 0;
+        float best = 0.f;
+        int completions = 0;
+    };
+    AiState ai;
+    std::unordered_map<int, std::array<int, 4>> aiMem;  // per level slice: {kept ok, kept bad, toggled ok, toggled bad}
+    bool aiStart(PlayLayer* layer);
+    void aiStop(PlayLayer* layer, char const* why);
+    bool aiRunning();
+    void loadAi();
+    void saveAi();
+
+    // the mod's own cost per frame, for the FPS engine's overload protection
+    double modCostMs = 0.0;
+    struct CostTimer {
+        double t0 = nowSeconds();
+        ~CostTimer() {
+            modCostMs += (nowSeconds() - t0) * 1000.0;
+        }
+    };
 
     // Spam meter: clicks per second and how even the gaps between your clicks are
     void spamNote(bool down) {
@@ -2996,7 +3248,7 @@ namespace {
         }
         auto* layer = GameManager::get()->m_playLayer;
         bool practice = layer && layer->m_isPracticeMode;
-        int state = !practice ? 0 : (routeReplaying ? 1 : (analyze.running ? 2 : (spamEngineOn() ? 3 : 0)));
+        int state = !practice ? 0 : (routeReplaying ? 1 : (aiRunning() ? 5 : (analyze.running ? 2 : (spamEngineOn() ? 3 : (nerfOn() ? 4 : 0)))));
         static int shown = -1;
         static CCLabelBMFont* lastTag = nullptr;
         if (lastTag != buf.botTag) {  // a new level made a new tag
@@ -3009,7 +3261,7 @@ namespace {
         shown = state;
         buf.botTag->setVisible(state != 0);
         if (state != 0) {
-            buf.botTag->setString(state == 1 ? "BOT ROUTE REPLAY | PRACTICE ONLY" : (state == 2 ? "AUTO-ANALYZE | PRACTICE ONLY" : "INPUT ENGINE | PRACTICE ONLY"));
+            buf.botTag->setString(state == 5 ? "AI AUTOPILOT | PRACTICE ONLY" : (state == 1 ? "BOT ROUTE REPLAY | PRACTICE ONLY" : (state == 2 ? "AUTO-ANALYZE | PRACTICE ONLY" : (state == 3 ? "INPUT ENGINE | PRACTICE ONLY" : "DIFFICULTY NERF | PRACTICE ONLY"))));
         }
     }
 
@@ -3384,6 +3636,7 @@ namespace {
     void saveMemory() {
         saveSections();
         saveSpam();
+        saveAi();
         if (!memoryDirty || memoryKey.empty()) {
             return;
         }
@@ -3455,6 +3708,8 @@ namespace {
         loadSections();
         loadRoute();
         loadSpam();
+        loadNerfLevel();
+        loadAi();
         if (!memory.empty()) {
             say("memory: {} spots learned on this level", memory.size());
         }
@@ -3657,12 +3912,82 @@ namespace {
         ghost->updateRotation(dt);
     }
 
+    // v3.0 test 27: the level index's objects near a hidden player that GD didn't give it this step
+    void injectOffscreen(PlayLayer* layer, PlayerObject* ghost, float dt) {
+        static gd::vector<GameObject*> extra;
+        extra.clear();
+        auto pos = ghost->getPosition();
+        int b = static_cast<int>(std::floor(pos.x / 64.f));
+        for (int k = b - 3; k <= b + 3; ++k) {
+            auto it = buf.objIndex.find(k);
+            if (it == buf.objIndex.end()) {
+                continue;
+            }
+            for (auto* o : it->second) {
+                if (std::abs(o->m_positionX - pos.x) < 200.f && std::abs(o->m_positionY - pos.y) < 200.f && !buf.seenThisCheck.contains(o)) {
+                    extra.push_back(o);
+                }
+            }
+        }
+        if (buf.gBounds) {
+            // test 50: the corridor's floor and ceiling, under / over the ghost
+            for (int i = 0; i < 2; ++i) {
+                auto*& slab = buf.boundSlabs[i];
+                if (!slab) {
+                    slab = GameObject::createWithKey(1);
+                    if (!slab) {
+                        continue;
+                    }
+                    slab->retain();
+                    slab->setScaleX(40.f);
+                }
+                float y = i == 0 ? buf.gBoundLo - 15.f : buf.gBoundHi + 15.f;
+                slab->setPosition({ pos.x, y });
+                slab->m_positionX = pos.x;
+                slab->m_positionY = y;
+                slab->setObjectRectDirty(true);
+                slab->m_isOrientedBoxDirty = true;
+                extra.push_back(slab);
+            }
+        }
+        if (!extra.empty()) {
+            buf.offscreenAdded += static_cast<long long>(extra.size());
+            layer->collisionCheckObjects(ghost, &extra, static_cast<int>(extra.size()), dt);
+        }
+    }
+
     void checkGhost(PlayLayer* layer, PlayerObject* ghost, float dt) {
         ghost->m_collisionLogTop->removeAllObjects();
         ghost->m_collisionLogBottom->removeAllObjects();
         ghost->m_collisionLogLeft->removeAllObjects();
         ghost->m_collisionLogRight->removeAllObjects();
+        buf.seenThisCheck.clear();
+        buf.inCheck = true;
+        buf.postCollisionSeen = false;
         layer->checkCollisions(ghost, dt, false);
+        buf.inCheck = false;
+        if (buf.simulating && buf.gBounds && !buf.ghostDied && ghost->m_isDart) {
+            // test 53: the wave dies on the corridor's floor / ceiling (your "object 0" deaths)
+            auto r = ghost->getObjectRect();
+            if (r.getMaxY() >= buf.gBoundHi || r.getMinY() <= buf.gBoundLo) {
+                buf.ghostDied = true;
+            }
+        }
+        if (buf.offscreenFill && !buf.postCollisionSeen && !buf.objIndex.empty() && !buf.ghostDied) {
+            // test 33: GD didn't call postCollision in this check: the far objects go in after it
+            auto before = buf.offscreenAdded;
+            injectOffscreen(layer, ghost, dt);
+            buf.offscreenFallback += buf.offscreenAdded - before;
+        }
+        if (buf.simulating && !buf.ghostDied && !buf.autoDangers.empty()) {
+            auto r = ghost->getObjectRect();
+            for (auto const& d : buf.autoDangers) {
+                if (r.intersectsRect(d)) {
+                    buf.ghostDied = true;
+                    break;
+                }
+            }
+        }
     }
 
     bool isFlying(PlayerObject* player) {
@@ -3715,13 +4040,26 @@ namespace {
         // v2.78.1: always known, so mode portals you're still inside are skipped (see
         // collisionCheckObjects)
         buf.haveStartRects = true;
-        buf.realRect1 = p1->getObjectRect();
+        PlayerObject* from1 = buf.simFrom ? buf.simFrom : p1;
+        buf.realRect1 = from1->getObjectRect();
         buf.realRect2 = second ? p2->getObjectRect() : buf.realRect1;
-        copyState(buf.ghost1, p1);
+        copyState(buf.ghost1, from1);
         if (second) {
             copyState(buf.ghost2, p2);
         }
-        buf.held1 = buf.held2 = buf.appliedInput;
+        buf.held1 = buf.held2 = buf.simFrom ? buf.simFromHeld : buf.appliedInput;
+        int off = buf.simFrom ? buf.simOffset : 0;
+        buf.gBounds = false;
+        if (buf.offscreenFill) {
+            if (buf.simFrom) {
+                buf.gBounds = buf.simFromBounds;
+                buf.gBoundLo = buf.simFromLo;
+                buf.gBoundHi = buf.simFromHi;
+            }
+            else {
+                realBounds(layer, p1, buf.gBounds, buf.gBoundLo, buf.gBoundHi);
+            }
+        }
         buf.auto1 = buf.auto2 = false;
         buf.autoAt1 = buf.autoAt2 = -1;
 
@@ -3762,16 +4100,43 @@ namespace {
         bool safe = false;
 
         collectMovers();
-        collectScripted(layer, total);
+        collectScripted(layer, off + total);
+        if (off > 0 && buf.crossPos) {
+            // test 27: starting further along the route: triggers between you and the start went
+            // off when the route passed them
+            double startX = buf.ghost1->getPositionX();
+            auto const& rp = *buf.crossPos;
+            for (auto& m : scriptedMoves) {
+                if (m.armed || m.x > startX + 60.0) {
+                    continue;
+                }
+                int at = -1;
+                for (size_t k = 0; k < rp.size() && static_cast<int>(k) + buf.crossBase < off; ++k) {
+                    bool reached = m.touch ? CCRect(m.rect.origin.x - 15.f, m.rect.origin.y - 15.f, m.rect.size.width + 30.f,
+                                                 m.rect.size.height + 30.f)
+                                                 .containsPoint(rp[k])
+                                           : rp[k].x >= m.x;
+                    if (reached) {
+                        at = buf.crossBase + static_cast<int>(k);
+                        break;
+                    }
+                }
+                if (at < 0) {
+                    continue;  // the route didn't get to it before this test starts: the test sets it off itself
+                }
+                m.armed = true;
+                m.fireStep = std::max(0, at) + m.delay;
+            }
+        }
         for (; tick < total; ++tick) {
             second = buf.simSecond;  // v2.84: after a solo portal only P1 goes on (v2.85: after a dual portal both)
             if (!movers.empty()) {
-                placeMovers(tick + 1);  // where they'll be after this step
+                placeMovers(off + tick + 1);  // where they'll be after this step
             }
             if (!scriptedMoves.empty()) {
                 // v2.81: a move / rotate / toggle trigger the ghost has reached goes off
-                fireScripted(buf.ghost1->getPositionX(), tick);
-                placeScripted(tick + 1);
+                fireScripted(buf.ghost1->getPositionX(), buf.ghost1->getObjectRect(), off + tick);
+                placeScripted(off + tick + 1);
             }
             buf.simTick = tick;
             // v2.26: orb auto-clicks that wait a few ticks into the orb fire here, if the
@@ -3817,6 +4182,17 @@ namespace {
                     pressGhost(buf.ghost2, !down);
                 }
             }
+            if (buf.plan) {
+                for (int t : *buf.plan) {
+                    if (t == tick) {
+                        bool now = !buf.held1;
+                        pressGhost(buf.ghost1, now);
+                        if (second) {
+                            pressGhost(buf.ghost2, now);
+                        }
+                    }
+                }
+            }
 
             // v2.18: with CBF the click lands partway through a tick, so the ghost's first
             // step is only the rest of that tick; after it, ghost and game are on the same
@@ -3842,8 +4218,15 @@ namespace {
                 died = true;
                 break;
             }
+            if (buf.yBand && std::abs(buf.ghost1->getPositionY() - buf.yBandCenter) > buf.yBandHalf) {
+                died = true;  // test 45: out of the route's band (not a real death)
+                break;
+            }
             if (buf.recordPath) {
                 buf.recordPath->push_back(buf.ghost1->getPosition());
+            }
+            if (buf.cpSink && buf.cpEvery > 0 && (tick + 1) % buf.cpEvery == 0) {
+                buf.cpSink(tick + 1, buf.ghost1, buf.held1);  // test 27: a route state to go on from
             }
             if (buf.ghostHitPortal) {
                 safe = tick >= delay;
@@ -3859,7 +4242,7 @@ namespace {
             }
             // v2.79: after a portal changed the ghost's mode, only surviving the look-ahead counts
             // (the cube's "landed = safe" rule doesn't fit the new mode)
-            if ((flying && !ufoRun) || buf.ghostSwitched) {
+            if ((flying && !ufoRun) || buf.ghostSwitched || buf.fullHorizon) {
                 continue;
             }
 
@@ -4112,7 +4495,7 @@ namespace {
 
     // faint snapshots along the path and one icon that replays the run, slowly, on a loop
     void addGhostIcons(std::vector<CCPoint> const& path, bool buffered, bool died) {
-        if (!buf.ghostIcon || !buf.ghostIcons || path.size() < 4) {
+        if (!buf.ghostIcon || !buf.ghostIcons || buf.fxLevel >= 1 || path.size() < 4) {
             return;
         }
         bool flies = ghostIconFlies();
@@ -4237,6 +4620,7 @@ namespace {
             return;
         }
         clearPathNode();
+        CostTimer cost;
         buf.reviewShown = false;  // a new decision replaces the review
         buf.pathHoldUntil = tickCount + st(45);
         bool nowDied = false;
@@ -4267,7 +4651,7 @@ namespace {
                 buf.review.maxX = std::max(buf.review.maxX, pt.x);
             }
             buf.review.cfEarlier = buf.review.cfLater = -1;
-            if (buf.counterfactual && buf.reviewOn && !buf.perfMode && chosen > 0) {
+            if (buf.counterfactual && buf.reviewOn && !buf.perfMode && buf.fxLevel == 0 && chosen > 0) {
                 // counterfactual: the same click one frame earlier / later
                 int oneFrame = std::max(1, static_cast<int>(std::lround(1.f / TICK)));
                 int earlier = chosen - oneFrame;
@@ -4283,7 +4667,7 @@ namespace {
                 recordRun(layer, p1, p2, dual, chosen + oneFrame, down, horizon, releaseAfter, &laterDied);
                 buf.review.cfLater = laterDied ? 1 : 0;
             }
-            if (buf.branching && !buf.perfMode) {
+            if (buf.branching && !buf.perfMode && buf.fxLevel == 0) {
                 // predictive branching: the same decision with several delays side by side
                 std::string result;
                 for (int f : { 0, 1, 2, 3, 4, 6, 8 }) {
@@ -5006,7 +5390,8 @@ namespace {
         if ((!buf.showPath && !buf.forecast && !buf.hitboxPredict && buf.futureSeconds == 0 && buf.pieMode != 5) || buf.perfMode || !buf.ghost1 || buf.simulating || p1->m_isDead || layer->m_isPlatformer) {
             return;
         }
-        bool draw = buf.showPath && buf.pathNode;
+        bool draw = buf.showPath && buf.pathNode && buf.fxLevel < 2;
+        CostTimer cost;
         if (buf.reviewShown && draw) {
             if (p1->getPosition().x > buf.review.maxX + 30.f) {
                 buf.reviewShown = false;
@@ -5063,7 +5448,7 @@ namespace {
         buf.forecastTicks = idleDied ? static_cast<int>(idle.size()) : -1;
         buf.predValid = idleDied && !idle.empty();
         buf.predPoint = buf.predValid ? idle.back() : CCPoint { 0.f, 0.f };
-        if (buf.futureSeconds > 0 && tickCount % st(120) == 0) {
+        if (buf.futureSeconds > 0 && buf.fxLevel == 0 && tickCount % st(120) == 0) {
             int futureHorizon = std::min(static_cast<int>(buf.futureSeconds * (60.0 / (buf.tickLength > 0.001f ? buf.tickLength : TICK))), 3000);
             bool futureDied = false;
             buf.skipPress = true;
@@ -5703,6 +6088,15 @@ namespace {
         if (buf.perMode) {
             maxDelay = st(buf.modeTicks[modeIndex(p1, p2)]);  // v2.88: your frames for this mode (over low latency's cap)
         }
+        // v3.0: a mode (normal or mini size) switched off on the Modes page gets raw clicks
+        {
+            int mi = modeIndex(p1, p2);
+            PlayerObject* who = (mi == 4 && p2 && p2->m_isDart && !p1->m_isDart) ? p2 : p1;
+            bool mini = who->m_vehicleSize < 0.95f;
+            if (buf.modeOff & (1u << (mi * 2 + (mini ? 1 : 0)))) {
+                maxDelay = 0;
+            }
+        }
         if (resuming) {
             maxDelay -= resumeEntry.elapsed;  // the time since your click counts
             if (maxDelay < searchFrom) {
@@ -6103,6 +6497,4158 @@ namespace {
     // tick whether holding crashes within the next `autoWindow` ticks. If it does and
     // letting go now clearly survives longer, let go for you. Your own release later is
     // swallowed, and your next press works as normal.
+    // v3.0 autoplay, for level showcases: the hidden ghost looks ahead every physics tick and
+    // the mod presses / lets go only when keeping the button as it is would crash sooner than
+    // switching. The level is put in test mode, so the game saves nothing it plays; your own
+    // clicks are ignored while it runs, and AUTOPLAY stays on screen.
+// test 66: online players. Every 90 s (setting "Show Online Players") the game sends the CBF server
+// an anonymous random id, its platform and the mod's version, nothing else; the server answers with
+// how many are online and offline, shown in the window's footer. The server's code is in web/.
+namespace online {
+    // the worker's address once it's deployed (web/README.md); empty = nothing is sent
+    constexpr char const* URL = "";  // Aliou's Buffer sends nothing to any server (the upstream mod's was removed)
+    std::atomic<int> nowOnline { -1 };
+    std::atomic<int> nowOffline { -1 };
+    bool started = false;
+
+    std::string id() {
+        auto saved = Mod::get()->getSavedValue<std::string>("online-id", "");
+        if (saved.size() == 32) {
+            return saved;
+        }
+        std::random_device rd;
+        std::string made;
+        for (int i = 0; i < 32; ++i) {
+            made += "0123456789abcdef"[rd() % 16];
+        }
+        Mod::get()->setSavedValue("online-id", made);
+        return made;
+    }
+
+    char const* platform() {
+#if defined(GEODE_IS_WINDOWS)
+        return "Windows";
+#elif defined(GEODE_IS_ANDROID)
+        return "Android";
+#elif defined(GEODE_IS_IOS)
+        return "iOS";
+#elif defined(GEODE_IS_MACOS)
+        return "macOS";
+#else
+        return "Other";
+#endif
+    }
+
+    void start() {
+        if (started || std::string_view(URL).empty()) {
+            return;
+        }
+        started = true;
+        std::string body = fmt::format(R"({{"id":"{}","platform":"{}","version":"{}"}})", id(), platform(),
+            Mod::get()->getVersion().toVString());
+        std::thread([body] {
+            while (true) {
+                if (Mod::get()->getSettingValue<bool>("online-players")) {
+                    auto res = web::WebRequest()
+                        .timeout(std::chrono::seconds(10))
+                        .userAgent("AliousBuffer")
+                        .header("Content-Type", "application/json")
+                        .bodyString(body)
+                        .postSync(std::string(URL) + "/api/ping");
+                    if (res.ok()) {
+                        if (auto json = res.json(); json.isOk()) {
+                            nowOnline = static_cast<int>(json.unwrap()["online"].asInt().unwrapOr(-1));
+                            nowOffline = static_cast<int>(json.unwrap()["offline"].asInt().unwrapOr(-1));
+                        }
+                    }
+                }
+                else {
+                    nowOnline = nowOffline = -1;
+                }
+                std::this_thread::sleep_for(std::chrono::seconds(90));
+            }
+        }).detach();
+    }
+
+    std::string text() {
+        int on = nowOnline, off = nowOffline;
+        if (on < 0) {
+            return "";
+        }
+        return fmt::format("{} online  ·  {} offline", on, off);
+    }
+}
+
+    // ===== test 91: your account (a game linked to your Discord on the CBF site) =====
+    namespace account {
+        struct Stats {
+            bool loaded = false;
+            bool linked = false;
+            std::string name;
+            int games = 0, levelsBeaten = 0, finishes = 0, runsShared = 0, othersUsed = 0;
+            std::vector<std::string> recent;
+        };
+        Stats stats;
+        bool dirty = false;      // the window shows it again
+        bool linking = false;
+        std::string code;        // the code the browser shows while linking
+        std::string status;
+
+        // test 92: autoplay and updates need this game linked to Discord on the CBF site (checked with
+        // the site at start; the last answer is kept for when it can't be reached)
+        bool isLinked() {
+            if (stats.loaded) {
+                return stats.linked;
+            }
+            return !Mod::get()->getSavedValue<std::string>("account-name", "").empty();
+        }
+
+        void refresh() {
+            if (std::string_view(online::URL).empty()) {
+                return;
+            }
+            std::string url = fmt::format("{}/api/account?id={}", online::URL, online::id());
+            std::thread([url] {
+                auto res = web::WebRequest().timeout(std::chrono::seconds(15)).userAgent("AliousBuffer").getSync(url);
+                Stats st;
+                if (res.ok()) {
+                    if (auto j = res.json(); j.isOk()) {
+                        auto v = j.unwrap();
+                        st.loaded = true;
+                        st.linked = v["linked"].asBool().unwrapOr(false);
+                        st.name = v["name"].asString().unwrapOr("");
+                        st.games = static_cast<int>(v["games"].asInt().unwrapOr(1));
+                        st.levelsBeaten = static_cast<int>(v["levelsBeaten"].asInt().unwrapOr(0));
+                        st.finishes = static_cast<int>(v["finishes"].asInt().unwrapOr(0));
+                        st.runsShared = static_cast<int>(v["runsShared"].asInt().unwrapOr(0));
+                        st.othersUsed = static_cast<int>(v["othersFinishedWithYours"].asInt().unwrapOr(0));
+                        if (v["recent"].isArray()) {
+                            for (auto const& r : v["recent"]) {
+                                st.recent.push_back(r["name"].asString().unwrapOr("?"));
+                            }
+                        }
+                    }
+                }
+                queueInMainThread([st] {
+                    if (st.loaded) {
+                        stats = st;
+                        Mod::get()->setSavedValue("account-name", st.linked ? st.name : std::string());
+                    }
+                    else {
+                        status = "Couldn't reach the CBF site.";
+                    }
+                    dirty = true;
+                });
+            }).detach();
+        }
+
+        // the game gets a code, the browser opens the site's link page, and the game asks every 3 s
+        // whether you pressed Link there (for 10 minutes)
+        void startLink() {
+            if (linking || std::string_view(online::URL).empty()) {
+                return;
+            }
+            linking = true;
+            status = "Opening the CBF site...";
+            dirty = true;
+            std::string body = fmt::format(R"({{"id":"{}"}})", online::id());
+            std::thread([body] {
+                auto res = web::WebRequest().timeout(std::chrono::seconds(15)).userAgent("AliousBuffer").header("Content-Type", "application/json")
+                    .bodyString(body).postSync(std::string(online::URL) + "/api/link/start");
+                std::string c, url;
+                if (res.ok()) {
+                    if (auto j = res.json(); j.isOk()) {
+                        c = j.unwrap()["code"].asString().unwrapOr("");
+                        url = j.unwrap()["url"].asString().unwrapOr("");
+                    }
+                }
+                if (c.empty()) {
+                    queueInMainThread([] {
+                        linking = false;
+                        status = "Couldn't reach the CBF site.";
+                        dirty = true;
+                    });
+                    return;
+                }
+                queueInMainThread([c, url] {
+                    code = c;
+                    status = fmt::format("Log in with Discord in the browser and press Link (code {}).", c);
+                    dirty = true;
+                    web::openLinkInBrowser(url);
+                });
+                for (int i = 0; i < 200; ++i) {
+                    std::this_thread::sleep_for(std::chrono::seconds(3));
+                    auto p = web::WebRequest().timeout(std::chrono::seconds(10)).userAgent("AliousBuffer")
+                        .getSync(fmt::format("{}/api/link/poll?code={}", online::URL, c));
+                    if (!p.ok()) {
+                        continue;
+                    }
+                    auto j = p.json();
+                    if (j.isErr()) {
+                        continue;
+                    }
+                    auto v = j.unwrap();
+                    if (v["linked"].asBool().unwrapOr(false)) {
+                        std::string name = v["name"].asString().unwrapOr("");
+                        queueInMainThread([name] {
+                            linking = false;
+                            code.clear();
+                            status = "Linked to " + name + ".";
+                            say("account: this game is linked to {} on the CBF site", name);
+                            refresh();
+                        });
+                        return;
+                    }
+                    if (v["expired"].asBool().unwrapOr(false)) {
+                        break;
+                    }
+                }
+                queueInMainThread([] {
+                    linking = false;
+                    code.clear();
+                    status = "The code ran out. Press Link with Discord again.";
+                    dirty = true;
+                });
+            }).detach();
+        }
+    }
+
+    // test 91: the CBF icon, sized to a game button
+    static CCSprite* cbfIcon(float height) {
+    // the Aliou's Buffer logo, scaled to this height
+    auto* sprite = CCSprite::create("alious-buffer-icon.png"_spr);
+    if (!sprite) {
+        return nullptr;
+    }
+    sprite->setScale(height / sprite->getContentSize().height);
+    return sprite;
+}
+
+    void manualUpdate();
+    std::string updateButtonText();
+    bool updateAvailable();
+    std::string levelFingerprint(GJGameLevel* level);
+    void brainFetch(int levelId, std::string print);
+
+    int macroOffsetSetting = 0;  // test 93: read once an attempt
+    bool macroFixesSetting = true;
+
+    // test 89: a bot's position record for one frame (player 1, and player 2 if it has one)
+    struct MacroFix {
+        int frame = 0;
+        float x = 0.f, y = 0.f, r = 0.f;
+        bool p2 = false;
+        float x2 = 0.f, y2 = 0.f, r2 = 0.f;
+    };
+
+    struct Autoplay {
+        bool active = false;
+        PlayLayer* layer = nullptr;
+        int inputs = 0;
+        int userUntil = -1;   // Take Over: your last click; the bot waits until this tick
+        bool takeOver = false;
+        std::vector<int> plan;  // absolute ticks at which to flip the button
+        int verifyAt = -1;      // next tick to check the plan still works
+        int sims = 0;           // planner budget used for one search
+        // v3.0 test 7: a time budget per frame (the "budget" setting), so planning never drops
+        // the frame rate; what doesn't fit goes on next frame while the current plan is followed
+        unsigned frame = 0;
+        double frameMs = 0.0;
+        std::chrono::steady_clock::time_point searchStart {};
+        double searchCap = 0.0;
+        // v3.0 test 8: it learns the level (normal mode). Each attempt's inputs are kept; after a
+        // death the ones up to a bit before it are replayed exactly next attempt, and the search
+        // only runs past them. Dying at the same spot again and again forgets further back.
+        int attemptTick = 0;
+        // v3.0 test 10: inputs are kept as states (tick, pressed) and every attempt starts let go,
+        // so a replay is the same each time (flips replayed from a held start came out inverted)
+        std::vector<std::pair<int, bool>> attemptFlips;
+        std::vector<std::pair<int, bool>> known;
+        int planSafeUntil = -1;  // attempt tick until which the current plan was expected to survive
+        int knownUntil = 0;
+        size_t replayIdx = 0;
+        bool userTouched = false;
+        int lastDeath = -1;
+        int sameDeaths = 0;
+        bool diedThisAttempt = false;  // noclip (Mega Hack) calls "death" every tick: count one
+        int reports = 0;               // v3.0 test 15: search reports logged this attempt
+        // v3.0 test 17: flips (attempt ticks) that led to a crash, never tried there again (kept
+        // across attempts), and searches in a row that couldn't make the plan last longer
+        std::set<int> banned;
+        int stuck = 0;
+        std::string killer;  // v3.0 test 18: what kills the ghost in the current plan
+        // v3.0 test 20: plans still to try (absolute flip ticks, longest-lasting parent first),
+        // kept from frame to frame so the search goes on where it stopped instead of trying the
+        // same first few plans every frame
+        struct QItem {
+            int score;
+            std::vector<int> plan;
+            bool operator<(QItem const& o) const {
+                return score != o.score ? score < o.score : plan.size() > o.plan.size();
+            }
+        };
+        std::vector<QItem> queue;
+        std::set<std::vector<int>> seen;
+        int queueBase = -1;  // tick the queue was built at (cleared when a flip happens)
+        // v3.0 test 24: the trail. Where you were every 4 ticks of this attempt, and of the part
+        // it knows; drawn in the level, saved with the inputs so it's known from the first attempt
+        std::vector<CCPoint> attemptTrail;
+        std::vector<CCPoint> knownTrail;
+        bool knowsWholeLevel = false;
+        std::string fromMacro;  // test 67: the macro file autoplay replays (empty = its own memory)
+        std::vector<std::pair<int, bool>> macro;  // test 70: its inputs, by step
+        int macroUntil = 0;  // played up to here (less after it keeps dying at one spot)
+        int macroEnd = 0;
+        size_t macroIdx = 0;
+        bool macroArmed = false;  // (test 70; test 71: not used)
+        std::vector<float> macroX;  // test 71: where each input is (from the macro's position records), for start positions
+        int attemptNo = 0;
+        int macroSyncedFor = -1;
+        bool macroByX = false;
+        bool macroLogged = false;
+        std::vector<int> macroDeaths;
+        std::vector<std::pair<int, int>> macroGaps;  // test 75: stretches autoplay plays itself, the macro the rest
+        bool macroInGap = false;
+        // test 90: the global brain: this attempt's button changes by the game's step (to share a finished
+        // run), the level's fingerprint, and whether the macro is a shared run
+        std::vector<std::pair<int, bool>> runFlips;
+        std::string levelPrint;
+        bool macroIsBrain = false;
+        std::vector<MacroFix> macroFixes;  // test 89: frames converted to steps
+        int macroFixCount = 0;
+        float macroFixMax = 0.f;
+        int macroStepNow = 0;  // test 82: the macro's step as the game's step started (processCommands)
+        // test 79: which step the macro's frame 0 is (bots differ by a step): tried in turn, the best kept
+        int macroTry = 0;       // index into MACRO_OFFSETS while trying
+        bool macroTuned = false;
+        int macroAutoOffset = 0;
+        std::array<int, 5> macroReach { -1, -1, -1, -1, -1 };  // (test 79; test 84: macroTrialReach)
+        // test 84: 2-player levels: each player's clicks on their own (macro = player 1's, macroP2 = player 2's)
+        bool macroTwoPlayer = false;
+        bool macroSwap = false;  // the file's "player 1" / "player 2" the other way round (iCreate)
+        std::vector<std::pair<int, bool>> macroA, macroB, macroP2;
+        size_t macroIdx2 = 0;
+        bool held2 = false;
+        std::vector<std::pair<int, bool>> macroTrials;  // (shift, swapped) tried in turn
+        std::vector<int> macroTrialReach;
+        std::vector<int> deathTicks;  // where this session's attempts ended (learning backs off at repeats)
+        // v3.0 test 51: the attempt that got furthest; the next one replays it to just before its end
+        int bestReached = -1;
+        std::vector<std::pair<int, bool>> bestFlips;
+        std::vector<CCPoint> bestTrail;
+        float startX = -2.f;  // the start position the learning is for
+        std::string saveKey;
+        size_t levelHash = 0;
+        CCDrawNode* trailNode = nullptr;
+        // v3.0 test 25: making the path. On start the level is played hidden, many times faster
+        // than normal and with time to think at every jump, until it reaches the end; then the
+        // whole trail is known and the run you see follows it from the start.
+        bool generating = false;
+        bool needRestart = false;
+        int genAttempts = 0;
+        float genBest = 0.f;
+        std::chrono::steady_clock::time_point genStart {};
+        std::chrono::steady_clock::time_point genEnded {};
+        CCLayerColor* genCover = nullptr;
+        CCLabelBMFont* genText = nullptr;
+        CCLabelBMFont* tag = nullptr;
+    };
+    Autoplay autoplay;
+
+    // v3.0 test 24: what autoplay learned on a level is saved, so it plays the known part right
+    // from the first attempt next time. A level that changed (new version) starts fresh.
+    int trailEvery() {
+        return st(4);
+    }
+
+    std::filesystem::path autoplayFile() {
+        return Mod::get()->getSaveDir() / "autoplay" / (autoplay.saveKey + ".txt");
+    }
+
+    void autoplayKey(PlayLayer* layer) {
+        auto* level = layer->m_level;
+        autoplay.saveKey.clear();
+        autoplay.levelHash = 0;
+        if (!level) {
+            return;
+        }
+        int id = level->m_levelID.value();
+        if (id > 0) {
+            autoplay.saveKey = fmt::format("level_{}", id);
+        }
+        else {
+            std::string name = level->m_levelName;
+            for (auto& ch : name) {
+                if (!std::isalnum(static_cast<unsigned char>(ch))) {
+                    ch = '_';
+                }
+            }
+            autoplay.saveKey = "local_" + name;
+        }
+        // v3.0 test 26: a start position is a different run: its own save
+        if (layer->m_startPosObject) {
+            autoplay.saveKey += fmt::format("_start{}", static_cast<int>(layer->m_startPosObject->getPositionX()));
+        }
+        autoplay.levelHash = std::hash<std::string> {}(std::string(level->m_levelString)) ^ static_cast<size_t>(level->m_levelVersion);
+    }
+
+    void saveAutoplay() {
+        if (autoplay.saveKey.empty() || (autoplay.knownUntil <= 0 && buf.autoDangers.empty())) {
+            return;
+        }
+        std::error_code ec;
+        std::filesystem::create_directories(autoplayFile().parent_path(), ec);
+        std::ofstream out(autoplayFile(), std::ios::trunc);
+        out << "cbf-autoplay 1 " << autoplay.levelHash << ' ' << st(240) << '\n';
+        out << autoplay.knownUntil << ' ' << (autoplay.knowsWholeLevel ? 1 : 0) << '\n';
+        for (auto const& [t, down] : autoplay.known) {
+            out << "f " << t << ' ' << (down ? 1 : 0) << '\n';
+        }
+        for (auto const& pt : autoplay.knownTrail) {
+            out << "p " << pt.x << ' ' << pt.y << '\n';
+        }
+        for (auto const& d : buf.autoDangers) {
+            out << "d " << d.origin.x << ' ' << d.origin.y << ' ' << d.size.width << ' ' << d.size.height << '\n';
+        }
+    }
+
+    void drawTrail() {
+        auto* d = autoplay.trailNode;
+        if (!d) {
+            return;
+        }
+        d->clear();
+        auto const& pts = autoplay.knownTrail;
+        ccColor4F line { 0.35f, 1.f, 0.65f, 1.f };
+        for (size_t i = 1; i < pts.size(); ++i) {
+            // a teleport portal jumps far in one step: no line across it
+            if (std::abs(pts[i].x - pts[i - 1].x) < 150.f && std::abs(pts[i].y - pts[i - 1].y) < 150.f) {
+                d->drawSegment(pts[i - 1], pts[i], 1.2f, line);
+            }
+        }
+        // the presses on the trail, as dots
+        int every = std::max(1, trailEvery());
+        for (auto const& [t, down] : autoplay.known) {
+            size_t i = static_cast<size_t>(t / every);
+            if (down && i < pts.size()) {
+                d->drawDot(pts[i], 3.f, { 1.f, 0.85f, 0.3f, 1.f });
+            }
+        }
+    }
+
+    // ===== test 67: macros =====
+    // A GD bot macro (GDR, the format most 2.2 bots save: .gdr is MessagePack, .gdr.json / .json is
+    // JSON) in the mod's "macros" folder, made for this level, becomes what autoplay replays: it plays
+    // it input by input from the start, and where it dies it learns from there like after any death
+    // (the replay is kept up to just before, the route plans the rest). Player 1's jump only; not from
+    // a start position (the macro's ticks count from the level's start).
+
+    // a small MessagePack reader (only what GDR files use) into matjson
+    struct MsgPack {
+        std::vector<uint8_t> const& d;
+        size_t p = 0;
+        bool bad = false;
+
+        uint64_t be(int n) {
+            if (p + n > d.size()) {
+                bad = true;
+                return 0;
+            }
+            uint64_t v = 0;
+            for (int i = 0; i < n; ++i) {
+                v = (v << 8) | d[p++];
+            }
+            return v;
+        }
+
+        std::string str(size_t n) {
+            if (p + n > d.size()) {
+                bad = true;
+                return "";
+            }
+            std::string s(reinterpret_cast<char const*>(d.data() + p), n);
+            p += n;
+            return s;
+        }
+
+        matjson::Value arr(size_t n, int depth) {
+            auto a = matjson::Value::array();
+            for (size_t i = 0; i < n && !bad; ++i) {
+                a.push(read(depth + 1));
+            }
+            return a;
+        }
+
+        matjson::Value map(size_t n, int depth) {
+            auto o = matjson::Value::object();
+            for (size_t i = 0; i < n && !bad; ++i) {
+                auto k = read(depth + 1);
+                auto v = read(depth + 1);
+                o[k.isString() ? k.asString().unwrapOr("") : k.dump()] = v;
+            }
+            return o;
+        }
+
+        matjson::Value read(int depth = 0) {
+            if (bad || depth > 64 || p >= d.size()) {
+                bad = true;
+                return nullptr;
+            }
+            uint8_t t = d[p++];
+            if (t <= 0x7f) return static_cast<int64_t>(t);
+            if (t >= 0xe0) return static_cast<int64_t>(static_cast<int8_t>(t));
+            if ((t & 0xf0) == 0x80) return map(t & 0x0f, depth);
+            if ((t & 0xf0) == 0x90) return arr(t & 0x0f, depth);
+            if ((t & 0xe0) == 0xa0) return str(t & 0x1f);
+            switch (t) {
+                case 0xc0: return nullptr;
+                case 0xc2: return false;
+                case 0xc3: return true;
+                case 0xc4: p += be(1); return nullptr;
+                case 0xc5: p += be(2); return nullptr;
+                case 0xc6: p += be(4); return nullptr;
+                case 0xca: { uint32_t u = static_cast<uint32_t>(be(4)); float f; std::memcpy(&f, &u, 4); return static_cast<double>(f); }
+                case 0xcb: { uint64_t u = be(8); double f; std::memcpy(&f, &u, 8); return f; }
+                case 0xcc: return static_cast<int64_t>(be(1));
+                case 0xcd: return static_cast<int64_t>(be(2));
+                case 0xce: return static_cast<int64_t>(be(4));
+                case 0xcf: return static_cast<int64_t>(be(8));
+                case 0xd0: return static_cast<int64_t>(static_cast<int8_t>(be(1)));
+                case 0xd1: return static_cast<int64_t>(static_cast<int16_t>(be(2)));
+                case 0xd2: return static_cast<int64_t>(static_cast<int32_t>(be(4)));
+                case 0xd3: return static_cast<int64_t>(be(8));
+                case 0xd9: return str(be(1));
+                case 0xda: return str(be(2));
+                case 0xdb: return str(be(4));
+                case 0xdc: return arr(be(2), depth);
+                case 0xdd: return arr(be(4), depth);
+                case 0xde: return map(be(2), depth);
+                case 0xdf: return map(be(4), depth);
+                case 0xd4: p += 2; return nullptr;
+                case 0xd5: p += 3; return nullptr;
+                case 0xd6: p += 5; return nullptr;
+                case 0xd7: p += 9; return nullptr;
+                case 0xd8: p += 17; return nullptr;
+                case 0xc7: { auto n = be(1); p += 1 + n; return nullptr; }
+                case 0xc8: { auto n = be(2); p += 1 + n; return nullptr; }
+                case 0xc9: { auto n = be(4); p += 1 + n; return nullptr; }
+                default: bad = true; return nullptr;
+            }
+        }
+    };
+
+    std::filesystem::path macroDir() {
+        return Mod::get()->getConfigDir() / "macros";
+    }
+
+    struct Macro {
+        std::string file, author, bot;
+        std::vector<MacroFix> fixFull;  // test 89
+        double fps = 240.0;
+        int levelId = 0;
+        std::vector<std::pair<int, bool>> inputs;  // (macro frame, down) for player 1's jump
+        std::vector<std::pair<int, bool>> inputs2;  // test 70: the same, marked as player 2's
+        std::vector<std::pair<int, float>> fixes;  // test 71: (frame, player 1's x) where the bot recorded it
+        int lastFrame = 0;
+        double gameVersion = 0.0;  // test 77
+        bool ldm = false;  // test 86
+    };
+
+    std::optional<Macro> parseMacro(std::vector<uint8_t> const& data, std::string const& fileName, std::string& why);
+    std::optional<Macro> readMacro(std::filesystem::path const& path, std::string& why) {
+        std::ifstream f(path, std::ios::binary);
+        std::vector<uint8_t> data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        return parseMacro(data, path.filename().string(), why);
+    }
+
+    std::optional<Macro> parseMacro(std::vector<uint8_t> const& data, std::string const& fileName, std::string& why) {
+        if (data.empty()) {
+            why = "empty file";
+            return std::nullopt;
+        }
+        matjson::Value j;
+        if (data[0] == '{') {
+            auto parsed = matjson::parse(std::string_view(reinterpret_cast<char const*>(data.data()), data.size()));
+            if (parsed.isErr()) {
+                why = "not valid JSON";
+                return std::nullopt;
+            }
+            j = parsed.unwrap();
+        }
+        else if (data.size() > 3 && data[0] == 'G' && data[1] == 'D' && data[2] == 'R') {
+            why = "a GDR2 file (not supported yet: save it as GDR / .gdr.json)";
+            return std::nullopt;
+        }
+        else {
+            MsgPack mp { data };
+            j = mp.read();
+            if (mp.bad || !j.isObject()) {
+                why = "not a GDR macro";
+                return std::nullopt;
+            }
+        }
+        Macro m;
+        m.file = fileName;
+        m.author = j["author"].asString().unwrapOr("");
+        // test 69: the GDR files people upload say "bot" / "level" (older writers: "botInfo" / "levelInfo")
+        auto sub = [&](char const* a, char const* b) -> matjson::Value {
+            if (j.contains(a) && j[a].isObject()) {
+                return j[a];
+            }
+            if (j.contains(b) && j[b].isObject()) {
+                return j[b];
+            }
+            return matjson::Value::object();
+        };
+        auto botInfo = sub("bot", "botInfo");
+        auto levelInfo = sub("level", "levelInfo");
+        m.bot = botInfo.contains("name") ? botInfo["name"].asString().unwrapOr("") : "";
+        m.fps = j["framerate"].asDouble().unwrapOr(240.0);
+        m.gameVersion = j.contains("gameVersion") ? j["gameVersion"].asDouble().unwrapOr(0.0) : 0.0;
+        m.ldm = j.contains("ldm") && j["ldm"].asBool().unwrapOr(false);
+        if (!(m.fps >= 30.0 && m.fps <= 100000.0)) {
+            m.fps = 240.0;
+        }
+        m.levelId = levelInfo.contains("id") ? static_cast<int>(levelInfo["id"].asInt().unwrapOr(0)) : 0;
+        if (j["platformer"].asBool().unwrapOr(false)) {
+            why = "a platformer macro";
+            return std::nullopt;
+        }
+        if (!j["inputs"].isArray()) {
+            why = "no inputs in it";
+            return std::nullopt;
+        }
+        for (auto const& in : j["inputs"]) {
+            int btn = static_cast<int>(in["btn"].asInt().unwrapOr(1));
+            bool p2 = in["2p"].asBool().unwrapOr(false);
+            if (btn != 1) {
+                continue;  // left / right (platformer)
+            }
+            int frame = static_cast<int>(in["frame"].asInt().unwrapOr(-1));
+            if (frame < 0) {
+                continue;
+            }
+            // test 70: iCreate saves most of player 1's clicks as player 2's (Zodiac: 1078 of 1209), and
+            // outside 2-player levels both are your clicks: both are kept, joined when it's played
+            (p2 ? m.inputs2 : m.inputs).push_back({ frame, in["down"].asBool().unwrapOr(false) });
+            m.lastFrame = std::max(m.lastFrame, frame);
+        }
+        std::stable_sort(m.inputs2.begin(), m.inputs2.end(), [](auto const& a, auto const& b) { return a.first < b.first; });
+        if (j.contains("frameFixes") && j["frameFixes"].isArray()) {
+            for (auto const& f : j["frameFixes"]) {
+                if (f.contains("p1") && f["p1"].isObject() && f["p1"].contains("x")) {
+                    m.fixes.push_back({ static_cast<int>(f["frame"].asInt().unwrapOr(-1)), static_cast<float>(f["p1"]["x"].asDouble().unwrapOr(0.0)) });
+                    MacroFix fx;
+                    fx.frame = static_cast<int>(f["frame"].asInt().unwrapOr(-1));
+                    auto const& a = f["p1"];
+                    fx.x = static_cast<float>(a["x"].asDouble().unwrapOr(0.0));
+                    fx.y = a.contains("y") ? static_cast<float>(a["y"].asDouble().unwrapOr(0.0)) : 0.f;
+                    fx.r = a.contains("r") ? static_cast<float>(a["r"].asDouble().unwrapOr(0.0)) : 0.f;
+                    if (f.contains("p2") && f["p2"].isObject() && f["p2"].contains("y")) {
+                        auto const& b = f["p2"];
+                        fx.p2 = true;
+                        fx.x2 = b.contains("x") ? static_cast<float>(b["x"].asDouble().unwrapOr(0.0)) : fx.x;
+                        fx.y2 = static_cast<float>(b["y"].asDouble().unwrapOr(0.0));
+                        fx.r2 = b.contains("r") ? static_cast<float>(b["r"].asDouble().unwrapOr(0.0)) : 0.f;
+                    }
+                    m.fixFull.push_back(fx);
+                }
+            }
+            std::sort(m.fixes.begin(), m.fixes.end());
+            std::sort(m.fixFull.begin(), m.fixFull.end(), [](MacroFix const& a, MacroFix const& b) { return a.frame < b.frame; });
+        }
+        if (m.inputs.empty() && !m.inputs2.empty()) {
+            // nothing for player 1 at all: player 2's are the clicks
+            m.inputs.swap(m.inputs2);
+        }
+        if (m.inputs.empty()) {
+            why = "no player 1 jump inputs in it";
+            return std::nullopt;
+        }
+        // test 69: inputs aren't always in order in the file (a release listed before the one before it)
+        std::stable_sort(m.inputs.begin(), m.inputs.end(), [](auto const& a, auto const& b) { return a.first < b.first; });
+        return m;
+    }
+
+    void fetchOnlineMacro(int levelId);
+    bool applyMacro(Macro const& m, std::string const& credit);
+
+    // the macro for this level: a file named after the level id (76962930.gdr), or any file whose
+    // level id inside matches
+    void loadMacro(PlayLayer* layer) {
+        autoplay.fromMacro.clear();
+        autoplay.macroIsBrain = false;
+        autoplay.macro.clear();
+        autoplay.macroUntil = autoplay.macroEnd = 0;
+        autoplay.macroLogged = false;
+        if (!layer->m_level) {
+            return;
+        }
+        int id = layer->m_level->m_levelID.value();
+        std::error_code ec;
+        std::filesystem::create_directories(macroDir(), ec);
+        std::optional<Macro> found;
+        std::string why;
+        for (auto const& e : std::filesystem::directory_iterator(macroDir(), ec)) {
+            auto name = e.path().filename().string();
+            bool named = id > 0 && name.rfind(std::to_string(id) + ".", 0) == 0;
+            auto ext = e.path().extension().string();
+            if (!e.is_regular_file() || (ext != ".gdr" && ext != ".json")) {
+                continue;
+            }
+            std::string err;
+            auto m = readMacro(e.path(), err);
+            if (!m) {
+                if (named) {
+                    why = fmt::format("{}: {}", name, err);
+                }
+                continue;
+            }
+            if (named || (id > 0 && m->levelId == id)) {
+                found = std::move(m);
+                break;
+            }
+        }
+        if (!found) {
+            if (!why.empty()) {
+                say("autoplay: couldn't use the macro {}", why);
+            }
+            // test 90: the global brain first, then Hyperbolus
+            if (id > 0 && !layer->m_level->m_twoPlayerMode && !std::string_view(online::URL).empty() &&
+                Mod::get()->getSettingValue<bool>("global-brain")) {
+                brainFetch(id, levelFingerprint(layer->m_level));
+            }
+            else {
+                fetchOnlineMacro(id);
+            }
+            return;
+        }
+        // test 77: one downloaded from Hyperbolus keeps its credit
+        std::string credit;
+        auto src = Mod::get()->getSavedValue<std::string>(fmt::format("macro-src-{}", id), "");
+        if (auto nl = src.find('\n'); nl != std::string::npos && found->file.rfind(std::to_string(id) + ".", 0) == 0) {
+            credit = src.substr(nl + 1);
+        }
+        applyMacro(*found, credit);
+    }
+
+    void cbfOffForMacro();
+    // test 87: your Physics TPS setting (240 = the normal game)
+    double settingTps() {
+        return static_cast<double>(std::max<int64_t>(240, Mod::get()->getSettingValue<int64_t>("tps")));
+    }
+
+    // test 84: which of the file's two click lists goes to player 1 in a 2-player level
+    void macroSetSwap(bool swap) {
+        autoplay.macroSwap = swap;
+        if (!autoplay.macroTwoPlayer) {
+            return;
+        }
+        autoplay.macro = swap ? autoplay.macroB : autoplay.macroA;
+        autoplay.macroP2 = swap ? autoplay.macroA : autoplay.macroB;
+        autoplay.macroX.clear();
+        autoplay.macroSyncedFor = -1;
+    }
+
+    bool applyMacro(Macro const& m, std::string const& credit) {
+        // test 71: like Nova, only a macro made at your TPS (a converted one never lines up)
+        if (std::abs(m.fps - settingTps()) > 0.5) {
+            say("autoplay: the macro {} was made at {:.0f} TPS and you play at {:.0f}: it can't be used (set the mod's Physics TPS to {:.0f} to use it)",
+                m.file, m.fps, settingTps(), m.fps);
+            return false;
+        }
+        auto* plNow = GameManager::get()->m_playLayer;
+        double k = settingTps() / m.fps;
+        // test 70: outside 2-player levels the "player 2" clicks are yours too: the button is down
+        // while either is
+        auto* pl = GameManager::get()->m_playLayer;
+        bool twoPlayer = pl && pl->m_level && pl->m_level->m_twoPlayerMode;
+        std::vector<std::tuple<int, bool, bool>> all;  // frame, down, which
+        for (auto const& [f, d] : m.inputs) {
+            all.push_back({ f, d, false });
+        }
+        if (!twoPlayer) {
+            for (auto const& [f, d] : m.inputs2) {
+                all.push_back({ f, d, true });
+            }
+        }
+        std::stable_sort(all.begin(), all.end(), [](auto const& a, auto const& b) { return std::get<0>(a) < std::get<0>(b); });
+        // test 80: each press or release counts as it comes, from either side (test 70 held while
+        // either side held: a "player 1" release inside a "player 2" hold, which the game lets go on,
+        // was skipped: Zodiac's robot at 9.6% held from step 5984 to 6039 instead of 5984-6011, 6031-6039)
+        std::vector<std::pair<int, bool>> merged;
+        for (auto const& [f, d, which] : all) {
+            (void)which;
+            merged.push_back({ f, d });
+        }
+        auto toTicks = [k](std::vector<std::pair<int, bool>> const& in) {
+            std::vector<std::pair<int, bool>> out;
+            int lastTick = -1;
+            bool held = false;
+            for (auto const& [frame, down] : in) {
+                if (down == held) {
+                    continue;  // a repeat of the same state changes nothing
+                }
+                int t = static_cast<int>(std::llround(frame * k));
+                // two changes on one tick (a 1-tick tap): the second goes on the next tick
+                t = std::max(t, lastTick + 1);
+                out.push_back({ t, down });
+                lastTick = t;
+                held = down;
+            }
+            return out;
+        };
+        std::vector<std::pair<int, bool>> ticks = toTicks(merged);
+        autoplay.macroTwoPlayer = twoPlayer;
+        autoplay.macroA.clear();
+        autoplay.macroB.clear();
+        autoplay.macroP2.clear();
+        autoplay.macroSwap = false;
+        if (twoPlayer) {
+            // test 84: player 1's and player 2's clicks each to their own player
+            autoplay.macroA = toTicks(m.inputs);
+            autoplay.macroB = toTicks(m.inputs2);
+            ticks = autoplay.macroA;
+            autoplay.macroP2 = autoplay.macroB;
+        }
+        int until = static_cast<int>(std::llround(m.lastFrame * k)) + st(60);
+        if (until <= autoplay.knownUntil) {
+            say("autoplay: the macro {} is shorter than what it already learned here, it keeps its own", m.file);
+            return false;
+        }
+        // test 70: the macro is kept apart from what autoplay learns (test 69 put it in its memory,
+        // and the first death replaced it with autoplay's own attempt). It's played by the game's step
+        // counter, the way bots play it, from the start of an attempt
+        autoplay.macro = ticks;
+        // test 71: each input's x, from the bot's position records (for playing from a start position)
+        autoplay.macroX.clear();
+        if (m.fixes.size() >= 2) {
+            for (auto const& [t, d] : ticks) {
+                double f = t / k;
+                auto it = std::lower_bound(m.fixes.begin(), m.fixes.end(), std::pair<int, float> { static_cast<int>(f), -1e9f });
+                if (it == m.fixes.end()) {
+                    it = std::prev(m.fixes.end());
+                }
+                autoplay.macroX.push_back(it->second);
+            }
+        }
+        autoplay.macroByX = plNow && plNow->m_startPosObject && !autoplay.macroX.empty();
+        autoplay.macroFixes.clear();
+        for (auto f : m.fixFull) {
+            f.frame = static_cast<int>(std::llround(f.frame * k));
+            autoplay.macroFixes.push_back(f);
+        }
+        if (!autoplay.macroFixes.empty()) {
+            say("autoplay: the macro has {} position records: you're kept on its path (setting: Macro Position Fixes)", autoplay.macroFixes.size());
+        }
+        autoplay.macroSyncedFor = -1;
+        autoplay.macroUntil = until;
+        autoplay.macroEnd = until;
+        autoplay.macroIdx = 0;
+        autoplay.macroArmed = autoplay.attemptTick <= 1;
+        autoplay.macroDeaths.clear();
+        autoplay.macroGaps.clear();
+        autoplay.macroInGap = false;
+        autoplay.macroTry = 0;
+        autoplay.macroTuned = false;
+        // test 83: +1 first; test 84: in 2-player levels each shift also with the players swapped
+        autoplay.macroTrials.clear();
+        for (int sh : { 1, 0, -1, 2, -2 }) {
+            autoplay.macroTrials.push_back({ sh, false });
+            if (twoPlayer) {
+                autoplay.macroTrials.push_back({ sh, true });
+            }
+        }
+        if (twoPlayer) {
+            autoplay.macroTrials.resize(6);  // +1, +1 swapped, 0, 0 swapped, -1, -1 swapped
+        }
+        autoplay.macroTrialReach.assign(autoplay.macroTrials.size(), -1);
+        autoplay.macroAutoOffset = autoplay.macroTrials[0].first;
+        autoplay.macroIdx2 = 0;
+        autoplay.held2 = false;
+        autoplay.known.clear();
+        autoplay.knownUntil = 0;
+        autoplay.knownTrail.clear();
+        autoplay.knowsWholeLevel = false;
+        autoplay.fromMacro = credit.empty() ? m.file : credit;
+        cbfOffForMacro();
+        // test 81: the shift found for this macro before
+        if (plNow && plNow->m_level) {
+            auto saved = Mod::get()->getSavedValue<std::string>(fmt::format("macro-shift-{}", plNow->m_level->m_levelID.value()), "");
+            auto bar = saved.find('|');
+            if (bar != std::string::npos && saved.substr(bar + 1) == autoplay.fromMacro) {
+                auto head = saved.substr(0, bar);
+                autoplay.macroAutoOffset = std::atoi(head.c_str());
+                autoplay.macroTuned = true;
+                if (head.find('s') != std::string::npos) {
+                    macroSetSwap(true);
+                }
+                say("autoplay: plays it shifted {:+d} step(s){}, as found before", autoplay.macroAutoOffset, autoplay.macroSwap ? ", players swapped" : "");
+            }
+        }
+        if (m.ldm) {
+            say("autoplay: this macro was made with Low Detail Mode on: turn it on for this level if it dies where the two differ");
+        }
+        say("autoplay: plays the macro {}{}{} ({} inputs, {:.1f} s{})", m.file, m.author.empty() ? "" : " by " + m.author,
+            m.bot.empty() ? "" : " (" + m.bot + ")", ticks.size(), until / static_cast<double>(st(240)),
+            std::abs(m.fps - st(240)) > 0.5 ? fmt::format(", made at {:.0f} TPS, you're at {}", m.fps, st(240)) : "");
+        return true;
+    }
+
+    // ===== test 69: online macros from Hyperbolus (hyperbolus.net, used with its owner's OK) =====
+    // With no macro of your own for the level, the level's page on Hyperbolus is read once: its GDR
+    // macros (the archive lists 12 a page), approved ones first, then the most downloaded, skipping
+    // ones whose notes say they need noclip. The first that reads as a GDR macro for this level is
+    // saved in the macros folder (so it's there next time, and you can delete it) and replayed from
+    // the next attempt. Off with the "Online Macros" setting.
+    std::set<int> onlineMacroTried;
+
+    struct OnlineMacro {
+        std::string file, url, author, notes;
+        bool approved = false;
+        int downloads = 0;
+    };
+
+    std::string lower(std::string s) {
+        for (auto& c : s) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        return s;
+    }
+
+    // the page's data: <script data-page="app" type="application/json">{...}</script>
+    std::optional<matjson::Value> hyperbolusPage(std::string const& url) {
+        auto res = web::WebRequest().timeout(std::chrono::seconds(20)).userAgent("AliousBuffer").getSync(url);
+        if (!res.ok()) {
+            return std::nullopt;
+        }
+        auto html = res.string().unwrapOr("");
+        std::string_view open = R"(<script data-page="app" type="application/json">)";
+        auto a = html.find(open);
+        if (a == std::string::npos) {
+            return std::nullopt;
+        }
+        a += open.size();
+        auto b = html.find("</script>", a);
+        if (b == std::string::npos) {
+            return std::nullopt;
+        }
+        auto parsed = matjson::parse(std::string_view(html).substr(a, b - a));
+        if (parsed.isErr()) {
+            return std::nullopt;
+        }
+        return parsed.unwrap();
+    }
+
+    void fetchOnlineMacro(int levelId) {
+        if (levelId <= 0 || !Mod::get()->getSettingValue<bool>("online-macros") || onlineMacroTried.contains(levelId)) {
+            return;
+        }
+        onlineMacroTried.insert(levelId);
+        say("autoplay: looking for a macro of this level on Hyperbolus...");
+        std::filesystem::path dir = macroDir();
+        double tps = settingTps();  // test 87: the setting (the measured step can still be 240's)
+        std::string bad = "|" + Mod::get()->getSavedValue<std::string>(fmt::format("macro-bad-{}", levelId), "") + "|";
+        std::thread([levelId, dir, tps, bad] {
+            auto tell = [](std::string msg) { queueInMainThread([msg] { say("{}", msg); }); };
+            std::vector<OnlineMacro> list;
+            int last = 1;
+            for (int page = 1; page <= std::min(last, 8); ++page) {
+                // test 71: Hyperbolus's own API (the level page's data before)
+                std::optional<matjson::Value> data;
+                auto api = web::WebRequest().timeout(std::chrono::seconds(20)).userAgent("AliousBuffer")
+                    .getSync(fmt::format("https://hyperbolus.net/api/macros?level_id={}&format=gdr&page={}", levelId, page));
+                if (api.ok()) {
+                    if (auto j = api.json(); j.isOk()) {
+                        auto wrapped = matjson::Value::object();
+                        wrapped["props"] = matjson::Value::object();
+                        wrapped["props"]["replays"] = j.unwrap();
+                        data = wrapped;
+                    }
+                }
+                if (!data) {
+                    data = hyperbolusPage(fmt::format("https://hyperbolus.net/level/{}/replays?page={}", levelId, page));
+                }
+                if (!data) {
+                    if (page == 1) {
+                        return tell("autoplay: Hyperbolus has no macros of this level (or couldn't be reached)");
+                    }
+                    break;
+                }
+                auto& replays = (*data)["props"]["replays"];
+                last = static_cast<int>(replays["last_page"].asInt().unwrapOr(1));
+                if (!replays["data"].isArray()) {
+                    break;
+                }
+                for (auto const& r : replays["data"]) {
+                    if (r["format"].asString().unwrapOr("") != "gdr" || !r["files"].isArray() || r["files"].size() == 0) {
+                        continue;
+                    }
+                    auto const& f = r["files"][0];
+                    OnlineMacro o;
+                    o.file = f["filename"].asString().unwrapOr("");
+                    o.url = f["url"].asString().unwrapOr("");
+                    o.downloads = static_cast<int>(f["downloads"].asInt().unwrapOr(0));
+                    o.author = r["author"].isObject() ? r["author"]["name"].asString().unwrapOr("") : "";
+                    o.notes = r["notes"].isString() ? r["notes"].asString().unwrapOr("") : "";
+                    o.approved = !r["approved_at"].isNull();
+                    auto name = lower(o.file);
+                    bool gdrFile = name.ends_with(".gdr") || name.ends_with(".gdr.json") || name.ends_with(".json");
+                    auto notes = lower(o.notes);
+                    bool noclip = notes.find("noclip") != std::string::npos && notes.find("no noclip") == std::string::npos &&
+                        notes.find("no need noclip") == std::string::npos && notes.find("without noclip") == std::string::npos &&
+                        notes.find("no need for noclip") == std::string::npos;
+                    if (gdrFile && !noclip && o.url.rfind("https://hyperbolus.net/", 0) == 0) {
+                        list.push_back(std::move(o));
+                    }
+                }
+            }
+            if (list.empty()) {
+                return tell("autoplay: Hyperbolus has no GDR macro of this level it can use");
+            }
+            std::stable_sort(list.begin(), list.end(), [](OnlineMacro const& a, OnlineMacro const& b) {
+                if (a.approved != b.approved) {
+                    return a.approved;
+                }
+                return a.downloads > b.downloads;
+            });
+            // test 77: up to 8 are downloaded and read; the one made at your TPS on the newest GD
+            // (2.207+ first: macros from older 2.2 versions can go wrong in 2.2081), then approved, then
+            // the most downloaded. Ones that failed you before are skipped.
+            struct Pick {
+                OnlineMacro o;
+                Macro m;
+                std::vector<uint8_t> data;
+            };
+            std::vector<Pick> picks;
+            int skippedBad = 0;
+            std::map<int, int> otherTps;  // test 86: macros made at another TPS (which, how many)
+            bool anyLdm = false;
+            for (size_t i = 0; i < list.size() && i < 8; ++i) {
+                auto const& o = list[i];
+                if (bad.find("|" + o.url + "|") != std::string::npos) {
+                    ++skippedBad;
+                    continue;
+                }
+                auto file = web::WebRequest().timeout(std::chrono::seconds(60)).userAgent("AliousBuffer").followRedirects(true).getSync(o.url);
+                if (!file.ok()) {
+                    continue;
+                }
+                auto bytes = std::move(file).data();
+                std::vector<uint8_t> data(bytes.begin(), bytes.end());
+                std::string why;
+                auto m = parseMacro(data, o.file, why);
+                if (m && (m->levelId == 0 || m->levelId == levelId) && std::abs(m->fps - tps) > 0.5) {
+                    ++otherTps[static_cast<int>(std::lround(m->fps))];
+                    continue;
+                }
+                if (!m || (m->levelId != 0 && m->levelId != levelId)) {
+                    continue;
+                }
+                picks.push_back({ o, std::move(*m), std::move(data) });
+            }
+            if (!picks.empty()) {
+                // test 88: 2.206+ first (2.2069 left out 2.206 macros, which work: Thinking Space II;
+                // Silent Acropolis's only working one), then ones with the bot's position records
+                std::stable_sort(picks.begin(), picks.end(), [](Pick const& a, Pick const& b) {
+                    bool na = a.m.gameVersion >= 2.2055, nb = b.m.gameVersion >= 2.2055;
+                    if (na != nb) {
+                        return na;
+                    }
+                    bool fa = a.m.fixes.size() > 100, fb = b.m.fixes.size() > 100;
+                    if (fa != fb) {
+                        return fa;
+                    }
+                    if (a.o.approved != b.o.approved) {
+                        return a.o.approved;
+                    }
+                    return a.o.downloads > b.o.downloads;
+                });
+                auto& best = picks.front();
+                bool json = !best.data.empty() && best.data[0] == '{';
+                auto path = dir / fmt::format("{}{}", levelId, json ? ".gdr.json" : ".gdr");
+                std::error_code ec;
+                std::filesystem::create_directories(dir, ec);
+                std::filesystem::remove(dir / fmt::format("{}.gdr", levelId), ec);
+                std::filesystem::remove(dir / fmt::format("{}.gdr.json", levelId), ec);
+                (void)file::writeBinarySafe(path, ByteSpan(best.data));
+                if (best.m.author.empty()) {
+                    best.m.author = best.o.author;
+                }
+                std::string credit = fmt::format("{} by {} (Hyperbolus, GD {:.4f})", best.o.file, best.o.author.empty() ? best.m.author : best.o.author,
+                    best.m.gameVersion);
+                std::string url = best.o.url;
+                size_t usable = picks.size();
+                Macro got = std::move(best.m);
+                queueInMainThread([got, credit, levelId, url, usable] {
+                    Mod::get()->setSavedValue(fmt::format("macro-src-{}", levelId), url + "\n" + credit);
+                    auto* layer = GameManager::get()->m_playLayer;
+                    say("autoplay: downloaded {} from Hyperbolus ({} of its macros fit your TPS)", credit, usable);
+                    if (!autoplay.active || !layer || !layer->m_level || layer->m_level->m_levelID.value() != levelId) {
+                        return;
+                    }
+                    applyMacro(got, credit);
+                });
+                return;
+            }
+            if (!otherTps.empty()) {
+                // test 86: say which TPS to set (Grief's only macro is made at 360)
+                std::string which;
+                for (auto const& [t, n] : otherTps) {
+                    which += fmt::format("{}{} at {} TPS", which.empty() ? "" : ", ", n, t);
+                }
+                return tell(fmt::format("autoplay: Hyperbolus has macros of this level made at another TPS ({}); you play at {:.0f}. "
+                    "Set the mod's TPS setting to {} and start autoplay again to use one", which, tps, otherTps.rbegin()->first));
+            }
+            if (skippedBad > 0) {
+                return tell(fmt::format("autoplay: no other Hyperbolus macro of this level to try ({} failed here before); autoplay plays it itself", skippedBad));
+            }
+            tell("autoplay: none of the Hyperbolus macros of this level could be used (made at another TPS, or GDR2, which isn't supported yet)");
+        }).detach();
+    }
+
+    // test 90: the run of this level finished the most times by other games' autoplay
+    void brainFetch(int levelId, std::string print) {
+        int tps = static_cast<int>(settingTps());
+        say("autoplay: asking the global brain for a run of this level...");
+        std::thread([levelId, print, tps] {
+            auto res = web::WebRequest().timeout(std::chrono::seconds(15)).userAgent("AliousBuffer")
+                .getSync(fmt::format("{}/api/runs?level={}&hash={}&tps={}", online::URL, levelId, print, tps));
+            std::optional<Macro> got;
+            int confirms = 0;
+            if (res.ok()) {
+                if (auto j = res.json(); j.isOk()) {
+                    auto v = j.unwrap();
+                    if (v["found"].asBool().unwrapOr(false) && v["inputs"].isArray()) {
+                        Macro m;
+                        m.file = "global brain run";
+                        m.bot = "Aliou's Buffer";
+                        m.fps = tps;
+                        m.levelId = levelId;
+                        confirms = static_cast<int>(v["confirms"].asInt().unwrapOr(1));
+                        for (auto const& in : v["inputs"]) {
+                            if (in.isArray() && in.size() == 2) {
+                                int f = static_cast<int>(in[0].asInt().unwrapOr(0));
+                                m.inputs.push_back({ f, in[1].asInt().unwrapOr(0) != 0 });
+                                m.lastFrame = std::max(m.lastFrame, f);
+                            }
+                        }
+                        if (!m.inputs.empty()) {
+                            got = std::move(m);
+                        }
+                    }
+                }
+            }
+            queueInMainThread([got, confirms, levelId] {
+                auto* layer = GameManager::get()->m_playLayer;
+                bool here = autoplay.active && layer && layer->m_level && layer->m_level->m_levelID.value() == levelId;
+                if (!got) {
+                    say("autoplay: the global brain has no run of this level yet");
+                    if (here) {
+                        fetchOnlineMacro(levelId);
+                    }
+                    return;
+                }
+                if (!here) {
+                    return;
+                }
+                if (applyMacro(*got, fmt::format("global brain run ({} finish{})", confirms, confirms == 1 ? "" : "es"))) {
+                    // recorded by the same counter it's played by: no shift first
+                    autoplay.macroIsBrain = true;
+                    if (!autoplay.macroTuned) {
+                        autoplay.macroTrials = { { 0, false }, { 1, false }, { -1, false } };
+                        autoplay.macroTrialReach.assign(3, -1);
+                        autoplay.macroAutoOffset = 0;
+                    }
+                }
+            });
+        }).detach();
+    }
+
+    void loadAutoplaySaved(PlayLayer* layer);
+    void loadAutoplay(PlayLayer* layer) {
+        loadAutoplaySaved(layer);
+        loadMacro(layer);
+    }
+
+    void loadAutoplaySaved(PlayLayer* layer) {
+        autoplayKey(layer);
+        if (autoplay.saveKey.empty()) {
+            return;
+        }
+        std::ifstream in(autoplayFile());
+        std::string magic;
+        int version = 0, rate = 0;
+        size_t hash = 0;
+        if (!(in >> magic >> version >> hash >> rate) || magic != "cbf-autoplay" || version != 1) {
+            return;
+        }
+        if (hash != autoplay.levelHash || rate != st(240)) {
+            say("autoplay: the level (or the TPS) changed since it was learned, it learns it again");
+            return;
+        }
+        int until = 0, whole = 0;
+        if (!(in >> until >> whole)) {
+            return;
+        }
+        std::string kind;
+        while (in >> kind) {
+            if (kind == "f") {
+                int t = 0, down = 0;
+                if (in >> t >> down) {
+                    autoplay.known.push_back({ t, down != 0 });
+                }
+            }
+            else if (kind == "d") {
+                float x = 0.f, y = 0.f, w = 0.f, h = 0.f;
+                // test 60: test 59's big marks (what killed you, grown) are left out when loaded
+                if ((in >> x >> y >> w >> h) && w <= 30.f && h <= 30.f) {
+                    buf.autoDangers.push_back(CCRect(x, y, w, h));
+                }
+            }
+            else if (kind == "p") {
+                float x = 0.f, y = 0.f;
+                if (in >> x >> y) {
+                    autoplay.knownTrail.push_back({ x, y });
+                }
+            }
+        }
+        autoplay.knownUntil = until;
+        autoplay.knowsWholeLevel = whole != 0;
+        say("autoplay: loaded what it learned here ({} inputs, {}){}", autoplay.known.size(),
+            autoplay.knowsWholeLevel ? "the whole level" : fmt::format("{:.1f} s of the level", until / static_cast<double>(st(240))),
+            ", it follows the trail from the next attempt");
+    }
+
+    void routeReset();
+    void makeSnaps(PlayLayer* layer);
+    void dropSnaps(bool release);
+    void buildObjIndex(PlayLayer* layer);
+    void routeCountersReset();
+
+    void endGenerating(char const* result) {
+        if (!autoplay.generating) {
+            return;
+        }
+        autoplay.generating = false;
+        autoplay.genEnded = std::chrono::steady_clock::now();
+        if (autoplay.genCover) {
+            autoplay.genCover->removeFromParent();
+            autoplay.genCover = nullptr;
+            autoplay.genText = nullptr;
+        }
+        FMODAudioEngine::sharedEngine()->resumeAllAudio();
+        double secs = std::chrono::duration<double>(autoplay.genEnded - autoplay.genStart).count();
+        say("autoplay path: {} ({} attempts, {:.0f} s, best {:.1f}%)", result, autoplay.genAttempts, secs, autoplay.genBest);
+    }
+
+    void beginGenerating(PlayLayer* layer) {
+        auto win = CCDirector::get()->getWinSize();
+        autoplay.generating = true;
+        autoplay.genAttempts = 0;
+        autoplay.genBest = 0.f;
+        autoplay.genStart = std::chrono::steady_clock::now();
+        autoplay.genCover = CCLayerColor::create({ 8, 10, 16, 255 });
+        autoplay.genCover->setID("autoplay-making-path"_spr);
+        auto* title = CCLabelBMFont::create("Making the path...", "bigFont.fnt");
+        title->setScale(0.7f);
+        title->setPosition({ win.width / 2.f, win.height / 2.f + 22.f });
+        autoplay.genCover->addChild(title);
+        autoplay.genText = CCLabelBMFont::create("0%", "goldFont.fnt");
+        autoplay.genText->setScale(0.75f);
+        autoplay.genText->setPosition({ win.width / 2.f, win.height / 2.f - 12.f });
+        autoplay.genCover->addChild(autoplay.genText);
+        auto* hint = CCLabelBMFont::create("Autoplay plays the level hidden until it reaches the end. Pause to stop.", "chatFont.fnt");
+        hint->setScale(0.6f);
+        hint->setOpacity(170);
+        hint->setPosition({ win.width / 2.f, win.height / 2.f - 42.f });
+        autoplay.genCover->addChild(hint);
+        layer->addChild(autoplay.genCover, 999);
+        say("autoplay is making the path: it plays the level hidden until the end");
+    }
+
+    void updateGenText(PlayLayer* layer) {
+        autoplay.genBest = std::max(autoplay.genBest, layer->getCurrentPercent());
+        if (autoplay.genText) {
+            double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - autoplay.genStart).count();
+            autoplay.genText->setString(fmt::format("{:.0f}%  -  {} attempts  -  {:.0f}s", autoplay.genBest, autoplay.genAttempts, secs).c_str());
+        }
+    }
+
+    // test 78: while a macro plays, Click Between Frames is switched off (its "Disable CBF") and so is
+    // its Physics Bypass, which changes physics even with CBF disabled: macros are made without them,
+    // and a different press or step drifts the macro off. Your settings come back when autoplay stops
+    // (or at the next start if the game closed first).
+    bool cbfOverridden = false;
+
+    void cbfRestore() {
+        auto saved = Mod::get()->getSavedValue<std::string>("cbf-restore", "");
+        if (saved.size() != 2) {
+            cbfOverridden = false;
+            return;
+        }
+        if (auto* cbf = Loader::get()->getLoadedMod("syzzi.click_between_frames")) {
+            if (cbf->hasSetting("soft-toggle")) {
+                cbf->setSettingValue<bool>("soft-toggle", saved[0] == '1');
+            }
+            if (cbf->hasSetting("physics-bypass")) {
+                cbf->setSettingValue<bool>("physics-bypass", saved[1] == '1');
+            }
+            say("Click Between Frames: your settings are back (disabled {}, physics bypass {})", saved[0] == '1' ? "on" : "off",
+                saved[1] == '1' ? "on" : "off");
+        }
+        Mod::get()->setSavedValue("cbf-restore", std::string());
+        cbfOverridden = false;
+    }
+
+    void cbfOffForMacro() {
+        auto* cbf = Loader::get()->getLoadedMod("syzzi.click_between_frames");
+        if (!cbf || cbfOverridden || !cbf->hasSetting("soft-toggle")) {
+            return;
+        }
+        bool soft = cbf->getSettingValue<bool>("soft-toggle");
+        bool bypass = cbf->hasSetting("physics-bypass") && cbf->getSettingValue<bool>("physics-bypass");
+        if (soft && !bypass) {
+            return;  // already off
+        }
+        Mod::get()->setSavedValue("cbf-restore", std::string(soft ? "1" : "0") + (bypass ? "1" : "0"));
+        cbfOverridden = true;
+        cbf->setSettingValue<bool>("soft-toggle", true);
+        if (bypass) {
+            cbf->setSettingValue<bool>("physics-bypass", false);
+        }
+        say("Click Between Frames: switched off while the macro plays{} (back when autoplay stops)", bypass ? ", and its Physics Bypass" : "");
+    }
+
+    void stopAutoplay(char const* why) {
+        if (cbfOverridden) {
+            cbfRestore();
+        }
+        if (!autoplay.active) {
+            return;
+        }
+        auto* layer = GameManager::get()->m_playLayer;
+        if (layer && layer == autoplay.layer) {
+            endGenerating("stopped");
+            if (autoplay.tag) {
+                autoplay.tag->removeFromParent();
+            }
+            if (autoplay.trailNode) {
+                autoplay.trailNode->removeFromParent();
+            }
+            if (buf.appliedInput) {
+                // autoplay pressed on the players directly, so it lets go the same way
+                buf.appliedInput = false;
+                layer->m_player1->releaseButton(PlayerButton::Jump);
+                if (layer->m_player2) {
+                    layer->m_player2->releaseButton(PlayerButton::Jump);
+                }
+            }
+        }
+        say("autoplay off{} ({} inputs)", why, autoplay.inputs);
+        routeReset();
+        buf.objIndex.clear();
+        autoplay = {};
+        buf.autoDangers.clear();
+        onlineMacroTried.clear();  // test 86: looked up again next start (after changing TPS, say)
+    }
+
+    // a level that was left without quitting: its label went with it, so it's only forgotten
+    void forgetAutoplay() {
+        routeReset();
+        dropSnaps(false);  // the level they belonged to is gone
+        buf.objIndex.clear();
+        autoplay = {};
+        buf.autoDangers.clear();
+    }
+
+    bool startAutoplay(std::string* why) {
+        auto* layer = GameManager::get()->m_playLayer;
+        if (!layer) {
+            *why = "Open a level first.";
+            return false;
+        }
+        if (layer->m_isPlatformer) {
+            *why = "Autoplay doesn't do platformer levels.";
+            return false;
+        }
+        if (!account::isLinked()) {
+            *why = "Autoplay is only available to games linked to the original Click Before Frames site. Aliou's Buffer does not connect to it, so autoplay is off here.";
+            return false;
+        }
+        // test 85: 2-player levels are allowed: a macro plays both players (test 84); without one,
+        // autoplay plays player 1 only
+        if (layer->m_level && layer->m_level->m_twoPlayerMode) {
+            say("autoplay: a 2-player level: a macro plays both players; without one, autoplay plays player 1 only");
+        }
+        if (!buf.ghost1 || buf.owner != layer) {
+            *why = "The level isn't ready yet, try again in a moment.";
+            return false;
+        }
+        // the game itself saves nothing (progress, completion, stars) in test mode
+        layer->m_isTestMode = true;
+        autoplay = {};
+        buf.autoDangers.clear();
+        autoplay.active = true;
+        autoplay.layer = layer;
+        // started mid-run: this attempt's ticks don't count from the level start, so it isn't learned
+        autoplay.userTouched = true;
+        resetPending();
+        auto win = CCDirector::get()->getWinSize();
+        autoplay.takeOver = Mod::get()->getSavedValue<bool>("autoplay-takeover", false);
+        // the label stays the whole time autoplay is on (also while you play with Take Over),
+        // so a recording always shows the run wasn't played by hand
+        autoplay.tag = CCLabelBMFont::create(autoplay.takeOver ? "AUTOPLAY - TAKE OVER" : "AUTOPLAY", "bigFont.fnt");
+        // v3.0.1: the label always shows (viewers have to be able to tell it isn't a real run), but
+        // it can be small, in the bottom corner, for showcases
+        if (Mod::get()->getSettingValue<std::string>("autoplay-label") == "Small") {
+            autoplay.tag->setScale(0.32f);
+            autoplay.tag->setColor({ 255, 255, 255 });
+            autoplay.tag->setOpacity(150);
+            autoplay.tag->setAnchorPoint({ 1.f, 0.f });
+            autoplay.tag->setPosition({ win.width - 6.f, 4.f });
+        }
+        else {
+            autoplay.tag->setScale(0.45f);
+            autoplay.tag->setColor({ 255, 215, 90 });
+            autoplay.tag->setOpacity(220);
+            autoplay.tag->setPosition({ win.width / 2.f, win.height - 26.f });
+        }
+        autoplay.tag->setID("autoplay-label"_spr);
+        layer->addChild(autoplay.tag, 1000);
+        say("autoplay on: the level is in test mode, nothing is saved as progress");
+        autoplay.trailNode = CCDrawNode::create();
+        autoplay.trailNode->setID("autoplay-trail"_spr);
+        autoplay.trailNode->setVisible(Mod::get()->getSettingValue<bool>("autoplay-trail"));  // v3.0.1: hidden for showcases
+        (layer->m_aboveShaderObjectLayer ? layer->m_aboveShaderObjectLayer : layer->m_objectLayer)->addChild(autoplay.trailNode, 9998);
+        loadAutoplay(layer);
+        drawTrail();
+        // v3.0 test 27: no "making the path" screen any more: the route is planned while it plays
+        makeSnaps(layer);
+        buildObjIndex(layer);
+        routeReset();
+        routeCountersReset();
+        say("autoplay: the route is planned up to 10 s ahead while it plays ({} level objects indexed)", [] {
+            size_t n = 0;
+            for (auto const& [k, v] : buf.objIndex) {
+                n += v.size();
+            }
+            return n;
+        }());
+        return true;
+    }
+
+    // v3.0 test 5: autoplay plans a whole route (every press and release for the next half second)
+    // instead of deciding one click at a time, and sticks to it. One-click-at-a-time chose any
+    // corridor that survived a moment, so in levels with several paths it went into dead ends
+    // and flipped the button almost every tick.
+    struct PlanCtx {
+        PlayLayer* layer;
+        PlayerObject* p1;
+        PlayerObject* p2;
+        bool dual;
+        int horizon;
+        bool held0;     // the button now
+        bool holdMode;  // wave / ship: holding is a real choice; other modes default to let go
+        int at = 0;     // attempt tick now
+        std::set<int> const* banned = nullptr;  // attempt ticks where a flip already led to a crash
+    };
+
+    // the ghost runs the plan; orbs are only clicked by the plan itself (v3.0 test 8: "assume
+    // orbs" made the ghost click every orb on its own, so plans counted on orb clicks the real
+    // autoplay never made)
+    int simulatePlan(PlanCtx const& c, std::vector<int> const& rel) {
+        SimEnd end;
+        bool orbClick = buf.orbClick, orbAfter = buf.orbAfterFirst, portals = buf.portalPredict;
+        buf.orbClick = false;
+        buf.orbAfterFirst = false;
+        buf.portalPredict = true;  // v3.0 test 14: stopping at a portal looked "safe" to the planner
+        buf.orbTouches.clear();
+        buf.plan = &rel;
+        buf.skipPress = true;
+        int survived = simulate(c.layer, c.p1, c.p2, c.dual, 0, true, c.horizon, -1, c.horizon, &end);
+        buf.skipPress = false;
+        buf.plan = nullptr;
+        buf.orbClick = orbClick;
+        buf.orbAfterFirst = orbAfter;
+        buf.portalPredict = portals;
+        ++autoplay.sims;
+        return survived;
+    }
+
+    // depth-limited search: flips go in right before the ghost would die, latest first (late and
+    // few flips is how a player plays); returns ticks survived, `best` gets the longest plan seen
+    bool planOutOfTime() {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - autoplay.searchStart).count() > autoplay.searchCap;
+    }
+
+    int planSearch(PlanCtx const& c, std::vector<int>& rel, int depth, int budget, std::vector<int>& best, int& bestLen) {
+        if (planOutOfTime()) {
+            autoplay.sims = budget;  // stop here, carry on next frame
+            return -1;
+        }
+        int survived = simulatePlan(c, rel);
+        if (survived > bestLen || (survived == bestLen && rel.size() < best.size())) {
+            bestLen = survived;
+            best = rel;
+        }
+        if (survived >= c.horizon || depth == 0 || autoplay.sims >= budget) {
+            return survived;
+        }
+        int last = rel.empty() ? -1 : rel.back();
+        // orbs touched before the crash: try a tap right on them first (a press while touching it)
+        std::vector<int> orbTicks;
+        for (auto const& [r, t] : buf.orbTouches) {
+            if (t > last && t <= survived && orbTicks.size() < 2) {
+                orbTicks.push_back(t);
+            }
+        }
+        for (int ot : orbTicks) {
+            if (c.banned && c.banned->count(c.at + ot)) {
+                continue;
+            }
+            bool heldThen = c.held0 != (rel.size() % 2 == 1);
+            size_t before = rel.size();
+            if (heldThen) {
+                rel.push_back(ot);  // let go, then press again on the orb
+                rel.push_back(ot + 1);
+            }
+            else {
+                rel.push_back(ot);
+            }
+            if (!c.holdMode) {
+                rel.push_back(rel.back() + st(4));  // and let go again: a tap
+            }
+            int r = planSearch(c, rel, depth - 1, budget, best, bestLen);
+            rel.resize(before);
+            if (r >= c.horizon || autoplay.sims >= budget) {
+                return r;
+            }
+        }
+        // v3.0 test 11: how long before the crash to flip. A cube jump lasts ~100 ticks, so
+        // clearing a spike often means pressing 30-60 ticks before reaching it (test 10 only tried
+        // up to 30, so it never found that jump). Flying modes need finer, closer steps.
+        static constexpr int GROUND_BACKS[] = { 2, 5, 9, 14, 20, 27, 35, 45, 56, 70, 85, 100 };
+        static constexpr int FLY_BACKS[] = { 1, 2, 4, 6, 9, 13, 18, 24 };
+        std::vector<int> backs;
+        if (c.holdMode) {
+            backs.assign(std::begin(FLY_BACKS), std::end(FLY_BACKS));
+        }
+        else {
+            backs.assign(std::begin(GROUND_BACKS), std::end(GROUND_BACKS));
+        }
+        // v3.0 test 19: then earlier and earlier, all the way back to the last flip. The way past a
+        // spike can be a jump long before it (onto another path); test 18 showed the ghost hitting
+        // the same spike as you, with no press ever tried more than 100 ticks before it.
+        {
+            int stepBack = c.holdMode ? 6 : 12;
+            for (int b = backs.back() + stepBack; st(b) <= survived - last; b += stepBack) {
+                backs.push_back(b);
+            }
+        }
+        for (int back : backs) {
+            int t = survived - st(back);
+            if (t <= last) {
+                if (back == backs.front()) {
+                    t = last + 1;  // at least try the very next tick
+                }
+                else {
+                    break;
+                }
+            }
+            if (t < 0 || t > survived || (c.banned && c.banned->count(c.at + t))) {
+                continue;
+            }
+            // v3.0 test 16: outside wave / ship a press is tried three ways: a short tap, a longer
+            // tap, and holding (let go later by the next step). Test 9-15 only tried a 3-tick tap,
+            // which does nothing when pressed just before landing (the game jumps on landing only
+            // while you still hold) and can't chain a jump right after landing.
+            bool heldAt = c.held0 != (rel.size() % 2 == 1);
+            int variants[] = { st(3), st(10), -1 };
+            int nVariants = (!c.holdMode && !heldAt) ? 3 : 1;
+            int r = -1;
+            for (int v = 0; v < nVariants; ++v) {
+                size_t before = rel.size();
+                rel.push_back(t);
+                if (nVariants > 1 && variants[v] > 0) {
+                    rel.push_back(t + variants[v]);
+                }
+                r = planSearch(c, rel, depth - 1, budget, best, bestLen);
+                rel.resize(before);
+                if (r >= c.horizon || autoplay.sims >= budget) {
+                    return r;
+                }
+            }
+            if (t == last + 1) {
+                break;
+            }
+        }
+        return survived;
+    }
+
+    // v3.0 test 20: the plans one step on from `plan` (absolute flip ticks), which lasted `survived`
+    // ticks from now and touched `orbs`: a tap on an orb it touched, then a press or release near
+    // the crash and further and further back (a short tap, a long tap or a hold outside wave / ship)
+    void enqueueChildren(PlanCtx const& c, std::vector<int> const& plan, int survived, std::vector<std::pair<void*, int>> const& orbs) {
+        int lastRel = plan.empty() ? -1 : plan.back() - tickCount;
+        auto push = [&](std::vector<int> child) {
+            if (autoplay.seen.insert(child).second) {
+                autoplay.queue.push_back({ survived, std::move(child) });
+                std::push_heap(autoplay.queue.begin(), autoplay.queue.end());
+            }
+        };
+        auto banned = [&](int rel) {
+            return c.banned && c.banned->count(c.at + rel);
+        };
+        bool heldAt = c.held0 != (plan.size() % 2 == 1);
+        for (auto const& [r, t] : orbs) {
+            if (t > lastRel && t <= survived && !banned(t)) {
+                std::vector<int> child = plan;
+                if (heldAt) {
+                    child.push_back(tickCount + t);
+                    child.push_back(tickCount + t + 1);
+                }
+                else {
+                    child.push_back(tickCount + t);
+                }
+                if (!c.holdMode) {
+                    child.push_back(child.back() + st(4));
+                }
+                push(std::move(child));
+            }
+        }
+        // v3.0 test 21: every 3 ticks (2 in wave / ship) from the crash all the way back. Test 20 had
+        // gaps of 10-15 ticks, so a jump that only works in a window of a few ticks was stepped over
+        std::vector<int> backs;
+        int stepBack = c.holdMode ? 2 : 3;
+        for (int b = 1; st(b) <= survived - lastRel; b += stepBack) {
+            backs.push_back(b);
+        }
+        for (int back : backs) {
+            int t = std::max(survived - st(back), lastRel + 1);
+            if (t < 0 || t > survived || banned(t)) {
+                continue;
+            }
+            if (!c.holdMode && !heldAt) {
+                for (int len : { st(3), st(10), -1 }) {
+                    std::vector<int> child = plan;
+                    child.push_back(tickCount + t);
+                    if (len > 0) {
+                        child.push_back(tickCount + t + len);
+                    }
+                    push(std::move(child));
+                }
+            }
+            else {
+                std::vector<int> child = plan;
+                child.push_back(tickCount + t);
+                push(std::move(child));
+            }
+            if (t == lastRel + 1) {
+                break;
+            }
+        }
+        if (autoplay.queue.size() > 20000) {
+            std::sort_heap(autoplay.queue.begin(), autoplay.queue.end());
+            autoplay.queue.erase(autoplay.queue.begin(), autoplay.queue.end() - 10000);
+            std::make_heap(autoplay.queue.begin(), autoplay.queue.end());
+        }
+    }
+
+    // v3.0 test 21: a plan got further than the one it came from: try its last press a tick or two
+    // earlier and later too (exact timings), ahead of everything else in the queue
+    void enqueueNeighbours(PlanCtx const& c, std::vector<int> const& plan, int score, int pressIndex) {
+        for (int d : { -2, -1, 1, 2 }) {
+            std::vector<int> child = plan;
+            for (size_t i = pressIndex; i < child.size(); ++i) {
+                child[i] += st(d);
+            }
+            int prev = pressIndex > 0 ? child[pressIndex - 1] : tickCount - 1;
+            if (child[pressIndex] <= prev || child[pressIndex] < tickCount) {
+                continue;
+            }
+            if (c.banned && c.banned->count(c.at + child[pressIndex] - tickCount)) {
+                continue;  // test 26: a press that already failed there
+            }
+            if (autoplay.seen.insert(child).second) {
+                autoplay.queue.push_back({ score, std::move(child) });
+                std::push_heap(autoplay.queue.begin(), autoplay.queue.end());
+            }
+        }
+    }
+
+    void clearQueue() {
+        autoplay.queue.clear();
+        autoplay.seen.clear();
+        autoplay.queueBase = -1;
+    }
+
+    // v3.0 test 12: autoplay presses on the player itself, like the ghost does, instead of through
+    // the game's button handling. Click Between Frames moves clicks that go through there to a
+    // sub-frame moment taken from the real clock, so the same plan landed a little differently
+    // every attempt: replays drifted and the ghost's predictions missed.
+    void autoplayButton(PlayLayer* layer, bool down) {
+        buf.appliedInput = down;
+        bool dual = layer->m_gameState.m_isDualMode && layer->m_player2;
+        for (auto* p : { layer->m_player1, dual ? layer->m_player2 : nullptr }) {
+            if (!p) {
+                continue;
+            }
+            if (down) {
+                p->pushButton(PlayerButton::Jump);
+            }
+            else {
+                p->releaseButton(PlayerButton::Jump);
+            }
+        }
+    }
+
+    // ===== test 90: the global brain =====
+    // A run autoplay finishes from the level's start (normal mode, nothing pressed by you) is sent to
+    // the CBF server: the level id, a fingerprint of the level's exact contents, the TPS, the mod
+    // version, the level name and its button changes by the game's step. Nothing about you. Another
+    // game starting autoplay there gets the run finished the most times and plays it like a macro.
+    // The same run finished again counts as a confirmation. Setting: Global Brain.
+    int progressPerStepNow();
+    void brainRecord(PlayLayer* layer, bool down) {
+        int per = progressPerStepNow();
+        int step = static_cast<int>(layer->m_gameState.m_currentProgress) / std::max(1, per);
+        if (!autoplay.runFlips.empty() && autoplay.runFlips.back().second == down) {
+            return;
+        }
+        autoplay.runFlips.push_back({ step, down });
+    }
+
+    std::string levelFingerprint(GJGameLevel* level) {
+        // FNV-1a 64 of the level's contents and version (the same on every platform)
+        uint64_t h = 1469598103934665603ull;
+        auto mix = [&](std::string const& t) {
+            for (unsigned char c : t) {
+                h ^= c;
+                h *= 1099511628211ull;
+            }
+        };
+        mix(std::string(level->m_levelString));
+        mix(fmt::format("|{}", static_cast<int>(level->m_levelVersion)));
+        return fmt::format("{:016x}", h);
+    }
+
+    void brainUpload(PlayLayer* layer) {
+        if (std::string_view(online::URL).empty() || !Mod::get()->getSettingValue<bool>("global-brain") || !layer->m_level ||
+            layer->m_level->m_levelID.value() <= 0 || layer->m_level->m_twoPlayerMode || autoplay.runFlips.size() < 1 ||
+            autoplay.macroIsBrain) {
+            return;
+        }
+        std::string inputs;
+        for (auto const& [t, d] : autoplay.runFlips) {
+            inputs += fmt::format("{}[{},{}]", inputs.empty() ? "" : ",", t, d ? 1 : 0);
+        }
+        auto name = matjson::Value(std::string(layer->m_level->m_levelName)).dump();
+        std::string body = fmt::format(R"({{"id":"{}","level":{},"hash":"{}","tps":{},"name":{},"version":"{}","inputs":[{}]}})", online::id(), layer->m_level->m_levelID.value(),
+            levelFingerprint(layer->m_level), static_cast<int>(settingTps()), name, Mod::get()->getVersion().toVString(), inputs);
+        size_t n = autoplay.runFlips.size();
+        std::thread([body, n] {
+            auto res = web::WebRequest().timeout(std::chrono::seconds(20)).userAgent("AliousBuffer").header("Content-Type", "application/json")
+                .bodyString(body).postSync(std::string(online::URL) + "/api/runs");
+            bool confirmed = res.ok() && res.string().unwrapOr("").find("\"confirmed\":true") != std::string::npos;
+            queueInMainThread([ok = res.ok(), confirmed, n] {
+                say("autoplay: {}", !ok ? std::string("couldn't share the run with the global brain") :
+                    confirmed ? fmt::format("the run ({} inputs) was already in the global brain: it counts as one more finish", n)
+                              : fmt::format("the run ({} inputs) is shared with the global brain: every game's autoplay can play it now", n));
+            });
+        }).detach();
+    }
+
+    void fetchOnlineMacro(int levelId);
+    bool applyMacro(struct Macro const& m, std::string const& credit);
+    void brainFetch(int levelId, std::string print);
+
+    void autoplaySet(PlayLayer* layer, bool down) {
+        if (buf.appliedInput == down) {
+            return;
+        }
+        autoplayButton(layer, down);
+        ++autoplay.inputs;
+        autoplay.attemptFlips.push_back({ autoplay.attemptTick - 1, down });
+        brainRecord(layer, down);
+    }
+
+    void autoplayFlip(PlayLayer* layer) {
+        autoplaySet(layer, !buf.appliedInput);
+    }
+
+    // a new attempt: the learned inputs are replayed from the start again
+    void autoplayAttemptStart(PlayLayer* layer) {
+        // v3.0 test 51: another start position: what was learned counts ticks from the old one
+        float sx = layer->m_startPosObject ? layer->m_startPosObject->getPositionX() : -1.f;
+        if (autoplay.startX > -1.5f && std::abs(sx - autoplay.startX) > 1.f) {
+            autoplay.known.clear();
+            autoplay.knownTrail.clear();
+            autoplay.knownUntil = 0;
+            autoplay.knowsWholeLevel = false;
+            autoplay.bestReached = -1;
+            autoplay.bestFlips.clear();
+            autoplay.bestTrail.clear();
+            autoplay.deathTicks.clear();
+            autoplay.banned.clear();
+            say("autoplay: another start position, it learns from here");
+        }
+        autoplay.startX = sx;
+        // normal mode: always start let go, so the learned inputs replay the same. Practice: a
+        // checkpoint can put you mid-flight (ship), where letting go means crashing at once, so
+        // autoplay plans from however you respawn (v3.0 test 13)
+        if (buf.appliedInput && !layer->m_isPracticeMode) {
+            autoplayButton(layer, false);
+        }
+        autoplay.planSafeUntil = -1;
+        autoplay.attemptTick = 0;
+        autoplay.attemptFlips.clear();
+        autoplay.attemptTrail.clear();
+        autoplay.plan.clear();
+        routeReset();
+        autoplay.verifyAt = -1;
+        autoplay.replayIdx = 0;
+        autoplay.macroIdx = 0;
+        autoplay.macroArmed = !autoplay.macro.empty();
+        ++autoplay.attemptNo;
+        autoplay.runFlips.clear();  // test 90
+        macroOffsetSetting = static_cast<int>(Mod::get()->getSettingValue<int64_t>("macro-offset"));  // test 93
+        macroFixesSetting = Mod::get()->getSettingValue<bool>("macro-fixes");
+        autoplay.userTouched = false;
+        autoplay.diedThisAttempt = false;
+        autoplay.reports = 0;
+        clearQueue();
+    }
+
+    // a death: keep this attempt's inputs up to a bit before it (normal mode, bot-only attempts)
+    // test 79; test 83: +1 first (Zodiac, Tidal Wave (iCreate) and Thinking Space II (xdBot) all lined up at +1)
+    constexpr int MACRO_OFFSETS[5] = { 1, 0, -1, 2, -2 };
+    int macroNow(PlayLayer* layer);
+    void autoplayDied(PlayLayer* layer) {
+        if (layer->m_isPracticeMode || (autoplay.userTouched && autoplay.macro.empty())) {
+            return;
+        }
+        // test 70: with a macro, the macro stays. Dying twice at the same spot in it: it's played up
+        // to 0.5 s before there, and the route plans the rest
+        if (!autoplay.macro.empty()) {
+            int reached = macroNow(layer);
+            if (autoplay.macroFixCount > 0) {
+                say("autoplay: position records used {} times this attempt (most {:.2f} units)", autoplay.macroFixCount, autoplay.macroFixMax);
+                autoplay.macroFixCount = 0;
+                autoplay.macroFixMax = 0.f;
+            }
+            // test 79: first find the step the macro lines up on: each shift gets an attempt
+            if (!autoplay.macroTuned && !autoplay.macroByX && reached < autoplay.macroEnd && !autoplay.macroTrials.empty()) {
+                int raw = reached - autoplay.macroAutoOffset;
+                int n = static_cast<int>(autoplay.macroTrials.size());
+                autoplay.macroTrialReach[autoplay.macroTry] = raw;
+                say("autoplay: the macro shifted {:+d} step(s){} got to step {}", autoplay.macroAutoOffset, autoplay.macroSwap ? ", players swapped," : "", raw);
+                if (autoplay.macroTry + 1 < n) {
+                    ++autoplay.macroTry;
+                    autoplay.macroAutoOffset = autoplay.macroTrials[autoplay.macroTry].first;
+                    macroSetSwap(autoplay.macroTrials[autoplay.macroTry].second);
+                    say("autoplay: trying the macro shifted {:+d} step(s){}", autoplay.macroAutoOffset, autoplay.macroSwap ? ", players swapped" : "");
+                    return;
+                }
+                int best = 0;
+                for (int i = 1; i < n; ++i) {
+                    if (autoplay.macroTrialReach[i] > autoplay.macroTrialReach[best]) {
+                        best = i;
+                    }
+                }
+                autoplay.macroTuned = true;
+                autoplay.macroAutoOffset = autoplay.macroTrials[best].first;
+                macroSetSwap(autoplay.macroTrials[best].second);
+                say("autoplay: the macro goes furthest shifted {:+d} step(s){} (to step {}): it's played that way", autoplay.macroAutoOffset,
+                    autoplay.macroSwap ? ", players swapped" : "", autoplay.macroTrialReach[best]);
+                // test 81: remembered for this macro, so the next session doesn't try them all again
+                if (layer->m_level) {
+                    Mod::get()->setSavedValue(fmt::format("macro-shift-{}", layer->m_level->m_levelID.value()),
+                        fmt::format("{}{}|{}", autoplay.macroAutoOffset, autoplay.macroSwap ? "s" : "", autoplay.fromMacro));
+                }
+                autoplay.macroDeaths.clear();
+                autoplay.macroDeaths.push_back(autoplay.macroTrialReach[best] + autoplay.macroAutoOffset);
+                return;
+            }
+            if (reached < autoplay.macroUntil + st(60)) {
+                autoplay.macroDeaths.push_back(reached);
+                int here = 0;
+                for (int d : autoplay.macroDeaths) {
+                    if (std::abs(d - reached) < st(30)) {
+                        ++here;
+                    }
+                }
+                // test 77: a downloaded macro dying twice in its first 5%: it doesn't work here (an
+                // older GD, or a broken one): the next best one is downloaded
+                auto* lvl = layer->m_level;
+                int lid = lvl ? lvl->m_levelID.value() : 0;
+                auto src = lid > 0 ? Mod::get()->getSavedValue<std::string>(fmt::format("macro-src-{}", lid), "") : std::string();
+                auto nl = src.find('\n');
+                bool fromSite = nl != std::string::npos && autoplay.fromMacro == src.substr(nl + 1);
+                // (one downloaded by tests 69-76 has no record of where it's from: it's downloaded again)
+                bool oldDownload = src.empty() && lid > 0 && autoplay.fromMacro.rfind(std::to_string(lid) + ".", 0) == 0;
+                if (here >= 2 && reached < autoplay.macroEnd / 20 && (fromSite || oldDownload)) {
+                    if (fromSite) {
+                        auto key = fmt::format("macro-bad-{}", lid);
+                        auto badList = Mod::get()->getSavedValue<std::string>(key, "");
+                        Mod::get()->setSavedValue(key, badList.empty() ? src.substr(0, nl) : badList + "|" + src.substr(0, nl));
+                    }
+                    Mod::get()->setSavedValue(fmt::format("macro-src-{}", lid), std::string());
+                    std::error_code ec;
+                    std::filesystem::remove(macroDir() / fmt::format("{}.gdr", lid), ec);
+                    std::filesystem::remove(macroDir() / fmt::format("{}.gdr.json", lid), ec);
+                    say("autoplay: the macro {} died twice at step {} ({:.0f}% into it): it's dropped, looking for another one", autoplay.fromMacro, reached,
+                        100.0 * reached / std::max(1, autoplay.macroEnd));
+                    autoplay.macro.clear();
+                    autoplay.fromMacro.clear();
+                    onlineMacroTried.erase(lid);
+                    fetchOnlineMacro(lid);
+                    return;
+                }
+                if (here >= 2 && autoplay.macroTwoPlayer) {
+                    say("autoplay: the macro died at step {} again (2-player level: autoplay can't plan player 2, it plays the macro again)", reached);
+                }
+                else if (here >= 2) {
+                    // test 75 (like Nova): autoplay plans a stretch around it, the macro plays on after it
+                    bool grown = false;
+                    for (auto& g : autoplay.macroGaps) {
+                        if (reached >= g.first - st(60) && reached < g.second + st(60)) {
+                            g.first = std::max(0, std::min(g.first, reached - st(180)));
+                            g.second = std::max(g.second + st(120), reached + st(240));
+                            grown = true;
+                            say("autoplay: died in the stretch it plans itself (step {}): it's now steps {}-{}", reached, g.first, g.second);
+                        }
+                    }
+                    if (!grown) {
+                        // test 82: from 1.5 s before (0.5 s was too little time to see the death coming)
+                        autoplay.macroGaps.push_back({ std::max(0, reached - st(360)), reached + st(240) });
+                        say("autoplay: the macro died at step {} again: autoplay plans steps {}-{}, the macro plays the rest", reached,
+                            std::max(0, reached - st(360)), reached + st(240));
+                    }
+                }
+                else {
+                    say("autoplay: the macro died at step {} ({:.0f}% of it), it plays it again", reached,
+                        100.0 * reached / std::max(1, autoplay.macroEnd));
+                }
+            }
+            return;
+        }
+        int reached = autoplay.attemptTick;
+        if (autoplay.knowsWholeLevel && reached < autoplay.knownUntil) {
+            // the saved run didn't play the same this time: learn from here like any other death
+            autoplay.knowsWholeLevel = false;
+        }
+        // v3.0 test 24: deaths near this one in this session (test 23 counted only deaths in a row
+        // at the same spot, so dying somewhere else once reset it and it went back and forth)
+        autoplay.deathTicks.push_back(reached);
+        int here = 0;
+        for (int d : autoplay.deathTicks) {
+            if (std::abs(d - reached) < st(30)) {
+                ++here;
+            }
+        }
+        autoplay.sameDeaths = here - 1;
+        autoplay.lastDeath = reached;
+        // v3.0 test 17: the last flip before the crash isn't made there again, so the next attempt
+        // takes a different route instead of repeating the same one
+        for (auto it = autoplay.attemptFlips.rbegin(); it != autoplay.attemptFlips.rend(); ++it) {
+            if (it->first >= autoplay.knownUntil) {
+                autoplay.banned.insert(it->first);
+                break;
+            }
+        }
+        // v3.0 test 51: the best attempt so far is what gets replayed (an attempt that dies sooner
+        // doesn't replace it), up to 0.5 s before where it ended; each death there frees 1 s more
+        // (at most 6). Test 43 kept 3 s for the search, and the search came out differently every
+        // time: a route that had worked wasn't followed again and it died sooner.
+        if (reached > autoplay.bestReached) {
+            autoplay.bestReached = reached;
+            autoplay.bestFlips = autoplay.attemptFlips;
+            autoplay.bestTrail = autoplay.attemptTrail;
+        }
+        int atBest = 0;
+        for (int d : autoplay.deathTicks) {
+            if (std::abs(d - autoplay.bestReached) < st(45)) {
+                ++atBest;
+            }
+        }
+        // v3.0 test 59: a second death there doesn't throw 1 s of the best run away any more (it went
+        // from replaying up to tick 322 to only up to 82, and died sooner): the first 3 deaths keep
+        // it up to 0.5 s before; after that, 0.25 s more each time
+        int keepUntil = std::max(0, autoplay.bestReached - st(120) - std::min(std::max(atBest - 3, 0), 16) * st(60));
+        autoplay.knownUntil = keepUntil;
+        autoplay.known.clear();
+        for (auto const& f : autoplay.bestFlips) {
+            if (f.first < keepUntil) {
+                autoplay.known.push_back(f);
+            }
+        }
+        autoplay.knownTrail.clear();
+        for (size_t i = 0; i < autoplay.bestTrail.size() && static_cast<int>(i) * trailEvery() < keepUntil; ++i) {
+            autoplay.knownTrail.push_back(autoplay.bestTrail[i]);
+        }
+        say("autoplay replays its best attempt ({} ticks) up to tick {} ({} inputs)", autoplay.bestReached, keepUntil, autoplay.known.size());
+        drawTrail();
+        saveAutoplay();
+    }
+
+    // v3.0 test 24: a run to the end: the whole level is known and saved
+    void autoplayFinished(PlayLayer* layer) {
+        if (!autoplay.active || autoplay.layer != layer || layer->m_isPracticeMode || autoplay.userTouched) {
+            return;
+        }
+        autoplay.known = autoplay.attemptFlips;
+        autoplay.knownTrail = autoplay.attemptTrail;
+        autoplay.knownUntil = autoplay.attemptTick + st(240);
+        autoplay.knowsWholeLevel = true;
+        saveAutoplay();
+        drawTrail();
+        say("autoplay finished the level: the whole run is saved, it plays it the same from the first attempt next time");
+        if (!layer->m_startPosObject) {
+            brainUpload(layer);  // test 90
+        }
+        if (autoplay.generating) {
+            endGenerating("reached the end");
+            autoplay.needRestart = true;  // now the run you see, along the trail
+        }
+    }
+
+    // ===== v3.0 test 27: the route =====
+    // A route is planned from where you are toward the end of the level (up to 10 s ahead), a bit
+    // more every tick. Hidden-player states are saved along it every 0.2 s, so it grows from its
+    // end (not from you every time). Where it dies, an input is tried one tick earlier at a time
+    // (latest first), and the middle of the window that works is kept. Nothing works: the last
+    // input is taken back and it looks before it (up to 8 times). You're checked against the
+    // route every tick; off it, it plans again from where you are.
+    struct RoutePoint {
+        int tick;  // the state at the start of this tick (before its inputs)
+        PlayerObject* snap;
+        bool held;
+        bool hasBounds = false;  // test 50: the corridor the ghost was in there
+        float lo = 0.f, hi = 0.f;
+    };
+    struct RouteGroup {
+        int first;
+        int last;
+    };
+    struct Route {
+        bool active = false;
+        int origin = 0;
+        bool originHeld = false;
+        std::vector<int> flips;  // absolute ticks the button flips at, ascending
+        std::vector<RouteGroup> groups;
+        std::vector<RoutePoint> cps;
+        std::vector<CCPoint> pos;  // pos[k]: where the route is after tick posBase + k
+        int posBase = 0;
+        int end = 0;  // the route is planned up to the start of this tick
+        bool sprinting = false;
+        int death = 0;
+        int cand = 0;
+        int lower = 0;
+        int variant = 0;
+        int windowHi = -1;
+        int windowVariant = 0;
+        int bestT = -1;  // test 29: the input that got furthest so far in this search
+        int bestV = 0;
+        int bestEnd = 0;
+        int sprintTests = 0;  // test 41: what the search did, for the "stuck" report
+        int orbTries = 0;
+        int orbBest = 0;
+        int lowest = INT_MAX;
+        int orbT = -1;  // test 38: an input whose path reaches an orb the route hadn't touched
+        int orbV = 0;
+        int orbEnd = 0;
+        int takebacks = 0;
+        int frontier = 0;
+        std::set<int> bannedFirst;
+        bool stuck = false;
+        int stuckAt = 0;
+        int drawnAt = -1000;
+        bool changed = false;
+        bool fine = false;  // test 28: the search goes a few ticks at a time first, then tick by tick
+        int candStart = 0;
+        int lastRecheck = -1000;
+        int lastAnchor = -100000;  // test 56
+        int recheckFails = 0;  // test 33: re-checks in a row that died sooner than the route
+        int beforeLimit = INT_MAX;  // test 32: after a take-back, the next search looks before it
+        int bandOffUntil = INT_MIN;  // test 45: the band is off for tests starting before this tick
+        bool afterTakeback = false;  // test 37: the next working timing is taken as it is (latest first)
+        std::vector<int> orbFirst;  // test 35: clicks in the middle of the orbs passed before the death, tried first
+        std::vector<std::pair<int, int>> orbRanges;  // test 39: when the route touches orbs (first, last tick)
+        std::string why;
+    };
+    Route route;
+    double routeSimMs = 0.0;  // test 28: what the route's tests cost (shown at a death)
+    int routeSimCount = 0;
+    int routeReports = 0;
+    int routeDrifts = 0;
+    int routeRechecks = 0;
+    std::map<int, int> routeStuckSpots;
+    void routeCountersReset() {
+        routeStuckSpots.clear();
+        buf.portalLogs = 0;
+        routeReports = 0;
+        routeDrifts = 0;
+        routeRechecks = 0;
+        routeSimMs = 0.0;
+        routeSimCount = 0;
+        buf.offscreenAdded = 0;
+        buf.offscreenFallback = 0;
+    }
+    constexpr int SNAP_MAX = 48;
+    std::vector<PlayerObject*> snapFree;
+    std::vector<PlayerObject*> snapAll;
+    CCLayer* snapLayer = nullptr;
+    PlayLayer* snapOwner = nullptr;
+
+    // the saved states are hidden players of their own, made once per level when autoplay starts
+    // test 57: the pathfinder's own pool of saved states
+    constexpr int PF_SNAPS = 64;
+    std::vector<PlayerObject*> pfFree;
+    // test 64: the step check (your state at the start of a tick, played one tick by the ghost)
+    struct StepCheck {
+        PlayerObject* snap = nullptr;
+        int tick = -1;
+        bool held = false;
+        bool want = false;
+        bool hasB = false;
+        float lo = 0.f, hi = 0.f;
+        int steps = 0;
+        int off = 0;
+        int logged = 0;
+        float maxD = 0.f;
+        CCPoint maxAt {};
+        int lastSummary = 0;
+    };
+    StepCheck stepChk;
+    void makeSnaps(PlayLayer* layer) {
+        if (snapOwner != layer) {
+            stepChk = {};
+            pfFree.clear();
+            snapFree.clear();  // another level's: let go of in onQuit (or left, see dropSnaps)
+            snapAll.clear();
+            snapLayer = nullptr;
+            snapOwner = layer;
+        }
+        if (!snapLayer) {
+            snapLayer = CCLayer::create();
+            snapLayer->retain();
+        }
+        while (snapAll.size() < static_cast<size_t>(SNAP_MAX + PF_SNAPS)) {
+            auto* s = PlayerObject::create(1, 1, layer, snapLayer, true);
+            s->retain();
+            s->setVisible(false);
+            snapLayer->addChild(s);
+            snapAll.push_back(s);
+            if (snapFree.size() < static_cast<size_t>(SNAP_MAX)) {
+                snapFree.push_back(s);
+            }
+            else {
+                pfFree.push_back(s);
+            }
+        }
+        if (!stepChk.snap && !pfFree.empty()) {
+            stepChk.snap = pfFree.back();
+            pfFree.pop_back();
+        }
+    }
+
+    void dropSnaps(bool release) {
+#ifdef GEODE_IS_ANDROID
+        release = false;  // like the ghosts (v2.87): never deleted while a level closes on Android
+#endif
+        if (release) {
+            for (auto* s : snapAll) {
+                s->removeFromParentAndCleanup(true);
+                s->release();
+            }
+            if (snapLayer) {
+                snapLayer->removeAllChildrenWithCleanup(true);
+                snapLayer->release();
+            }
+        }
+        snapAll.clear();
+        snapFree.clear();
+        pfFree.clear();
+        stepChk = {};
+        snapLayer = nullptr;
+        snapOwner = nullptr;
+    }
+
+    // test 57: the pathfinder's own saved states (kept apart from the route's)
+    bool pfActive = false;
+    int pfStepLen = 0;
+    PlayerObject* pfOut = nullptr;
+    bool pfOutHeld = false;
+    bool pfOutB = false;
+    float pfOutLo = 0.f, pfOutHi = 0.f;
+
+    void pfSink(int rel, PlayerObject* ghost, bool held) {
+        if (rel != pfStepLen || pfOut || pfFree.empty()) {
+            return;
+        }
+        pfOut = pfFree.back();
+        pfFree.pop_back();
+        copyState(pfOut, ghost);
+        pfOutHeld = held;
+        pfOutB = buf.gBounds;
+        pfOutLo = buf.gBoundLo;
+        pfOutHi = buf.gBoundHi;
+    }
+
+    PlayerObject* takeSnap() {
+        if (snapFree.empty()) {
+            return nullptr;
+        }
+        auto* s = snapFree.back();
+        snapFree.pop_back();
+        return s;
+    }
+
+    void beamReset();
+    void pfReset();
+    void routeReset() {
+        for (auto& c : route.cps) {
+            snapFree.push_back(c.snap);
+        }
+        route = {};
+        beamReset();
+        pfReset();
+    }
+
+    void routeKeepCps(int upTo) {
+        // the saved states after `upTo` belong to a route that changed there
+        while (route.cps.size() > 1 && route.cps.back().tick > upTo) {
+            snapFree.push_back(route.cps.back().snap);
+            route.cps.pop_back();
+        }
+        int keep = std::max(0, route.cps.back().tick - route.posBase);
+        if (static_cast<int>(route.pos.size()) > keep) {
+            route.pos.resize(keep);
+        }
+        route.end = route.cps.back().tick;
+        route.changed = true;
+    }
+
+    std::vector<CCPoint> routeRec;
+    std::vector<RoutePoint> routeNewCps;
+    int routeSimStart = 0;
+
+    void routeCpSink(int rel, PlayerObject* ghost, bool held) {
+        if (route.cps.size() + routeNewCps.size() >= static_cast<size_t>(SNAP_MAX) - 2) {
+            return;
+        }
+        auto* s = takeSnap();
+        if (!s) {
+            return;
+        }
+        copyState(s, ghost);
+        routeNewCps.push_back({ routeSimStart + rel, s, held, buf.gBounds, buf.gBoundLo, buf.gBoundHi });
+    }
+
+    int routeCpEvery() {
+        return st(48);
+    }
+
+    // the route's hidden player from saved state `from`, with `flips`, for `length` ticks: how many it lives
+    int routeSim(PlayLayer* layer, PlayerObject* p1, RoutePoint const& from, std::vector<int> const& flips, int length, bool record) {
+        std::vector<int> rel;
+        for (int t : flips) {
+            if (t >= from.tick) {
+                rel.push_back(t - from.tick);
+            }
+        }
+        float savedStep = buf.firstStep;
+        bool orbClick = buf.orbClick, orbAfter = buf.orbAfterFirst, portals = buf.portalPredict;
+        buf.firstStep = 1.f;
+        buf.fullHorizon = true;
+        buf.simFrom = from.snap;
+        buf.simFromHeld = from.held;
+        buf.simFromBounds = from.hasBounds;
+        buf.simFromLo = from.lo;
+        buf.simFromHi = from.hi;
+        buf.simOffset = from.tick - tickCount;
+        buf.crossPos = &route.pos;
+        buf.crossBase = route.posBase - tickCount;
+        buf.offscreenFill = true;
+        buf.orbClick = false;
+        buf.orbAfterFirst = false;
+        buf.portalPredict = true;
+        buf.orbTouches.clear();
+        buf.orbTouchLast.clear();
+        buf.plan = &rel;
+        buf.skipPress = true;
+        routeRec.clear();
+        routeNewCps.clear();
+        routeSimStart = from.tick;
+        if (record) {
+            buf.recordPath = &routeRec;
+            if (from.snap) {
+                buf.cpEvery = pfActive ? pfStepLen : routeCpEvery();
+                buf.cpSink = pfActive ? &pfSink : &routeCpSink;
+            }
+        }
+        buf.yBand = from.snap && (from.snap->m_isDart || from.snap->m_isShip) && from.tick > route.bandOffUntil;
+        if (buf.yBand) {
+            buf.yBandCenter = from.snap->getPositionY();
+            buf.yBandHalf = 75.f;
+        }
+        SimEnd end;
+        auto simStart = std::chrono::steady_clock::now();
+        int lived = simulate(layer, p1, nullptr, false, 0, true, length, -1, length, &end);
+        routeSimMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - simStart).count();
+        buf.yBand = false;
+        ++routeSimCount;
+        buf.recordPath = nullptr;
+        buf.cpEvery = 0;
+        buf.cpSink = nullptr;
+        buf.skipPress = false;
+        buf.plan = nullptr;
+        buf.simFrom = nullptr;
+        buf.crossPos = nullptr;
+        buf.offscreenFill = false;
+        buf.orbClick = orbClick;
+        buf.orbAfterFirst = orbAfter;
+        buf.portalPredict = portals;
+        buf.fullHorizon = false;
+        buf.firstStep = savedStep;
+        ++autoplay.sims;
+        return lived;
+    }
+
+    bool routeHeldAt(int t) {
+        // the button just before tick t's own flips
+        bool held = route.originHeld;
+        for (int f : route.flips) {
+            if (f >= t) {
+                break;
+            }
+            held = !held;
+        }
+        return held;
+    }
+
+    RoutePoint const& routeCpAtOrBefore(int t) {
+        size_t i = route.cps.size();
+        while (i > 1 && route.cps[i - 1].tick > t) {
+            --i;
+        }
+        return route.cps[i - 1];
+    }
+
+    void routeStart(PlayLayer* layer, PlayerObject* p1) {
+        routeReset();
+        auto* s = takeSnap();
+        if (!s) {
+            return;
+        }
+        copyState(s, p1);
+        route.active = true;
+        route.origin = tickCount;
+        route.originHeld = buf.appliedInput;
+        RoutePoint cp0 { tickCount, s, buf.appliedInput };
+        realBounds(layer, p1, cp0.hasBounds, cp0.lo, cp0.hi);
+        route.cps.push_back(cp0);
+        route.posBase = tickCount;
+        route.end = tickCount;
+        route.frontier = tickCount;
+        route.changed = true;
+    }
+
+    // v3.0 test 34: where the route got stuck (by level x, 60 units a slot) and how often. Kept for
+    // the level while autoplay is on: each time it's stuck at the same spot again, the next search
+    // there goes deeper (more take-backs, further back), so attempts make progress instead of
+    // getting stuck the same way every time
+
+    float routeXAt(int tick) {
+        int k = tick - route.posBase - 1;
+        if (k >= 0 && k < static_cast<int>(route.pos.size())) {
+            return route.pos[k].x;
+        }
+        return route.pos.empty() ? 0.f : route.pos.back().x;
+    }
+
+    int routeStuckHere(int tick) {
+        int slot = static_cast<int>(routeXAt(tick) / 60.f);
+        int n = 0;
+        for (int d = -1; d <= 1; ++d) {
+            auto it = routeStuckSpots.find(slot + d);
+            if (it != routeStuckSpots.end()) {
+                n = std::max(n, it->second);
+            }
+        }
+        return std::min(n, 6);
+    }
+
+    void routeStuck(PlayLayer* layer, std::string why) {
+        ++routeStuckSpots[static_cast<int>(routeXAt(route.death) / 60.f)];
+        route.sprinting = false;
+        route.stuck = true;
+        route.stuckAt = route.death;
+        route.why = why;
+        autoplay.killer = "route: " + why;
+        if (routeReports < 16) {
+            ++routeReports;
+            say("route stuck {:.1f} s ahead: {}", (route.death - tickCount) / static_cast<double>(st(240)), why);
+            // v3.0 test 41: what it was doing there, to see which move it never tries
+            int k = route.death - route.posBase - 1;
+            CCPoint at = k >= 0 && k < static_cast<int>(route.pos.size()) ? route.pos[k] : CCPoint {};
+            auto const& cp = routeCpAtOrBefore(route.death);
+            char const* mode = cp.snap->m_isShip ? "ship" : cp.snap->m_isDart ? "wave" : cp.snap->m_isBall ? "ball" : cp.snap->m_isBird ? "UFO"
+                : cp.snap->m_isRobot ? "robot" : cp.snap->m_isSpider ? "spider" : cp.snap->m_isSwing ? "swing" : "cube";
+            int orbsNear = 0;
+            std::string orbList;
+            int b = static_cast<int>(std::floor(at.x / 64.f));
+            for (int kk = b - 8; kk <= b + 2; ++kk) {
+                auto it = buf.objIndex.find(kk);
+                if (it == buf.objIndex.end()) {
+                    continue;
+                }
+                for (auto* o : it->second) {
+                    if (typeinfo_cast<RingObject*>(o) && o->m_positionX > at.x - 500.f && o->m_positionX < at.x + 120.f) {
+                        ++orbsNear;
+                        if (orbsNear <= 6) {
+                            orbList += fmt::format(" {}@{:.0f},{:.0f}", o->m_objectID, o->m_positionX, o->m_positionY);
+                        }
+                    }
+                }
+            }
+            say("  stuck detail: dies at x {:.0f} y {:.0f} as {} (button {} before it); searched back to {:.2f} s before, {} tests; "
+                "furthest any input got: {} ticks past it; orbs near (id@x,y): {}{}; touched on the way: {}; orb clicks tried {}, best {} ticks past",
+                at.x, at.y, mode, routeHeldAt(route.death) ? "held" : "let go",
+                route.lowest == INT_MAX ? 0.0 : (route.death - route.lowest) / static_cast<double>(st(240)), route.sprintTests,
+                route.bestEnd - route.death, orbsNear, orbList, route.orbRanges.size(), route.orbTries, route.orbBest);
+        }
+    }
+
+    void routeBeginSprint(int death) {
+        route.sprinting = true;
+        route.death = death;
+        int lastFlip = route.flips.empty() ? -1000000 : route.flips.back();
+        route.lower = std::max({ death - st(240 + 60 * routeStuckHere(death)), lastFlip + 1, tickCount + 1, route.cps.front().tick });
+        // v3.0 test 32: right after a take-back, only inputs BEFORE the one taken back: test 31 put
+        // nearly the same input back a tick or two off (a wave turn at the same peak, 8 times over)
+        route.cand = std::min(death - 1, route.beforeLimit - st(2));
+        route.beforeLimit = INT_MAX;
+        route.candStart = route.cand;
+        route.variant = 0;
+        route.windowHi = -1;
+        route.fine = false;
+        route.bestT = -1;
+        route.bestEnd = death;
+        route.orbT = -1;
+        route.orbEnd = 0;
+        route.sprintTests = 0;
+        route.orbTries = 0;
+        route.orbBest = 0;
+        route.lowest = INT_MAX;
+        route.orbFirst.clear();
+        route.orbRanges.clear();
+    }
+
+    // v3.0 test 39: a click while touching an orb only has to get a little past the death: in an
+    // orb chain each click only lives until the next orb (which gets its own search), so the 0.5 s
+    // rule never let one through (60% of Stereo Madness)
+    int routeNeeded(int t) {
+        for (auto const& [a, b] : route.orbRanges) {
+            if (t >= a - st(2) && t <= b) {
+                return st(30);
+            }
+        }
+        return st(120);
+    }
+
+    int routeCoarseStep(int t) {
+        auto const& cp = routeCpAtOrBefore(t);
+        return (cp.snap->m_isDart || cp.snap->m_isShip) ? st(2) : st(3);
+    }
+
+    // a flip group at t: variant 0 outside wave / ship while let go is a tap, otherwise a flip
+    std::vector<int> routeWith(int t, bool tap) {
+        std::vector<int> f = route.flips;
+        f.push_back(t);
+        if (tap) {
+            f.push_back(t + st(3));
+        }
+        return f;
+    }
+
+    // v3.0 test 55: still holding outside wave / ship: an orb or a jump needs a new click (let go,
+    // press again a tick later, let go after 4). The route only ever let go there, so an orb reached
+    // while holding was never clicked (Aquamarine 33.5%: "orb clicks tried 0", button held).
+    bool routeReclickMode(int t) {
+        auto const& cp = routeCpAtOrBefore(t);
+        bool holdMode = cp.snap->m_isDart || cp.snap->m_isShip;
+        return !holdMode && routeHeldAt(t);
+    }
+
+    std::vector<int> routeReclick(int t) {
+        std::vector<int> f = route.flips;
+        f.push_back(t);
+        f.push_back(t + 1);
+        f.push_back(t + 1 + st(3));
+        return f;
+    }
+
+    bool routeTapMode(int t) {
+        auto const& cp = routeCpAtOrBefore(t);
+        bool holdMode = cp.snap->m_isDart || cp.snap->m_isShip;
+        return !holdMode && !routeHeldAt(t);
+    }
+
+    void routeAccept(PlayLayer* layer, PlayerObject* p1, int hi, int lo, int variant) {
+        int t = (hi + lo) / 2;  // the middle of the timings that work: room on both sides
+        bool tapMode = routeTapMode(t);
+        bool tap = variant == 0 && tapMode;
+        if (variant == 1 && routeReclickMode(t)) {
+            route.flips.push_back(t);
+            route.flips.push_back(t + 1);
+            route.flips.push_back(t + 1 + st(3));
+            route.groups.push_back({ t, t + 1 + st(3) });
+            route.sprinting = false;
+            route.afterTakeback = false;
+            routeKeepCps(t);
+            return;
+        }
+        route.flips.push_back(t);
+        int last = t;
+        if (tap) {
+            last = t + st(3);
+            route.flips.push_back(last);
+        }
+        else if (tapMode) {
+            // v3.0 test 37: a held press outside wave / ship (it jumps again on every landing while
+            // held, and nothing ever let go: the cube hopped along flat ground for no reason). Let go
+            // at the first of these that still gets as far as holding does.
+            auto const& cp = routeCpAtOrBefore(t);
+            int length = route.death - cp.tick + st(120);
+            int held = routeSim(layer, p1, cp, route.flips, length, false);
+            for (int r : { st(10), st(20), st(35), st(60) }) {
+                auto f = route.flips;
+                f.push_back(t + r);
+                if (routeSim(layer, p1, cp, f, length, false) >= std::min(held, length)) {
+                    last = t + r;
+                    route.flips.push_back(last);
+                    break;
+                }
+            }
+        }
+        route.groups.push_back({ t, last });
+        route.sprinting = false;
+        route.afterTakeback = false;
+        routeKeepCps(t);
+    }
+
+    // ===== v3.0 test 42: the beam search for spots the route is stuck at =====
+    // Taking inputs back one at a time can't find a way that needs a different COMBINATION of
+    // inputs a few seconds earlier (Stereo Madness 60%: 20 take-backs, same spike every time). From
+    // the saved state ~3 s before the death, many input lists are tried side by side: each round
+    // every list gets one more input (every 4 ticks after its last one), and the 12 that get
+    // furthest (kept varied) go on. A list that gets well past the death becomes the route.
+    struct BeamItem {
+        std::vector<int> flips;  // absolute ticks (the route's earlier flips included)
+        int last;                // the last input's tick (new inputs go after it)
+        int end;                 // how far it gets (absolute tick)
+    };
+    struct Beam {
+        bool active = false;
+        RoutePoint start {};
+        int death = 0;
+        int target = 0;
+        int depth = 0;
+        std::vector<BeamItem> items;
+        std::vector<BeamItem> next;
+        size_t item = 0;
+        int cand = 0;
+        int variant = 0;
+        int tests = 0;
+        int triedFor = INT_MIN;  // the death it last ran for (one run per stuck spot per route)
+    };
+    Beam beam;
+    void beamReset() {
+        beam = {};
+    }
+
+    bool beamHeldAt(std::vector<int> const& flips, int t) {
+        bool held = route.originHeld;
+        for (int f : flips) {
+            if (f >= t) {
+                break;
+            }
+            held = !held;
+        }
+        return held;
+    }
+
+    // returns true if it started
+    bool beamStart(PlayLayer* layer, PlayerObject* p1) {
+        if (route.cps.empty() || std::abs(beam.triedFor - route.death) < st(30)) {
+            return false;
+        }
+        beam = {};
+        beam.triedFor = route.death;
+        beam.death = route.death;
+        beam.target = route.death + st(150);  // test 44: shorter tests (was 1 s past the death)
+        beam.start = routeCpAtOrBefore(std::max(route.death - st(720), tickCount + 1));
+        std::vector<int> base;
+        for (int f : route.flips) {
+            if (f < beam.start.tick) {
+                base.push_back(f);
+            }
+        }
+        int lived = routeSim(layer, p1, beam.start, base, beam.target - beam.start.tick, false);
+        int last = std::max(beam.start.tick, tickCount + 1) - st(3);
+        beam.items.push_back({ base, last, beam.start.tick + lived });
+        beam.cand = last + st(3);
+        beam.active = true;
+        say("route: stuck {:.1f} s ahead, trying combinations of inputs from {:.1f} s before it", (route.death - tickCount) / static_cast<double>(st(240)),
+            (route.death - beam.start.tick) / static_cast<double>(st(240)));
+        return true;
+    }
+
+    void beamFinish(PlayLayer* layer, BeamItem const& win) {
+        // the winning list becomes the route from the beam's start on
+        route.flips = win.flips;
+        route.groups.erase(std::remove_if(route.groups.begin(), route.groups.end(), [&](RouteGroup const& g) { return g.first >= beam.start.tick; }),
+            route.groups.end());
+        for (size_t i = 0; i < win.flips.size(); ++i) {
+            int f = win.flips[i];
+            if (f < beam.start.tick) {
+                continue;
+            }
+            // a tap (press then let go 3 ticks later) is one input
+            if (i + 1 < win.flips.size() && win.flips[i + 1] - f <= st(3) && !beamHeldAt(win.flips, f)) {
+                route.groups.push_back({ f, win.flips[i + 1] });
+                ++i;
+            }
+            else {
+                route.groups.push_back({ f, f });
+            }
+        }
+        route.stuck = false;
+        route.sprinting = false;
+        route.takebacks = 0;
+        route.bannedFirst.clear();
+        routeKeepCps(beam.start.tick);
+        beam.active = false;
+        if (routeReports < 16) {
+            ++routeReports;
+            say("route: found a way past the stuck spot ({} tests, {} inputs deep)", beam.tests, beam.depth + 1);
+        }
+    }
+
+    void beamFail(PlayLayer* layer, char const* why) {
+        beam.active = false;
+        routeStuck(layer, fmt::format("no combination of inputs found either ({}, {} tests)", why, beam.tests));
+    }
+
+    // one test
+    void beamStep(PlayLayer* layer, PlayerObject* p1) {
+        if (beam.item >= beam.items.size()) {
+            // the round is over: the furthest 12 go on, at most 2 that end at nearly the same spot
+            std::sort(beam.next.begin(), beam.next.end(), [](BeamItem const& a, BeamItem const& b) { return a.end > b.end; });
+            std::vector<BeamItem> keep;
+            for (auto& it : beam.next) {
+                int same = 0;
+                for (auto const& k : keep) {
+                    same += std::abs(k.end - it.end) <= st(4) ? 1 : 0;
+                }
+                if (same < 2) {
+                    keep.push_back(std::move(it));
+                }
+                if (keep.size() >= 12) {
+                    break;
+                }
+            }
+            beam.next.clear();
+            ++beam.depth;
+            if (keep.empty()) {
+                beamFail(layer, "nothing got further");
+                return;
+            }
+            if (beam.depth >= 10) {
+                beamFail(layer, "10 inputs deep");
+                return;
+            }
+            beam.items = std::move(keep);
+            beam.item = 0;
+            beam.cand = beam.items[0].last + st(3);
+            beam.variant = 0;
+            return;
+        }
+        auto const& base = beam.items[beam.item];
+        int hi = std::min(base.end - 1, base.last + st(200));
+        if (beam.cand > hi) {
+            ++beam.item;
+            if (beam.item < beam.items.size()) {
+                beam.cand = beam.items[beam.item].last + st(3);
+                beam.variant = 0;
+            }
+            return;
+        }
+        if (beam.cand < tickCount + 2) {
+            beam.cand = tickCount + 2;  // time went on while it searched: nothing before now
+            return;
+        }
+        int t = beam.cand;
+        auto const& cp = routeCpAtOrBefore(t);
+        bool holdMode = cp.snap->m_isDart || cp.snap->m_isShip;
+        bool held = beamHeldAt(base.flips, t);
+        bool tapMode = !holdMode && !held;
+        std::vector<int> f = base.flips;
+        f.push_back(t);
+        if (tapMode && beam.variant == 0) {
+            f.push_back(t + st(3));
+        }
+        else if (tapMode && beam.variant == 1) {
+            f.push_back(t + st(20));  // a longer press (a held jump, let go a little later)
+        }
+        int lived = routeSim(layer, p1, beam.start, f, beam.target - beam.start.tick, false);
+        ++beam.tests;
+        int end = beam.start.tick + lived;
+        int last = f.back();
+        if (end >= beam.target) {
+            beamFinish(layer, { f, last, end });
+            return;
+        }
+        if (end > base.end) {
+            beam.next.push_back({ f, last, end });
+        }
+        int variants = tapMode ? 2 : 1;
+        if (beam.variant + 1 < variants) {
+            ++beam.variant;
+        }
+        else {
+            beam.variant = 0;
+            beam.cand += holdMode ? st(3) : st(5);
+        }
+    }
+
+    // ===== v3.0 test 57/58: the pathfinder (wave / ship) =====
+    // When the route is stuck in wave or ship, many paths are followed side by side: every step
+    // (6 ticks) each path either keeps the button or flips it (at the start of the step or halfway;
+    // if all of those die, at every other tick of the step too), and its hidden player's state is
+    // saved at the end of the step. Up to 8 living paths at different heights go on (the route's
+    // own path is always one of them). Test 58: it runs while you play. As you come close, the
+    // inputs of the path in the middle of the others are given to you, step by step, and only the
+    // paths that agree with them go on. The first path that gets well past the death finishes it.
+    struct PfNode {
+        PlayerObject* snap = nullptr;
+        bool held = false;
+        bool onRoute = false;
+        int tick = 0;
+        std::vector<int> flips;  // from pf.start on
+        bool hasB = false;
+        float lo = 0.f, hi = 0.f;
+        float y = 0.f;
+    };
+    struct Pathfinder {
+        bool active = false;
+        int origStart = 0;
+        int start = 0;
+        int death = 0;
+        int target = 0;
+        std::vector<int> base;  // inputs before start (given to you)
+        std::vector<int> orig;  // the old route's inputs from origStart on
+        std::vector<PfNode> frontier;
+        std::vector<PfNode> next;
+        size_t idx = 0;
+        int variant = 0;
+        int childrenOfNode = 0;
+        int tests = 0;
+        int steps = 0;
+        int commits = 0;
+        double ms = 0.0;
+        int triedFor = INT_MIN;
+    };
+    Pathfinder pf;
+    constexpr int PF_WIDTH = 8;
+
+    void pfGive(PfNode& n) {
+        if (n.snap) {
+            pfFree.push_back(n.snap);
+            n.snap = nullptr;
+        }
+    }
+
+    void pfReset() {
+        for (auto& n : pf.frontier) {
+            pfGive(n);
+        }
+        for (auto& n : pf.next) {
+            pfGive(n);
+        }
+        int tried = pf.triedFor;
+        pf = {};
+        pf.triedFor = tried;
+    }
+
+    bool pfStart(PlayLayer* layer, PlayerObject* p1) {
+        if (route.cps.empty() || std::abs(pf.triedFor - route.death) < st(30) || pfFree.size() < 8) {
+            return false;
+        }
+        auto const& dcp = routeCpAtOrBefore(route.death);
+        if (!(dcp.snap->m_isDart || dcp.snap->m_isShip)) {
+            return false;  // cube-like parts keep the jump search
+        }
+        pfReset();
+        pf.triedFor = route.death;
+        auto const& cp = routeCpAtOrBefore(std::max(route.death - st(720), tickCount + 2));
+        if (cp.tick < tickCount + st(12)) {
+            return false;  // test 59: its start would be behind you already (it "fell behind" at once)
+        }
+        auto* s = pfFree.back();
+        pfFree.pop_back();
+        copyState(s, cp.snap);
+        PfNode root;
+        root.snap = s;
+        root.held = cp.held;
+        root.onRoute = true;
+        root.tick = cp.tick;
+        root.hasB = cp.hasBounds;
+        root.lo = cp.lo;
+        root.hi = cp.hi;
+        root.y = s->getPositionY();
+        pf.origStart = pf.start = cp.tick;
+        pf.death = route.death;
+        pf.target = route.death + st(150);
+        for (int f : route.flips) {
+            (f < cp.tick ? pf.base : pf.orig).push_back(f);
+        }
+        pf.frontier.push_back(std::move(root));
+        pf.active = true;
+        if (routeReports < 16) {
+            ++routeReports;
+            say("route: stuck {:.1f} s ahead in {}, pathfinder from {:.1f} s before it", (route.death - tickCount) / static_cast<double>(st(240)),
+                dcp.snap->m_isDart ? "wave" : "ship", (route.death - cp.tick) / static_cast<double>(st(240)));
+        }
+        return true;
+    }
+
+    void pfFinish(PlayLayer* layer, PfNode const& win) {
+        route.flips = pf.base;
+        route.flips.insert(route.flips.end(), win.flips.begin(), win.flips.end());
+        int from = pf.origStart;
+        route.groups.erase(std::remove_if(route.groups.begin(), route.groups.end(), [&](RouteGroup const& g) { return g.first >= from; }),
+            route.groups.end());
+        for (int f : route.flips) {
+            if (f >= from) {
+                route.groups.push_back({ f, f });
+            }
+        }
+        route.stuck = false;
+        route.sprinting = false;
+        route.takebacks = 0;
+        route.bannedFirst.clear();
+        if (routeReports < 16) {
+            ++routeReports;
+            say("route: pathfinder found a way ({} steps, {} tests, {:.2f} ms each, {} given to you on the way)", pf.steps, pf.tests,
+                pf.ms / std::max(1, pf.tests), pf.commits);
+        }
+        pfReset();
+        routeKeepCps(from);
+    }
+
+    void pfFail(PlayLayer* layer, char const* why) {
+        auto msg = fmt::format("the pathfinder {} ({} steps, {} tests, {:.2f} ms each)", why, pf.steps, pf.tests, pf.ms / std::max(1, pf.tests));
+        // what was given to you stays (nothing given: the old route stays)
+        if (pf.commits > 0) {
+            route.flips = pf.base;
+        }
+        pfReset();
+        routeStuck(layer, msg);
+    }
+
+    // the path in the middle of the others (the most room on both sides)
+    size_t pfMiddle(std::vector<PfNode> const& v) {
+        float lo = v.front().y, hi = v.front().y;
+        for (auto const& n : v) {
+            lo = std::min(lo, n.y);
+            hi = std::max(hi, n.y);
+        }
+        float mid = (lo + hi) * 0.5f;
+        size_t best = 0;
+        for (size_t i = 1; i < v.size(); ++i) {
+            if (std::abs(v[i].y - mid) < std::abs(v[best].y - mid)) {
+                best = i;
+            }
+        }
+        return best;
+    }
+
+    // the flips a variant puts in a step starting at t (-1 = no such variant)
+    bool pfVariant(PfNode const& node, int v, int step, std::vector<int>& out) {
+        out.clear();
+        int t = node.tick;
+        static int const offs[] = { 0, 3, 1, 2, 4, 5 };
+        if (v == 0) {
+            return true;  // keep the button
+        }
+        if (v >= 1 && v <= 6) {
+            int o = st(offs[v - 1]);
+            if (v >= 3 && (o == st(offs[0]) || o == st(offs[1]))) {
+                return false;  // same tick as a coarse one (low tick rates)
+            }
+            if (o >= step) {
+                return false;
+            }
+            out.push_back(t + o);
+            return true;
+        }
+        if (v == 7) {
+            // the old route's own inputs in this step, if none of the others is the same
+            if (!node.onRoute) {
+                return false;
+            }
+            for (int f : pf.orig) {
+                if (f >= t && f < t + step) {
+                    out.push_back(f);
+                }
+            }
+            if (out.empty()) {
+                return false;
+            }
+            if (out.size() == 1 && (out[0] == t || out[0] == t + st(3))) {
+                return false;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    bool pfMatchesOrig(PfNode const& node, std::vector<int> const& flips, int step) {
+        std::vector<int> want;
+        for (int f : pf.orig) {
+            if (f >= node.tick && f < node.tick + step) {
+                want.push_back(f);
+            }
+        }
+        return want == flips;
+    }
+
+    void pfStep(PlayLayer* layer, PlayerObject* p1) {
+        int step = st(6);
+        if (pf.idx < pf.frontier.size()) {
+            auto& node = pf.frontier[pf.idx];
+            int v = pf.variant;
+            std::vector<int> flips;
+            bool have = v <= 7 && pfVariant(node, v, step, flips);
+            if (have) {
+                RoutePoint from { node.tick, node.snap, node.held, node.hasB, node.lo, node.hi };
+                pfOut = nullptr;
+                pfStepLen = step;
+                pfActive = true;
+                auto t0 = std::chrono::steady_clock::now();
+                int lived = routeSim(layer, p1, from, flips, step, true);
+                pf.ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                pfActive = false;
+                ++pf.tests;
+                if (pfOut && lived >= step) {
+                    PfNode child;
+                    child.snap = pfOut;
+                    child.held = pfOutHeld;
+                    child.onRoute = node.onRoute && pfMatchesOrig(node, flips, step);
+                    child.tick = node.tick + step;
+                    child.flips = node.flips;
+                    child.flips.insert(child.flips.end(), flips.begin(), flips.end());
+                    child.hasB = pfOutB;
+                    child.lo = pfOutLo;
+                    child.hi = pfOutHi;
+                    child.y = pfOut->getPositionY();
+                    pf.next.push_back(std::move(child));
+                    ++pf.childrenOfNode;
+                }
+                else if (pfOut) {
+                    pfFree.push_back(pfOut);
+                }
+                pfOut = nullptr;
+            }
+            // next variant: 0, 1, 2, then 3..6 only if nothing lived, then 7 (the old route's)
+            if (v == 2 && pf.childrenOfNode > 0) {
+                pf.variant = 7;
+            }
+            else if (v < 7) {
+                pf.variant = v + 1;
+            }
+            else {
+                pf.variant = 8;
+            }
+            if (pf.variant > 7) {
+                pf.variant = 0;
+                pf.childrenOfNode = 0;
+                ++pf.idx;
+            }
+            return;
+        }
+        // the round is over: the old paths go, the new ones are thinned out (one per 6 units of
+        // height and button state, the route's own path first, at most 8 spread over the heights)
+        for (auto& n : pf.frontier) {
+            pfGive(n);
+        }
+        pf.frontier.clear();
+        ++pf.steps;
+        std::sort(pf.next.begin(), pf.next.end(), [](PfNode const& a, PfNode const& b) { return a.y < b.y; });
+        std::vector<PfNode> kept;
+        std::set<int> seenKeys;
+        auto key = [](PfNode const& n) { return static_cast<int>(std::floor(n.y / 6.f)) * 2 + (n.held ? 1 : 0); };
+        for (int pass = 0; pass < 2; ++pass) {
+            for (auto& n : pf.next) {
+                if (!n.snap || n.onRoute != (pass == 0)) {
+                    continue;
+                }
+                if (seenKeys.insert(key(n)).second) {
+                    kept.push_back(std::move(n));
+                    n.snap = nullptr;
+                }
+                else {
+                    pfGive(n);
+                }
+            }
+        }
+        pf.next.clear();
+        std::sort(kept.begin(), kept.end(), [](PfNode const& a, PfNode const& b) { return a.y < b.y; });
+        if (kept.size() > static_cast<size_t>(PF_WIDTH)) {
+            std::vector<PfNode> spread;
+            for (size_t i = 0; i < static_cast<size_t>(PF_WIDTH); ++i) {
+                size_t j = i * (kept.size() - 1) / (PF_WIDTH - 1);
+                if (kept[j].snap) {
+                    spread.push_back(std::move(kept[j]));
+                    kept[j].snap = nullptr;
+                }
+            }
+            for (auto& n : kept) {
+                if (n.onRoute && n.snap) {
+                    spread.push_back(std::move(n));
+                    n.snap = nullptr;
+                }
+                pfGive(n);
+            }
+            kept = std::move(spread);
+        }
+        if (kept.empty()) {
+            pfFail(layer, "found no way either");
+            return;
+        }
+        int at = kept.front().tick;
+        if (at >= pf.target) {
+            PfNode win = std::move(kept[pfMiddle(kept)]);
+            for (auto& n : kept) {
+                if (n.snap != win.snap) {
+                    pfGive(n);
+                }
+                n.snap = nullptr;
+            }
+            pfFinish(layer, win);
+            pfGive(win);
+            return;
+        }
+        // test 58: you're coming close: the next step of the middle path is given to you
+        while (tickCount + st(48) >= pf.start && pf.start + step <= at) {
+            auto const& pick = kept[pfMiddle(kept)];
+            std::vector<int> part;
+            for (int f : pick.flips) {
+                if (f < pf.start + step) {
+                    part.push_back(f);
+                }
+            }
+            std::vector<PfNode> agree;
+            for (auto& n : kept) {
+                std::vector<int> mine;
+                for (int f : n.flips) {
+                    if (f < pf.start + step) {
+                        mine.push_back(f);
+                    }
+                }
+                if (mine == part) {
+                    n.flips.erase(n.flips.begin(), n.flips.begin() + static_cast<long>(part.size()));
+                    agree.push_back(std::move(n));
+                    n.snap = nullptr;
+                }
+                else {
+                    pfGive(n);
+                }
+            }
+            kept = std::move(agree);
+            pf.base.insert(pf.base.end(), part.begin(), part.end());
+            pf.start += step;
+            ++pf.commits;
+            route.flips = pf.base;
+        }
+        if (tickCount + st(2) >= at) {
+            pf.frontier = std::move(kept);
+            pfFail(layer, "fell behind you");
+            return;
+        }
+        pf.frontier = std::move(kept);
+        pf.idx = 0;
+        pf.variant = 0;
+        pf.childrenOfNode = 0;
+    }
+
+    void routeTakeBack(PlayLayer* layer, PlayerObject* p1) {
+        int deeper = routeStuckHere(route.death);
+        if (route.groups.empty() || route.takebacks >= 8 + 6 * deeper || route.groups.back().first <= tickCount + 1) {
+            if (pfStart(layer, p1) || beamStart(layer, p1)) {  // test 57: the pathfinder in wave / ship
+                route.sprinting = false;
+                return;
+            }
+            routeStuck(layer, fmt::format("no input in the second before it gets through ({} taken back, {} times stuck here before)",
+                                  route.takebacks, deeper));
+            return;
+        }
+        auto g = route.groups.back();
+        route.groups.pop_back();
+        // v3.0 test 37: timings within 3 ticks of the one that failed aren't tried again; earlier
+        // AND later ones are (test 32-36 only looked earlier, and a jump that had to be a bit later
+        // was never found: Stereo Madness 20%)
+        for (int d = -st(10); d <= st(10); ++d) {  // test 40: was 3 (it walked one jump down 7 ticks at a time)
+            route.bannedFirst.insert(g.first + d);
+        }
+        route.afterTakeback = true;
+        while (!route.flips.empty() && route.flips.back() >= g.first) {
+            route.flips.pop_back();
+        }
+        ++route.takebacks;
+        route.sprinting = false;
+        routeKeepCps(g.first);
+    }
+
+    // one test of the search. Latest first: an input that gets well past the death is taken (the
+    // middle of the timings that do). v3.0 test 29: none does -> the one that got furthest is
+    // taken anyway, and the next death gets its own search (test 28 wanted one input to clear
+    // everything up to 0.2 s past the death, so a part that needs two quick inputs was "stuck")
+    void routeSprintStep(PlayLayer* layer, PlayerObject* p1) {
+        if (!route.orbFirst.empty() && route.windowHi < 0) {
+            int t = route.orbFirst.front();
+            route.orbFirst.erase(route.orbFirst.begin());
+            if (t >= route.lower && t < route.death && !route.bannedFirst.count(t)) {
+                bool tapMode = routeTapMode(t);
+                bool reclick = routeReclickMode(t);
+                auto const& cp = routeCpAtOrBefore(t);
+                int cpTick = cp.tick;
+                int length = route.death - cpTick + routeNeeded(t);
+                int lived = routeSim(layer, p1, cp, reclick ? routeReclick(t) : routeWith(t, tapMode), length, false);
+                ++route.orbTries;
+                route.orbBest = std::max(route.orbBest, cpTick + lived - route.death);
+                if (lived >= length) {
+                    routeAccept(layer, p1, t, t, reclick ? 1 : 0);  // the orb's middle gets through: taken as it is
+                    return;
+                }
+                if (cpTick + lived > route.bestEnd) {
+                    route.bestEnd = cpTick + lived;
+                    route.bestT = t;
+                    route.bestV = 0;
+                }
+            }
+            return;
+        }
+        if (route.cand < route.lower) {
+            if (route.windowHi >= 0) {
+                routeAccept(layer, p1, route.windowHi, route.lower, route.windowVariant);
+            }
+            else if (route.orbT >= 0) {
+                routeAccept(layer, p1, route.orbT, route.orbT, route.orbV);  // test 38: toward the orb
+            }
+            else if (route.bestT >= 0 && route.bestEnd >= route.death + st(6)) {
+                routeAccept(layer, p1, route.bestT, route.bestT, route.bestV);
+            }
+            else if (!route.fine) {
+                route.fine = true;  // the quick pass (every 2-3 ticks) found nothing: now every tick
+                route.cand = route.candStart;
+                route.variant = 0;
+            }
+            else if (route.bandOffUntil < route.death) {
+                // test 45: nothing works inside the band here: this stretch may go anywhere
+                auto const& cp = routeCpAtOrBefore(route.death);
+                if (cp.snap->m_isDart || cp.snap->m_isShip || route.death - route.cps.front().tick < st(720)) {
+                    route.bandOffUntil = route.death + st(240);
+                    route.sprinting = false;
+                    routeKeepCps(routeCpAtOrBefore(std::max(route.death - st(480), route.cps.front().tick)).tick);
+                }
+                else {
+                    routeTakeBack(layer, p1);
+                }
+            }
+            else {
+                routeTakeBack(layer, p1);
+            }
+            return;
+        }
+        int t = route.cand;
+        int step = route.fine ? 1 : routeCoarseStep(t);
+        if (route.bannedFirst.count(t)) {
+            route.cand -= step;
+            route.variant = 0;
+            return;
+        }
+        bool tapMode = routeTapMode(t);
+        bool reclickMode = routeReclickMode(t);
+        int variants = (tapMode || reclickMode) ? 2 : 1;
+        int v = route.windowHi >= 0 ? route.windowVariant : route.variant;
+        auto flips = (reclickMode && v == 1) ? routeReclick(t) : routeWith(t, tapMode && v == 0);
+        auto const& cp = routeCpAtOrBefore(t);
+        int cpTick = cp.tick;
+        int length = route.death - cpTick + routeNeeded(t);
+        int lived = routeSim(layer, p1, cp, flips, length, false);
+        bool ok = lived >= length;
+        ++route.sprintTests;
+        route.lowest = std::min(route.lowest, t);
+        if (!ok) {
+            // v3.0 test 38: does this input's path reach an orb (touched after the input)? Then the
+            // next search can click that orb (51% of Stereo Madness: a jump, then the orb above the
+            // pillar; the jump alone dies, so it never looked like the way)
+            for (auto const& [ring, touched] : buf.orbTouches) {
+                if (cpTick + touched > t && cpTick + lived >= route.death && cpTick + lived > route.orbEnd) {
+                    route.orbT = t;
+                    route.orbV = v;
+                    route.orbEnd = cpTick + lived;
+                    break;
+                }
+            }
+        }
+        if (cpTick + lived > route.bestEnd) {
+            route.bestEnd = cpTick + lived;
+            route.bestT = t;
+            route.bestV = v;
+        }
+        if (route.windowHi >= 0) {
+            // measuring the window of timings that work. v3.0 test 36: the WHOLE window (up to
+            // 0.25 s, 2 ticks a step): test 35 stopped after 8 ticks, so "the middle" was still
+            // the last moment possible and every easy jump came out late and frame perfect
+            int wstep = st(2);
+            if (!ok) {
+                routeAccept(layer, p1, route.windowHi, std::min(route.windowHi, t + wstep), route.windowVariant);
+            }
+            else if (route.windowHi - t >= st(60) || t - wstep < route.lower) {
+                routeAccept(layer, p1, route.windowHi, t, route.windowVariant);
+            }
+            else {
+                route.cand -= wstep;
+            }
+            return;
+        }
+        if (ok && route.afterTakeback) {
+            routeAccept(layer, p1, t, t, v);  // test 37: right after a take-back: this timing itself
+            return;
+        }
+        if (ok && !route.fine) {
+            // the quick pass found one: tick by tick from just above it, for the latest
+            route.fine = true;
+            route.variant = v;
+            route.cand = std::min(t + step - 1, route.candStart);
+            if (route.cand == t) {
+                route.windowHi = t;
+                route.windowVariant = v;
+                --route.cand;
+            }
+            return;
+        }
+        if (ok) {
+            route.windowHi = t;
+            route.windowVariant = v;
+            --route.cand;
+            return;
+        }
+        if (v + 1 < variants) {
+            route.variant = v + 1;
+        }
+        else {
+            route.variant = 0;
+            route.cand -= step;
+        }
+    }
+
+    // grow the route at its end; false when there's nothing to do
+    bool routeExtend(PlayLayer* layer, PlayerObject* p1) {
+        if (route.stuck || route.cps.size() >= static_cast<size_t>(SNAP_MAX) - 4) {
+            return false;
+        }
+        auto from = route.cps.back();
+        int length = std::min(st(240), tickCount + st(2400) - from.tick);
+        if (length < st(12)) {
+            return false;
+        }
+        // v3.0 test 38: still holding in a mode where holding means jumping again on every landing
+        // (a hold from the ship carried through a cube portal: it hopped along for no reason). Let
+        // go here if that does no worse.
+        if (from.held && !(from.snap->m_isDart || from.snap->m_isShip) && routeHeldAt(from.tick + 1) == from.held) {
+            int r = std::max(from.tick, tickCount + 1);
+            bool flipAtR = std::find(route.flips.begin(), route.flips.end(), r) != route.flips.end();
+            if (!flipAtR && (route.flips.empty() || route.flips.back() < r)) {
+                int keep = routeSim(layer, p1, from, route.flips, length, false);
+                auto f = route.flips;
+                f.push_back(r);
+                if (routeSim(layer, p1, from, f, length, false) >= keep) {
+                    route.flips.push_back(r);
+                    route.groups.push_back({ r, r });
+                }
+            }
+        }
+        int lived = routeSim(layer, p1, from, route.flips, length, true);
+        for (auto const& c : routeNewCps) {
+            route.cps.push_back(c);
+        }
+        route.pos.resize(std::max(0, from.tick - route.posBase));
+        route.pos.insert(route.pos.end(), routeRec.begin(), routeRec.end());
+        int got = static_cast<int>(routeRec.size());
+        route.changed = true;
+        if (lived >= length && got >= length) {
+            route.end = from.tick + length;
+            if (route.end > route.frontier + st(120)) {
+                route.takebacks = 0;  // well past the last hard spot: a new one gets its own 8
+            }
+            route.frontier = std::max(route.frontier, route.end);
+            return true;
+        }
+        if (lived >= length) {
+            // it stopped at something it can't go through (a portal it doesn't simulate)
+            route.end = from.tick + got;
+            route.death = route.end;
+            routeStuck(layer, "a portal the hidden player can't take");
+            return false;
+        }
+        route.end = from.tick + lived;
+        route.frontier = std::max(route.frontier, route.end);
+        std::vector<std::pair<int, int>> orbs;  // (first, last) touch ticks, absolute
+        for (size_t i = 0; i < buf.orbTouches.size() && i < buf.orbTouchLast.size(); ++i) {
+            orbs.push_back({ from.tick + buf.orbTouches[i].second, from.tick + buf.orbTouchLast[i] });
+        }
+        routeBeginSprint(from.tick + lived);
+        route.orbRanges = orbs;
+        // v3.0 test 35: orbs it went through on the way: a click in the middle of each is tried
+        // first, the nearest to the death first (orb clicks came out too early / late / missing)
+        for (auto it = orbs.rbegin(); it != orbs.rend(); ++it) {
+            int mid = (it->first + it->second) / 2;
+            if (mid >= route.lower && mid < route.death) {
+                route.orbFirst.push_back(mid);
+            }
+        }
+        return true;
+    }
+
+    void routeDraw(PlayerObject* p1) {
+        auto* d = autoplay.trailNode;
+        if (!d || (!route.changed && tickCount - route.drawnAt < st(6))) {  // test 49: redrawn ~40x a second
+            return;
+        }
+        route.changed = false;
+        route.drawnAt = tickCount;
+        d->clear();
+        int from = std::max(0, tickCount - route.posBase);
+        CCPoint prev = p1->getPosition();
+        int step = std::max(1, st(4));
+        for (int k = from; k < static_cast<int>(route.pos.size()); k += step) {
+            auto const& pt = route.pos[k];
+            if (std::abs(pt.x - prev.x) < 150.f && std::abs(pt.y - prev.y) < 150.f) {
+                d->drawSegment(prev, pt, 1.2f, { 0.35f, 1.f, 0.65f, 1.f });
+            }
+            prev = pt;
+        }
+        bool held = route.originHeld;
+        for (int f : route.flips) {
+            held = !held;
+            int k = f - route.posBase - 1;
+            if (f >= tickCount && k >= 0 && k < static_cast<int>(route.pos.size())) {
+                d->drawDot(route.pos[k], held ? 3.f : 2.f, held ? ccColor4F { 0.3f, 0.95f, 1.f, 1.f } : ccColor4F { 1.f, 0.45f, 0.75f, 1.f });
+            }
+        }
+        if (route.stuck) {
+            int k = route.stuckAt - route.posBase - 1;
+            if (k >= 0 && k < static_cast<int>(route.pos.size())) {
+                d->drawDot(route.pos[k], 5.f, { 1.f, 0.2f, 0.2f, 1.f });
+            }
+        }
+    }
+
+    // v3.0 test 46: the route starts again from where you are, keeping its inputs still to come
+    // (they're checked again from here). Used by the re-check and, since test 46, by a drift (test
+    // 45 threw the whole route away on a 5-unit drift, right before a spike, with no time to plan)
+    bool routeRebase(PlayLayer* layer, PlayerObject* p1) {
+            std::vector<int> future;
+            std::vector<RouteGroup> futureGroups;
+            for (int f : route.flips) {
+                if (f >= tickCount) {
+                    future.push_back(f);
+                }
+            }
+            for (auto const& g : route.groups) {
+                if (g.first >= tickCount) {
+                    futureGroups.push_back(g);
+                }
+            }
+            // the button just before this tick's own inputs, as the old route had it
+            bool heldNow = routeHeldAt(tickCount);
+            routeStart(layer, p1);
+            if (!route.active) {
+                return false;
+            }
+            route.originHeld = heldNow;
+            route.cps.front().held = heldNow;
+            route.flips = future;
+            route.groups = futureGroups;
+        return true;
+    }
+
+    // a tick of autoplay with the route; false = the route has nothing here (the short planner goes on)
+    // test 64: what you and the ghost touch, for the step check
+    std::string stepWhat(PlayerObject* p) {
+        auto obj = [](GameObject* o) {
+            return o ? fmt::format("{}@{:.0f},{:.0f}", o->m_objectID, o->getPositionX(), o->getPositionY()) : std::string("-");
+        };
+        return fmt::format("y {:.2f} vy {:.3f} ground {} slope {} upside {} hit {} on {} slopeObj {}", p->getPositionY(), p->m_yVelocity,
+            p->m_isOnGround ? 1 : 0, p->m_isOnSlope ? 1 : 0, p->m_isUpsideDown ? 1 : 0, obj(p->m_collidedObject), obj(p->m_lastGroundObject),
+            obj(p->m_currentSlope));
+    }
+
+    void stepCheck(PlayLayer* layer, PlayerObject* p1) {
+        auto& c = stepChk;
+        if (!c.snap || c.tick != tickCount - 1 || p1->m_isDead) {
+            return;
+        }
+        std::vector<int> flips;
+        if (c.want != c.held) {
+            flips.push_back(c.tick);
+        }
+        RoutePoint from { c.tick, c.snap, c.held, c.hasB, c.lo, c.hi };
+        routeSim(layer, p1, from, flips, 1, false);
+        auto* g = buf.ghost1;
+        if (!g) {
+            return;
+        }
+        ++c.steps;
+        float d = std::max(std::abs(g->getPositionX() - p1->getPositionX()), std::abs(g->getPositionY() - p1->getPositionY()));
+        if (d > 0.1f) {
+            ++c.off;
+        }
+        if (d > c.maxD) {
+            c.maxD = d;
+            c.maxAt = p1->getPosition();
+        }
+        if (d > 0.5f && c.logged < 24) {
+            ++c.logged;
+            say("step check tick {} ({}{}): ghost {:.2f} units off after one tick at x {:.0f}", c.tick, MODE_NAMES[modeIndex(p1, nullptr)],
+                c.want != c.held ? ", button changed" : "", d, p1->getPositionX());
+            say("   you:   {}", stepWhat(p1));
+            say("   ghost: {}", stepWhat(g));
+            say("   before: {}", stepWhat(c.snap));
+        }
+        if (tickCount - c.lastSummary >= st(2400)) {
+            c.lastSummary = tickCount;
+            say("step check: {} ticks, {} off by more than 0.1, most {:.2f} at x {:.0f} y {:.0f}", c.steps, c.off, c.maxD, c.maxAt.x, c.maxAt.y);
+            c.maxD = 0.f;
+        }
+    }
+
+    // test 92: the FPS guard. Your usual frame time is learned (the fastest frames of the last few
+    // seconds); while frames take over 15% longer than that, autoplay plans with less time a frame
+    // and checks less often, and goes back up slowly once they're quick again
+    double fpsScale = 1.0;
+    double frameBest = 0.0;
+    int frameBestAge = 0;
+    double frameAvg = 0.0;
+    int fpsLogged = 0;
+
+    void frameGuard(double frameMs) {
+        if (frameMs > 200.0) {
+            return;  // a hitch (loading, pausing), not the normal speed
+        }
+        if (frameBest <= 0.0 || frameMs < frameBest || ++frameBestAge > 600) {
+            frameBest = frameMs;
+            frameBestAge = 0;
+        }
+        frameAvg = frameAvg <= 0.0 ? frameMs : frameAvg * 0.9 + frameMs * 0.1;
+        double before = fpsScale;
+        if (frameAvg > frameBest * 1.15) {
+            fpsScale = std::max(0.25, fpsScale * 0.92);
+        }
+        else {
+            fpsScale = std::min(1.0, fpsScale * 1.01);
+        }
+        if (before >= 0.5 && fpsScale < 0.5 && fpsLogged < 5) {
+            ++fpsLogged;
+            say("autoplay: frames are slow ({:.1f} ms, usually {:.1f}): it plans with less time a frame for now", frameAvg, frameBest);
+        }
+    }
+
+    bool routeTick(PlayLayer* layer, PlayerObject* p1, int at) {
+        if (snapAll.empty() || snapOwner != layer) {
+            return false;
+        }
+        // test 92: a debug tool: only with Drift Check on, and every 8th tick (it ran every tick)
+        bool sampleStep = buf.driftCheck && tickCount % 8 == 0;
+        if (sampleStep) {
+            stepCheck(layer, p1);
+        }
+        stepChk.tick = -1;
+        // are you where the route said you'd be?
+        if (route.active && tickCount - 1 >= route.origin) {
+            int k = tickCount - 1 - route.posBase;
+            if (k >= 0 && k < static_cast<int>(route.pos.size())) {
+                auto want = route.pos[k];
+                auto now = p1->getPosition();
+                // v3.0 test 54: only a big difference (10 units) replans at once; a small one is left to
+                // the re-check from you, which replans only if it finds a death (a 5-unit ship
+                // difference replanned 0.3 s before a wave portal: Aquamarine 69%)
+                if (!pf.active && (std::abs(want.x - now.x) > 10.f || std::abs(want.y - now.y) > 10.f)) {  // test 58: not while the pathfinder gives you its inputs
+                    if (routeDrifts < 12) {
+                        ++routeDrifts;
+                        say("route drift at tick {} ({}): you're at {:.0f},{:.0f}, the route said {:.0f},{:.0f}, planning again from you", at,
+                            MODE_NAMES[modeIndex(p1, nullptr)], now.x, now.y, want.x, want.y);
+                    }
+                    if (!routeRebase(layer, p1)) {
+                        return false;
+                    }
+                }
+            }
+        }
+        // a stuck route you got well past (the short planner found a way): a new one from you
+        if (route.active && route.stuck && tickCount > route.stuckAt + st(60)) {
+            routeReset();
+        }
+        if (!route.active) {
+            routeStart(layer, p1);
+            if (!route.active) {
+                return false;
+            }
+        }
+        // v3.0 test 30: what moves is only known well once you're close (the objects have been seen
+        // moving). Every 0.05 s the next 1.25 s of the route are played again from you, with the
+        // objects as they are now; if that dies sooner than the route said, the route is planned
+        // again from you, keeping its inputs still to come (they're checked again from there)
+        // v3.0 test 49: every 6 ticks (was 12), from where you really are, with the path compared too
+        // v3.0 test 61: also while it looks for a way past a stuck spot further on, or the pathfinder
+        // runs (tests 27-60 stopped checking then, so an object that moved into the path you were
+        // following wasn't seen and you flew into it). Then only a death sooner than the one it
+        // already knows about counts, and the path isn't re-anchored.
+        bool busy = route.sprinting || pf.active;
+        int checkEnd = route.end;
+        if (pf.active) {
+            checkEnd = pf.commits > 0 ? pf.start : std::min(route.end, pf.death);
+        }
+        // test 92: 20 times a second (was 40), 10 when frames are slow
+        int recheckEvery = fpsScale < 0.6 ? st(24) : st(12);
+        if (route.active && tickCount - route.lastRecheck >= recheckEvery && checkEnd - tickCount > st(6)) {
+            route.lastRecheck = tickCount;
+            RoutePoint here { tickCount, nullptr, buf.appliedInput };
+            int length = std::min(checkEnd, tickCount + (fpsScale < 0.6 ? st(480) : st(720))) - tickCount;  // test 63: 3 s ahead (test 92: 2 s while frames are slow)
+            int lived = routeSim(layer, p1, here, route.flips, length, true);
+            // the route's path off from where you'll really go (more than 3 units, while both live):
+            // the route is put back onto you, keeping its inputs
+            // v3.0 test 56: the route was planned far ahead, where the ghost sees some parts slightly
+            // differently (Aquamarine's ship parts: 10 units off at the same spots every time, also
+            // without Click Between Frames). Seen from near you it's right, so when the next second
+            // seen from you leaves the route by more than 4 units, the route is put back onto you
+            // now (~1 s before the spot), keeping its inputs; at most every 0.25 s
+            bool off = false;
+            CCPoint offAt {};
+            float offBy = 0.f;
+            for (int k = 0; k < static_cast<int>(routeRec.size()) && k < lived; k += 2) {
+                int i = tickCount + k - route.posBase;
+                if (i < 0 || i >= static_cast<int>(route.pos.size())) {
+                    break;
+                }
+                float d = std::max(std::abs(routeRec[k].x - route.pos[i].x), std::abs(routeRec[k].y - route.pos[i].y));
+                if (d > 4.f) {
+                    off = true;
+                    offAt = route.pos[i];
+                    offBy = d;
+                    break;
+                }
+            }
+            if (off && !busy && lived >= length && tickCount - route.lastAnchor >= st(60)) {
+                route.lastAnchor = tickCount;
+                if (routeRechecks < 16) {
+                    ++routeRechecks;
+                    int slopes = 0;
+                    int b = static_cast<int>(std::floor(offAt.x / 64.f));
+                    for (int kk = b - 2; kk <= b + 2; ++kk) {
+                        auto it = buf.objIndex.find(kk);
+                        if (it == buf.objIndex.end()) {
+                            continue;
+                        }
+                        for (auto* o : it->second) {
+                            if (o->m_objectType == GameObjectType::Slope && std::abs(o->m_positionX - offAt.x) < 90.f &&
+                                std::abs(o->m_positionY - offAt.y) < 90.f) {
+                                ++slopes;
+                            }
+                        }
+                    }
+                    say("route re-anchored on you at tick {}: {:.0f} units off ahead at x {:.0f} y {:.0f} ({} slopes near it), inputs kept", at,
+                        offBy, offAt.x, offAt.y, slopes);
+                }
+                if (!routeRebase(layer, p1)) {
+                    return false;
+                }
+                route.lastRecheck = tickCount;
+            }
+            // test 33: one re-check isn't enough unless the death is close (guesses about moving
+            // objects wobble, and every replan changed the path you see)
+            route.recheckFails = lived < length ? route.recheckFails + 1 : 0;
+            if (lived < length && (lived < st(90) || route.recheckFails >= 2 || (busy && lived < length - st(6)))) {
+                if (routeRechecks < 12) {
+                    ++routeRechecks;
+                    say("route re-check at tick {}: it now dies {} ticks ahead, not past {} (something moved): planned again from you", at,
+                        lived, length);
+                }
+                if (!routeRebase(layer, p1)) {
+                    return false;
+                }
+                route.lastRecheck = tickCount;
+            }
+        }
+        // the route's saved states behind you aren't needed any more
+        while (route.cps.size() > 1 && route.cps[1].tick <= tickCount) {
+            snapFree.push_back(route.cps.front().snap);
+            route.cps.erase(route.cps.begin());
+        }
+
+        // plan: a slice of the frame
+        unsigned frame = CCDirector::get()->getTotalFrames();
+        if (frame != autoplay.frame) {
+            autoplay.frame = frame;
+            autoplay.frameMs = 0.0;
+        }
+        double frameMs = std::max(1.0, CCDirector::get()->getDeltaTime() * 1000.0);
+        frameGuard(frameMs);
+        // v3.0 test 44: back to about half a frame (test 35's double time dropped the FPS)
+#ifdef GEODE_IS_MOBILE
+        double budget = std::clamp(frameMs * 0.5, 2.0, 5.0);
+#else
+        double budget = std::clamp(frameMs * 0.5, 2.0, 8.0);
+#endif
+        if (route.end - tickCount < st(60) || pf.active) {
+            budget *= 1.5;  // the planned part is about to run out (test 58: or the pathfinder is racing you)
+        }
+        // test 92: never more than your Prediction Budget setting, and less while frames are slow
+        budget = std::min(budget, std::max(2.0, buf.userBudget * 1.25)) * fpsScale;
+        auto start = std::chrono::steady_clock::now();
+        double left = budget - autoplay.frameMs;
+        while (left > 0.2) {
+            if (pf.active) {
+                pfStep(layer, p1);
+            }
+            else if (beam.active) {
+                beamStep(layer, p1);
+            }
+            else if (route.sprinting) {
+                routeSprintStep(layer, p1);
+            }
+            else if (!routeExtend(layer, p1)) {
+                break;
+            }
+            double used = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            left = budget - autoplay.frameMs - used;
+        }
+        sweepGhostLayer();
+        autoplay.frameMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+
+        if (tickCount >= route.end && route.stuck) {
+            return false;  // stuck here: the short planner looks after this part
+        }
+        // (test 28: while the route is being redone from a saved state behind you, you keep its
+        // inputs: test 27 let the short planner press here, which put you off the route, and the
+        // route started over from nothing again and again)
+        // the button as the route has it for this tick
+        bool want = route.originHeld;
+        for (int f : route.flips) {
+            if (f > tickCount) {
+                break;
+            }
+            want = !want;
+        }
+        if (stepChk.snap && !p1->m_isDead && buf.driftCheck && (tickCount + 1) % 8 == 0) {
+            // test 64: your state now, played one tick by the ghost next time
+            copyState(stepChk.snap, p1);
+            stepChk.tick = tickCount;
+            stepChk.held = buf.appliedInput;
+            stepChk.want = want;
+            realBounds(layer, p1, stepChk.hasB, stepChk.lo, stepChk.hi);
+        }
+        autoplaySet(layer, want);
+        autoplay.plan.clear();
+        autoplay.verifyAt = -1;
+        autoplay.planSafeUntil = at + std::max(0, route.end - tickCount);
+        if (!route.stuck) {
+            autoplay.killer = "the route said this was safe";
+        }
+        routeDraw(p1);
+        return true;
+    }
+
+    void buildObjIndex(PlayLayer* layer) {
+        buf.objIndex.clear();
+        if (!layer->m_objects) {
+            return;
+        }
+        uint64_t keep = COLLIDING_TYPES | INTERACT_TYPES | STOP_TYPES | SIZE_TYPES;
+        for (auto* o : CCArrayExt<GameObject*>(layer->m_objects)) {
+            if (!o) {
+                continue;
+            }
+            auto type = static_cast<unsigned>(o->m_objectType);
+            uint64_t bit = type < 64 ? (1ull << type) : 0;
+            if (!(keep & bit) && speedPortalValue(o->m_objectID) <= 0.f) {
+                continue;
+            }
+            buf.objIndex[static_cast<int>(std::floor(o->m_positionX / 64.f))].push_back(o);
+        }
+    }
+
+    // ===== test 72: macros pressed like a bot =====
+    // test 74: the game's step counter goes up by 2 a step (the macro's frames by 1: tests 70-73
+    // played every macro at double speed). How much it moves a step is measured, and the macro's
+    // step is the counter divided by that
+    int progressPerStep = 0;
+    int lastProgress = -1;
+    int progressPerStepNow() {
+        return progressPerStep > 0 ? progressPerStep : 2;
+    }
+
+    void measureProgress(PlayLayer* layer) {
+        int p = static_cast<int>(layer->m_gameState.m_currentProgress);
+        int d = p - lastProgress;
+        if (lastProgress >= 0 && d >= 1 && d <= 8 && d != progressPerStep) {
+            progressPerStep = d;
+            say("macro: the game's step counter moves {} a step", d);
+        }
+        lastProgress = p;
+    }
+
+    int macroNow(PlayLayer* layer) {
+        int per = progressPerStep > 0 ? progressPerStep : 2;
+        return static_cast<int>(layer->m_gameState.m_currentProgress) / per + macroOffsetSetting + autoplay.macroAutoOffset;
+    }
+
+    // test 73: a macro without position records only lines up from the level's start (test 71/72
+    // played it by step from a start position too: the wrong inputs in the wrong places)
+    bool macroUsable(PlayLayer* layer) {
+        if (autoplay.macro.empty() || layer->m_isPracticeMode) {
+            return false;
+        }
+        autoplay.macroByX = layer->m_startPosObject && !autoplay.macroX.empty();
+        return !layer->m_startPosObject || autoplay.macroByX;
+    }
+
+    bool macroGapAt(int step) {
+        for (auto const& [a, b] : autoplay.macroGaps) {
+            if (step >= a && step < b) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool macroPlaying(PlayLayer* layer, PlayerObject* p1) {
+        if (!macroUsable(layer)) {
+            return false;
+        }
+        if (autoplay.macroByX) {
+            return autoplay.macroIdx < autoplay.macro.size();
+        }
+        int now = macroNow(layer);
+        bool gap = macroGapAt(now);
+        if (gap != autoplay.macroInGap) {
+            autoplay.macroInGap = gap;
+            if (gap) {
+                // test 82 (like Nova): the route starts from you holding the macro's own inputs and checks
+                // them with the ghost; only where they'd die does it look for others (test 75 planned the
+                // stretch from nothing, with half a second to do it)
+                routeStart(layer, p1);
+                if (route.active) {
+                    int base = tickCount - autoplay.macroStepNow;
+                    route.flips.clear();
+                    route.groups.clear();
+                    for (auto const& [m, down] : autoplay.macro) {
+                        int t = base + m;
+                        if (m >= autoplay.macroStepNow && t > tickCount) {
+                            route.flips.push_back(t);
+                            route.groups.push_back({ t, t });
+                        }
+                    }
+                }
+                say("autoplay: plans the stretch the macro dies in (from step {}), starting from the macro's own inputs", now);
+            }
+            else {
+                // back to the macro: its button as it has it here
+                size_t idx = 0;
+                while (idx < autoplay.macro.size() && autoplay.macro[idx].first < now) {
+                    ++idx;
+                }
+                autoplay.macroIdx = idx;
+                autoplaySet(layer, idx > 0 && autoplay.macro[idx - 1].second);
+                say("autoplay: back to the macro at step {}", now);
+            }
+        }
+        return !gap && now < autoplay.macroEnd;
+    }
+
+    // the game's own button path (handleButton), as macro bots press
+    void macroPress(PlayLayer* layer, bool down) {
+        if (buf.appliedInput == down) {
+            return;
+        }
+        buf.injecting = true;
+        buf.appliedInput = down;
+        layer->handleButton(down, 1, true);
+        buf.injecting = false;
+        ++autoplay.inputs;
+        autoplay.attemptFlips.push_back({ autoplay.attemptTick, down });
+        brainRecord(layer, down);
+    }
+
+    void macroApplyFix(PlayLayer* layer, PlayerObject* p1, int now);
+    // test 84: player 2's button in a 2-player level
+    void macroPress2(PlayLayer* layer, bool down) {
+        if (autoplay.held2 == down) {
+            return;
+        }
+        buf.injecting = true;
+        autoplay.held2 = down;
+        layer->handleButton(down, 1, false);
+        buf.injecting = false;
+        ++autoplay.inputs;
+    }
+
+    // at the start of each game step, before the players move
+    void macroStep(PlayLayer* layer) {
+        if (!autoplay.active || autoplay.layer != layer || autoplay.macro.empty() || layer->m_isPracticeMode || buf.simulating) {
+            return;
+        }
+        if (progressPerStep <= 0) {
+            return;  // one more step to know how the counter moves
+        }
+        autoplay.macroStepNow = macroNow(layer);
+        if (!macroUsable(layer)) {
+            if (autoplay.macroSyncedFor != autoplay.attemptNo) {
+                autoplay.macroSyncedFor = autoplay.attemptNo;
+                say("autoplay: the macro {} has no position records, so it only plays from the level's start: autoplay plays this start position itself",
+                    autoplay.fromMacro);
+            }
+            return;
+        }
+        auto* p1 = layer->m_player1;
+        if (!p1 || p1->m_isDead || (autoplay.takeOver && tickCount < autoplay.userUntil)) {
+            return;
+        }
+        int now = macroNow(layer);
+        float px = p1->getPositionX();
+        // the macro picks up where the attempt is: by step from the level's start, by x from a start pos
+        if (autoplay.macroSyncedFor != autoplay.attemptNo) {
+            autoplay.macroSyncedFor = autoplay.attemptNo;
+            size_t idx = 0;
+            while (idx < autoplay.macro.size() && (autoplay.macroByX ? autoplay.macroX[idx] <= px : autoplay.macro[idx].first < now)) {
+                ++idx;
+            }
+            autoplay.macroIdx = idx;
+            autoplay.macroLogged = false;
+            macroPress(layer, idx > 0 && autoplay.macro[idx - 1].second);
+            if (autoplay.macroTwoPlayer) {
+                size_t i2 = 0;
+                while (i2 < autoplay.macroP2.size() && autoplay.macroP2[i2].first < now) {
+                    ++i2;
+                }
+                autoplay.macroIdx2 = i2;
+                autoplay.held2 = !(i2 > 0 && autoplay.macroP2[i2 - 1].second);  // so the next line presses it either way
+                macroPress2(layer, i2 > 0 && autoplay.macroP2[i2 - 1].second);
+            }
+            say("autoplay: playing the macro {} (it comes first) from {}", autoplay.fromMacro,
+                autoplay.macroByX ? fmt::format("x {:.0f}", px) : fmt::format("step {}", now));
+        }
+        if (!autoplay.macroByX && (now >= autoplay.macroEnd || macroGapAt(now))) {
+            return;
+        }
+        if (!autoplay.macroByX && autoplay.macroInGap) {
+            return;  // leaving a gap is handled once a step in macroPlaying
+        }
+        while (autoplay.macroIdx < autoplay.macro.size() &&
+               (autoplay.macroByX ? autoplay.macroX[autoplay.macroIdx] <= px : autoplay.macro[autoplay.macroIdx].first <= now)) {
+            if (!autoplay.macroLogged) {
+                autoplay.macroLogged = true;
+                say("macro: an input for step {} went in at step {} (x {:.1f})", autoplay.macro[autoplay.macroIdx].first, now, px);
+            }
+            macroPress(layer, autoplay.macro[autoplay.macroIdx].second);
+            ++autoplay.macroIdx;
+        }
+        if (autoplay.macroTwoPlayer && !autoplay.macroByX) {
+            while (autoplay.macroIdx2 < autoplay.macroP2.size() && autoplay.macroP2[autoplay.macroIdx2].first <= now) {
+                macroPress2(layer, autoplay.macroP2[autoplay.macroIdx2].second);
+                ++autoplay.macroIdx2;
+            }
+        }
+        macroApplyFix(layer, p1, now);
+    }
+
+    // test 89 (as xdBot plays its macros): the bot's position record nearest where you are (by x, the
+    // part that doesn't drift) puts you back on the macro's height and angle when you're slightly off,
+    // so small physics differences don't add up into a death
+    void macroApplyFix(PlayLayer* layer, PlayerObject* p1, int now) {
+        if (autoplay.macroFixes.empty() || !macroFixesSetting) {
+            return;
+        }
+        auto& fx = autoplay.macroFixes;
+        auto it = std::lower_bound(fx.begin(), fx.end(), now - 3, [](MacroFix const& f, int v) { return f.frame < v; });
+        float px = p1->getPositionX();
+        MacroFix const* best = nullptr;
+        for (; it != fx.end() && it->frame <= now + 2; ++it) {
+            if (!best || std::abs(it->x - px) < std::abs(best->x - px)) {
+                best = &*it;
+            }
+        }
+        if (!best || std::abs(best->x - px) > 2.5f) {
+            return;  // no record here, or you're somewhere else (a teleport): leave it
+        }
+        auto fix = [&](PlayerObject* p, float y, float r) {
+            float dy = y - p->getPositionY();
+            if (std::abs(dy) < 0.01f || std::abs(dy) > 20.f) {
+                return;
+            }
+            p->setPositionY(y);
+            p->setRotation(r);
+            ++autoplay.macroFixCount;
+            autoplay.macroFixMax = std::max(autoplay.macroFixMax, std::abs(dy));
+        };
+        fix(p1, best->y, best->r);
+        if (best->p2 && layer->m_gameState.m_isDualMode && layer->m_player2 && !layer->m_player2->m_isDead) {
+            fix(layer->m_player2, best->y2, best->r2);
+        }
+    }
+
+    void autoplayTick(PlayLayer* layer, PlayerObject* p1) {
+        if (!autoplay.active || autoplay.layer != layer || p1->m_isDead || !buf.ghost1 || buf.owner != layer) {
+            return;
+        }
+        measureProgress(layer);  // test 74: once a physics step
+        // Take Over: your clicks go first; the bot plans again once you've stopped for a moment
+        if (autoplay.takeOver && tickCount < autoplay.userUntil) {
+            autoplay.plan.clear();
+            autoplay.verifyAt = -1;
+            return;
+        }
+        resetPending();
+        int at = autoplay.attemptTick++;
+        if (at % trailEvery() == 0 && static_cast<size_t>(at / trailEvery()) == autoplay.attemptTrail.size()) {
+            autoplay.attemptTrail.push_back(p1->getPosition());
+        }
+        // what it learned in earlier attempts: replayed exactly, no searching
+        // (not in an attempt autoplay was started in the middle of: the inputs are from the start)
+        // v3.0 test 40: not while the route plans (it replayed the inputs that led into a dead end
+        // right up to it, so the route had no room: Stereo Madness 60%, 3 deaths on the same tick).
+        // Only a whole level learned to the end is replayed.
+        // test 70: a macro: played by the game's step counter from the start of the attempt, the way
+        // bots play it, up to where it keeps dying (then the route plans from there)
+        // test 72: the macro is pressed at the start of the game's step (macroStep, from
+        // GJBaseGameLayer::processCommands) the way bots play macros; here autoplay just doesn't plan
+        // while the macro plays
+        if (macroPlaying(layer, p1)) {
+            return;
+        }
+        bool replayOk = autoplay.macro.empty();  // test 43: back on, up to 3 s before the last death (see autoplayDied); test 70: not with a macro
+        if (replayOk && !layer->m_isPracticeMode && !autoplay.userTouched && at < autoplay.knownUntil) {
+            while (autoplay.replayIdx < autoplay.known.size() && autoplay.known[autoplay.replayIdx].first <= at) {
+                if (autoplay.known[autoplay.replayIdx].first == at) {
+                    autoplaySet(layer, autoplay.known[autoplay.replayIdx].second);
+                }
+                ++autoplay.replayIdx;
+            }
+            return;
+        }
+        bool dual = layer->m_gameState.m_isDualMode && layer->m_player2;
+        // v3.0 test 27: the long route (not in dual parts: the short planner does those)
+        if (!dual && routeTick(layer, p1, at)) {
+            return;
+        }
+        if (dual && route.active) {
+            routeReset();
+        }
+        auto* p2 = dual ? layer->m_player2 : nullptr;
+        bool holdMode = p1->m_isDart || p1->m_isShip || (p2 && (p2->m_isDart || p2->m_isShip));
+        // v3.0 test 17: the plan reaches 1.5 s ahead (300 ticks flying, 360 on the ground) and is
+        // extended at its far end every frame. A hard part is planned for while it's still far
+        // away (dozens of frames of search instead of one or two), and the next few ticks are
+        // already settled, so nothing is decided at the last moment.
+        bool flyer = isFlying(p1) || (p2 && isFlying(p2));
+        PlanCtx c { layer, p1, p2, dual, st(flyer ? 300 : 360), buf.appliedInput, holdMode };
+        c.at = at;
+        c.banned = layer->m_isPracticeMode ? nullptr : &autoplay.banned;
+
+        // follow the plan: flips due now (the queued plans were built before it, so they go)
+        while (!autoplay.plan.empty() && autoplay.plan.front() <= tickCount) {
+            autoplay.plan.erase(autoplay.plan.begin());
+            autoplayFlip(layer);
+            clearQueue();
+        }
+        c.held0 = buf.appliedInput;
+        if (tickCount < autoplay.verifyAt) {
+            return;
+        }
+        unsigned frame = CCDirector::get()->getTotalFrames();
+        if (frame != autoplay.frame) {
+            autoplay.frame = frame;
+            autoplay.frameMs = 0.0;
+        }
+        // v3.0 test 17: about 45% of a frame for planning (so the frame rate holds at any FPS),
+        // at most 8 ms on PC and 5 ms on phones
+        double frameMs = std::max(1.0, CCDirector::get()->getDeltaTime() * 1000.0);
+#ifdef GEODE_IS_MOBILE
+        double frameBudget = std::clamp(frameMs * 0.45, 2.0, 5.0);
+#else
+        double frameBudget = std::clamp(frameMs * 0.45, 2.0, 8.0);
+#endif
+        if (at < st(6)) {
+            frameBudget *= 3.0;  // the first ticks of an attempt or a respawn: plan properly at once
+        }
+        double left = frameBudget - autoplay.frameMs;
+        if (autoplay.generating) {
+            left = 3.0;  // test 26: short looks while it's safe, long ones only near a crash (below)
+        }
+        if (left < 0.25) {
+            return;  // this frame's time is used up: keep following the plan, look again next frame
+        }
+        autoplay.searchStart = std::chrono::steady_clock::now();
+        autoplay.searchCap = left;
+
+        float savedStep = buf.firstStep;
+        buf.firstStep = 1.f;  // autoplay acts at the start of a tick: the ghost's first step is whole
+        buf.fullHorizon = true;
+        std::vector<int> rel;
+        for (int t : autoplay.plan) {
+            rel.push_back(t - tickCount);
+        }
+        bool seeded = false;
+        if (rel.empty() && c.held0 && !c.holdMode) {
+            rel.push_back(0);  // outside wave / ship, holding means jumping again and again: let go
+            seeded = true;
+        }
+        autoplay.sims = 0;
+        int survived = simulatePlan(c, rel);
+        bool changed = seeded;
+        if (survived < st(30)) {
+            // a crash is close: this frame may take longer (a tiny hitch beats a death)
+            autoplay.searchCap = std::max(autoplay.searchCap, autoplay.generating ? 40.0 : frameBudget * 2.0);
+        }
+        if (survived >= c.horizon) {
+            autoplay.stuck = 0;
+        }
+        else {
+            // v3.0 test 20: work through the queue of plans, carrying on from last frame
+            std::vector<int> curAbs;
+            for (int t : rel) {
+                curAbs.push_back(tickCount + t);
+            }
+            if (autoplay.queue.empty()) {
+                autoplay.seen.clear();
+                autoplay.seen.insert(curAbs);
+                simulatePlan(c, rel);  // for the orbs it touches
+                auto orbs = buf.orbTouches;
+                enqueueChildren(c, curAbs, survived, orbs);
+                autoplay.queueBase = tickCount;
+            }
+            int startLen = survived;
+            while (!autoplay.queue.empty() && !planOutOfTime() && survived < c.horizon) {
+                std::pop_heap(autoplay.queue.begin(), autoplay.queue.end());
+                auto item = std::move(autoplay.queue.back());
+                autoplay.queue.pop_back();
+                std::vector<int> r;
+                bool stale = false;
+                for (int t : item.plan) {
+                    stale = stale || t < tickCount;
+                    r.push_back(t - tickCount);
+                }
+                if (stale) {
+                    continue;
+                }
+                int len = simulatePlan(c, r);
+                auto orbs = buf.orbTouches;
+                if (len > item.score && !item.plan.empty()) {
+                    // the newest press: the first flip added after the parent (a tap adds two)
+                    int pressIndex = static_cast<int>(item.plan.size()) - 1;
+                    if (pressIndex > 0 && !c.holdMode) {
+                        bool tapRelease = (c.held0 != (pressIndex % 2 == 1)) && item.plan[pressIndex] - item.plan[pressIndex - 1] <= st(10);
+                        if (tapRelease) {
+                            --pressIndex;
+                        }
+                    }
+                    enqueueNeighbours(c, item.plan, len, pressIndex);
+                }
+                if (len > survived) {
+                    // only a plan that really lasts longer replaces the current one (v3.0 test 16
+                    // also switched to equally bad plans: the wave turned for no reason)
+                    rel = r;
+                    survived = len;
+                    changed = true;
+                }
+                if (len < c.horizon) {
+                    enqueueChildren(c, item.plan, len, orbs);
+                }
+            }
+            bool timedOut = planOutOfTime();
+            if (survived > startLen) {
+                autoplay.stuck = 0;
+            }
+            else if (autoplay.queue.empty() && (!timedOut || ++autoplay.stuck >= 3)) {
+                // nothing better from here: take back the last flip that isn't about to happen, mark
+                // it as failed there, and look for another way from the shorter plan
+                autoplay.stuck = 0;
+                for (size_t i = rel.size(); i-- > 0;) {
+                    if (rel[i] > st(12)) {
+                        if (c.banned) {
+                            autoplay.banned.insert(at + rel[i]);
+                        }
+                        if (autoplay.reports < 8) {
+                            ++autoplay.reports;
+                            say("autoplay backs up at tick {} ({}): drops the flip at tick {} (plan lasted {} of {})", at,
+                                MODE_NAMES[modeIndex(p1, p2)], at + rel[i], survived, c.horizon);
+                        }
+                        rel.resize(i);
+                        changed = true;
+                        survived = simulatePlan(c, rel);
+                        clearQueue();
+                        break;
+                    }
+                }
+            }
+        }
+        // v3.0 test 18: when the plan still crashes soon, what kills the ghost (logged at a death)
+        if (survived < c.horizon && survived < st(90)) {
+            buf.captureKiller = true;
+            buf.killerSeen = false;
+            buf.baseTouchedDown = false;
+            buf.baseEscape = -1;
+            simulatePlan(c, rel);
+            buf.captureKiller = false;
+            if (buf.killerSeen) {
+                autoplay.killer = fmt::format("ghost hit object {} (type {}{}{}) at x {:.0f} y {:.0f} when at x {:.0f} y {:.0f}", buf.killerId,
+                    buf.killerType, buf.killerNoTouch ? ", no-touch" : "", buf.killerDisabled ? ", disabled" : "", buf.killerRect.getMidX(),
+                    buf.killerRect.getMidY(), buf.ghostDeathRect.getMidX(), buf.ghostDeathRect.getMidY());
+            }
+            else {
+                autoplay.killer = "ghost didn't hit an object (fell out of the level, or stopped)";
+            }
+        }
+        else {
+            autoplay.killer = "ghost thought this was safe";
+        }
+        buf.fullHorizon = false;
+        buf.firstStep = savedStep;
+        sweepGhostLayer();
+        autoplay.frameMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - autoplay.searchStart).count();
+        if (changed) {
+            autoplay.plan.clear();
+            for (int t : rel) {
+                autoplay.plan.push_back(tickCount + t);
+            }
+            // flips due right now
+            while (!autoplay.plan.empty() && autoplay.plan.front() <= tickCount) {
+                autoplay.plan.erase(autoplay.plan.begin());
+                autoplayFlip(layer);
+            }
+        }
+        autoplay.planSafeUntil = at + survived;
+        // a full plan is re-checked every few ticks; one that's still short keeps being worked on
+        // (within the frame's time)
+        autoplay.verifyAt = tickCount + (survived >= c.horizon ? st(8) : 1);
+    }
+
     void tryAutoRelease(PlayLayer* layer, PlayerObject* p1) {
         if ((!buf.autoRelease && !buf.robotAutoRelease && !buf.dashAutoRelease) || buf.autoReleased || layer->m_isPlatformer) {
             return;
@@ -6341,6 +10887,26 @@ class BufferMenu : public geode::Popup {
         { "more-time-death-spots", "More time at deaths" },
         { "per-level-settings", "Per-level settings" },
     };
+    struct NerfPreset {
+        char const* name;
+        double margin, speed, grace;
+    };
+    static constexpr NerfPreset NERF_PRESETS[] = {
+        { "Original", 0, 100, 0 }, { "Insane Demon", 2, 100, 2 }, { "Hard Demon", 4, 90, 4 },
+        { "Medium Demon", 7, 80, 8 }, { "Easy Demon", 11, 70, 12 }, { "Normal", 16, 60, 20 }, { "Custom", 0, 100, 0 },
+    };
+    static constexpr Option FPS_OPTS[] = {
+        { "fps-overlay", "FPS overlay" },
+        { "fps-graph", "Frame-time graph" },
+        { "fps-spike-killer", "Spike killer" },
+        { "fps-overload", "Overload protection" },
+        { "fps-dynamic", "Dynamic quality" },
+        { "fps-long-session", "Long-session monitor" },
+    };
+    static constexpr Option NERF_OPTS[] = {
+        { "nerf-hard-sections", "Stronger in hard parts" },
+        { "nerf-per-level", "Remember per level" },
+    };
     static constexpr Option HITBOX_OPTS[] = {
         { "hitbox-view", "Hitboxes" },
         { "hitbox-difference", "Hitbox difference" },
@@ -6406,7 +10972,7 @@ class BufferMenu : public geode::Popup {
         { "check-updates", "Update checker" },
     };
     static constexpr char const* TABS[] = { "Overview", "Prediction", "Game Modes", "Automation", "Memory", "Sections", "Performance",
-        "Visuals", "Tools", "Analyzer", "Vision", "Timing", "About" };
+        "Visuals", "Tools", "Analyzer", "Vision", "Timing", "Difficulty", "About" };
     static constexpr char const* THEMES[] = { "AMOLED", "Light", "Graphite", "Midnight", "Ocean", "Forest", "Rose", "Paper", "Custom" };
     static constexpr char const* ABOUT_URL = "https://github.com/Zeptoreal1/-predictive-input-buffer";
 
@@ -6486,21 +11052,23 @@ public:
                 { 255, 255, 255 }, { 200, 206, 217 }, { 180, 95, 6 }, { 200, 40, 40 }, true, "GJ_button_06.png" };
         }
         if (name == "Graphite") {
-            return { { 20, 22, 28 }, { 31, 34, 43 }, { 52, 56, 68 }, { 236, 238, 244 }, { 148, 154, 170 }, { 96, 165, 250 },
-                { 10, 16, 30 }, { 74, 80, 96 }, { 245, 175, 50 }, { 248, 113, 113 }, false, "GJ_button_06.png" };
+            // Clean UI: quieter surfaces, crisper body copy, one consistent blue accent.
+            return { { 14, 17, 23 }, { 23, 28, 37 }, { 44, 51, 65 }, { 238, 242, 249 }, { 151, 162, 181 }, { 111, 151, 255 },
+                { 11, 16, 27 }, { 69, 78, 96 }, { 245, 175, 50 }, { 248, 113, 113 }, false, "GJ_button_06.png" };
         }
         return { { 0, 0, 0 }, { 14, 15, 18 }, { 38, 40, 48 }, { 245, 246, 250 }, { 140, 145, 158 }, { 59, 130, 246 },
             { 255, 255, 255 }, { 58, 62, 74 }, { 245, 175, 50 }, { 248, 113, 113 }, false, "GJ_button_06.png" };
     }
 
 private:
-    static constexpr float W = 430.f;      // sidebar + page
-    static constexpr float RP = 112.f;     // right status panel
-    static constexpr float WIN_W = W + RP; // whole window
-    static constexpr float H = 272.f;
-    static constexpr float TITLE = 28.f;
-    static constexpr float SIDE = 100.f;
-    static constexpr float ROW = 21.f;
+    // A little more breathing space without using oversized controls on mobile.
+    static constexpr float W = 442.f;      // sidebar + settings area
+    static constexpr float RP = 120.f;     // compact live-status rail
+    static constexpr float WIN_W = W + RP;
+    static constexpr float H = 294.f;
+    static constexpr float TITLE = 31.f;
+    static constexpr float SIDE = 108.f;
+    static constexpr float ROW = 22.f;
 
     static inline BufferMenu* s_open = nullptr;
     static inline int s_tab = 0;
@@ -6510,6 +11078,7 @@ private:
     static inline int s_secPage = 0;
     static inline int s_anaSub = 0;
     static inline int s_visSub = 0;
+    static inline int s_perfSub = 0;
     static inline std::vector<std::filesystem::path> s_macroFiles;
     static inline std::string s_macroName;                 // the file analysed now
     static inline std::filesystem::file_time_type s_macroTime {};
@@ -6534,6 +11103,8 @@ private:
 
     CCMenu* m_frameMenu = nullptr;
     CCNode* m_tabsNode = nullptr;
+    std::string m_tabHiTheme;
+    CCLabelBMFont* m_fpsLines[3] = {};
     CCNode* m_page = nullptr;
     CCMenu* m_pageMenu = nullptr;
     CCLabelBMFont* m_stage = nullptr;
@@ -6617,8 +11188,8 @@ private:
         return "sans-bold.fnt"_spr;
     }
 
-    static constexpr float BODY_K = 0.86f;  // Poppins Regular next to the old chat font
-    static constexpr float HEAD_K = 0.82f;  // Poppins Bold
+    static constexpr float BODY_K = 0.91f;  // slightly easier to read in-game
+    static constexpr float HEAD_K = 0.85f;
 
     CCLabelBMFont* label(CCNode* parent, std::string const& str, float scale, ccColor3B color, CCPoint at, CCPoint anchor = { 0.5f, 0.5f },
         bool head = false) {
@@ -6631,23 +11202,23 @@ private:
         return l;
     }
 
-    // a flat pill button: filled with the accent (primary) or glassy with an accent edge
+    // A compact, gently rounded button. Primary actions stand out; secondary controls stay quiet.
     CCMenuItemSpriteExtra* button(CCMenu* menu, std::string const& str, SEL_MenuHandler handler, CCPoint center, float width,
         bool primary = false, int tag = 0, float height = 18.f) {
         auto* node = CCNode::create();
         node->setContentSize({ width, height });
         auto* d = CCDrawNode::create();
-        roundRect(d, { 0.f, 0.f, width, height }, height / 2.f, primary ? col(m_t.accent, 1.f) : col(m_t.surface, 1.f), primary ? 0.f : 0.7f,
-            col(m_t.line, 1.f));
+        roundRect(d, { 0.f, 0.f, width, height }, 5.f, primary ? col(m_t.accent, 1.f) : col(m_t.surface, 1.f),
+            primary ? 0.f : 0.6f, col(m_t.line, 0.8f));
         node->addChild(d);
         auto* l = CCLabelBMFont::create(str.c_str(), bodyFont());
-        l->setScale(0.5f * BODY_K);
+        l->setScale(0.52f * BODY_K);
         l->setColor(primary ? m_t.onAccent : m_text);
         l->setPosition({ width / 2.f, height / 2.f + 0.5f });
-        l->limitLabelWidth(width - 8.f, 0.5f * BODY_K, 0.2f);
+        l->limitLabelWidth(width - 8.f, 0.52f * BODY_K, 0.2f);
         node->addChild(l);
         auto* item = CCMenuItemSpriteExtra::create(node, this, handler);
-        item->m_scaleMultiplier = 1.05f;
+        item->m_scaleMultiplier = 1.025f;
         item->setTag(tag);
         item->setPosition(center);
         menu->addChild(item);
@@ -6695,12 +11266,22 @@ private:
         return o.key ? Mod::get()->getSettingValue<bool>(o.key) : buf.showPath;
     }
 
-    // a switch row: label on the left, switch on the right
+    // Whole-row touch targets: tapping the text toggles an option, not just its tiny switch.
     void optionRow(Option const& o, float x, float y, float width) {
-        CCDrawNode* d = nullptr;
-        switchItem({ x + width - 15.f, y }, optionValue(o), menu_selector(BufferMenu::onToggle), static_cast<int>(m_options.size()), &d);
-        auto* l = label(m_page, o.label, 0.52f, optionValue(o) ? m_text : m_muted, { x, y }, { 0.f, 0.5f });
-        l->limitLabelWidth(width - 36.f, 0.52f, 0.2f);
+        auto* hit = CCNode::create();
+        hit->setContentSize({ width, ROW - 2.f });
+        auto* item = CCMenuItemSpriteExtra::create(hit, this, menu_selector(BufferMenu::onToggle));
+        item->setTag(static_cast<int>(m_options.size()));
+        item->m_scaleMultiplier = 1.f;  // don't move the label/switch when a setting is tapped
+        item->setPosition({ x + width / 2.f, y });
+        m_pageMenu->addChild(item);
+
+        auto* d = CCDrawNode::create();
+        d->setPosition({ x + width - 28.f, y - 6.5f });
+        m_page->addChild(d, 4);
+        drawSwitch(d, optionValue(o));
+        auto* l = label(m_page, o.label, 0.54f, optionValue(o) ? m_text : m_muted, { x, y }, { 0.f, 0.5f });
+        l->limitLabelWidth(width - 37.f, 0.54f, 0.2f);
         m_options.push_back(&o);
         m_switches.push_back(d);
         m_switchLabels.push_back(l);
@@ -6750,13 +11331,13 @@ private:
 
         // flat window: solid background, hairline border, no glow
         auto* base = CCDrawNode::create();
-        roundRect(base, { 0.f, 0.f, WIN_W, H }, 14.f, col(m_t.bg, 1.f));
+        roundRect(base, { 0.f, 0.f, WIN_W, H }, 12.f, col(m_t.bg, 1.f));
         root->addChild(base, -5);
         m_hasImage = addBackgroundImage(root);
 
         auto* chrome = CCDrawNode::create();
-        roundRect(chrome, { 0.f, 0.f, WIN_W, H }, 14.f, { 0, 0, 0, 0 }, 0.8f, col(m_t.line, 1.f));
-        roundRect(chrome, { 8.f, 8.f, SIDE - 12.f, H - TITLE - 14.f }, 10.f, col(m_t.surface, m_hasImage ? 0.9f : 1.f), 0.7f, col(m_t.line, 1.f));
+        roundRect(chrome, { 0.f, 0.f, WIN_W, H }, 12.f, { 0, 0, 0, 0 }, 0.65f, col(m_t.line, 0.85f));
+        roundRect(chrome, { 8.f, 8.f, SIDE - 12.f, H - TITLE - 14.f }, 8.f, col(m_t.surface, m_hasImage ? 0.94f : 1.f), 0.5f, col(m_t.line, 0.7f));
         root->addChild(chrome, -1);
         auto* sep = CCLayerColor::create({ m_t.line.r, m_t.line.g, m_t.line.b, 255 }, WIN_W - 24.f, 1.f);
         sep->setPosition({ 12.f, H - TITLE });
@@ -6769,8 +11350,9 @@ private:
             icon->setPosition(lc);
             root->addChild(icon, 2);
         }
-        label(root, "Aliou's Buffer", 0.62f, m_text, { 38.f, H - TITLE / 2.f }, { 0.f, 0.5f }, true);
-        label(root, Mod::get()->getVersion().toVString(), 0.4f, m_muted, { WIN_W - 36.f, H - TITLE / 2.f }, { 1.f, 0.5f });
+        label(root, "Aliou's Buffer", 0.66f, m_text, { 38.f, H - TITLE / 2.f }, { 0.f, 0.5f }, true);
+        // Keep the version beside the logo rather than overlapping Settings and Close.
+        label(root, Mod::get()->getVersion().toVString(), 0.37f, m_muted, { 157.f, H - TITLE / 2.f }, { 0.f, 0.5f });
 
         m_frameMenu = CCMenu::create();
         m_frameMenu->setPosition({ 0.f, 0.f });
@@ -6872,6 +11454,10 @@ private:
                 seg(0.f, 0.f, 0.f, 3.4f);
                 seg(0.f, 0.f, 2.6f, -1.2f);
                 break;
+            case 12:  // difficulty: a slider
+                seg(-5.5f, 0.f, 5.5f, 0.f);
+                circle(d, c + CCPoint { 1.5f, 0.f }, 2.2f, k, 12);
+                break;
             default:  // about: an "i" in a ring
                 circle(d, c, 5.2f, { 0, 0, 0, 0 }, 18, 0.8f, k);
                 seg(0.f, -2.8f, 0.f, 0.8f);
@@ -6889,27 +11475,43 @@ private:
         auto* menu = CCMenu::create();
         menu->setPosition({ 0.f, 0.f });
         m_tabsNode->addChild(menu);
+        constexpr float STEP = 16.8f, ITEM = 15.5f;
+        float activeY = H - TITLE - 18.f - s_tab * STEP - ITEM / 2.f;
+        // one highlight that glides to the active tab instead of jumping
+        auto* hi = static_cast<CCDrawNode*>(m_mainLayer->getChildByTag(7701));
+        if (!hi || m_tabHiTheme != m_themeKey) {
+            if (hi) {
+                hi->removeFromParent();
+            }
+            hi = CCDrawNode::create();
+            hi->setTag(7701);
+            roundRect(hi, { 0.f, 0.f, SIDE - 16.f, ITEM }, 5.f, col(m_t.accent, m_t.light ? 0.1f : 0.14f));
+            roundRect(hi, { 0.f, 3.f, 2.f, ITEM - 6.f }, 1.f, col(m_t.accent, 1.f));
+            hi->setPosition({ 8.f, activeY });
+            m_mainLayer->addChild(hi, 3);
+            m_tabHiTheme = m_themeKey;
+        }
+        else {
+            hi->stopAllActions();
+            hi->runAction(CCEaseExponentialOut::create(CCMoveTo::create(0.3f, { 8.f, activeY })));
+        }
         for (int i = 0; i < static_cast<int>(std::size(TABS)); ++i) {
-            float y = H - TITLE - 18.f - i * 17.f;
+            float y = H - TITLE - 18.f - i * STEP;
             bool active = i == s_tab;
             auto* node = CCNode::create();
-            node->setContentSize({ SIDE - 16.f, 16.f });
+            node->setContentSize({ SIDE - 16.f, ITEM });
             auto* d = CCDrawNode::create();
-            if (active) {
-                roundRect(d, { 0.f, 0.f, SIDE - 16.f, 16.f }, 7.f, col(m_t.accent, m_t.light ? 0.13f : 0.2f));
-                roundRect(d, { 0.f, 4.f, 2.5f, 13.f }, 1.2f, col(m_t.accent, 1.f));
-            }
-            navIcon(d, i, { 13.f, 8.f }, col(active ? m_t.accent : m_muted, 1.f));
+            navIcon(d, i, { 13.f, ITEM / 2.f }, col(active ? m_t.accent : m_muted, 1.f));
             node->addChild(d);
             auto* l = CCLabelBMFont::create(TABS[i], active ? headFont() : bodyFont());
-            l->setScale(0.44f * (active ? HEAD_K : BODY_K));
+            l->setScale(0.48f * (active ? HEAD_K : BODY_K));
             l->setColor(active ? m_text : m_muted);
             l->setAnchorPoint({ 0.f, 0.5f });
-            l->setPosition({ 25.f, 8.f });
-            l->limitLabelWidth(SIDE - 16.f - 29.f, 0.44f * (active ? HEAD_K : BODY_K), 0.15f);
+            l->setPosition({ 25.f, ITEM / 2.f });
+            l->limitLabelWidth(SIDE - 16.f - 29.f, 0.48f * (active ? HEAD_K : BODY_K), 0.15f);
             node->addChild(l);
             auto* item = CCMenuItemSpriteExtra::create(node, this, menu_selector(BufferMenu::onTab));
-            item->m_scaleMultiplier = 1.03f;
+            item->m_scaleMultiplier = 1.02f;
             item->setTag(i);
             item->setPosition({ SIDE / 2.f, y });
             menu->addChild(item);
@@ -6922,7 +11524,11 @@ private:
         auto* root = m_chrome;
         float x0 = W + 5.f, pw = RP - 11.f;
         auto* d = CCDrawNode::create();
-        roundRect(d, { x0, 8.f, pw, H - TITLE - 14.f }, 10.f, col(m_t.surface, m_hasImage ? 0.9f : 1.f), 0.7f, col(m_t.line, 1.f));
+        roundRect(d, { x0, 8.f, pw, H - TITLE - 14.f }, 8.f, col(m_t.surface, m_hasImage ? 0.94f : 1.f), 0.5f, col(m_t.line, 0.7f));
+        // Light section dividers keep the live details scannable without adding heavy cards.
+        for (float y : { H - TITLE - 57.f, H - TITLE - 101.f, H - TITLE - 170.f }) {
+            d->drawSegment({ x0 + 9.f, y }, { x0 + pw - 9.f, y }, 0.3f, col(m_t.line, 0.58f));
+        }
         root->addChild(d, -1);
         float lx = x0 + 10.f, lw = pw - 20.f;
         auto section = [&](char const* t, float y) {
@@ -7041,16 +11647,16 @@ private:
     }
 
     void heading(std::string const& title, std::string const& sub) {
-        label(m_page, title, 0.72f, m_text, { SIDE + 14.f, pageTop() }, { 0.f, 0.5f }, true);
+        label(m_page, title, 0.78f, m_text, { SIDE + 14.f, pageTop() }, { 0.f, 0.5f }, true);
         if (!sub.empty()) {
-            label(m_page, sub, 0.42f, m_muted, { SIDE + 14.f, pageTop() - 14.f }, { 0.f, 0.5f })->limitLabelWidth(W - SIDE - 28.f, 0.42f, 0.2f);
+            label(m_page, sub, 0.44f, m_muted, { SIDE + 14.f, pageTop() - 15.f }, { 0.f, 0.5f })->limitLabelWidth(W - SIDE - 28.f, 0.44f, 0.2f);
         }
     }
 
     // a translucent card behind a group of rows
     void card(float top, float height) {
         auto* d = CCDrawNode::create();
-        roundRect(d, { SIDE + 8.f, top - height, W - SIDE - 16.f, height }, 9.f, col(m_t.surface, m_hasImage ? 0.9f : 1.f), 0.7f, col(m_t.line, 1.f));
+        roundRect(d, { SIDE + 8.f, top - height, W - SIDE - 16.f, height }, 7.f, col(m_t.surface, m_hasImage ? 0.94f : 1.f), 0.5f, col(m_t.line, 0.7f));
         m_page->addChild(d, 1);
     }
 
@@ -7060,7 +11666,7 @@ private:
     }
 
     void pageOverview() {
-        heading("Overview", "Pick a stage or preset, then play.");
+        heading("Control centre", "Your essentials, all in one place.");
         float cx = SIDE + (W - SIDE) / 2.f;
         float y = pageTop() - 40.f;
         card(y + 13.f, 52.f);
@@ -7192,8 +11798,7 @@ private:
         }
     }
 
-    void pagePerformance() {
-        heading("Performance", "Prediction time, latency and optimisation.");
+    void pagePerformanceBasic() {
         float top = pageTop() - 40.f;
         card(top + 12.f, 2 * ROW + 4.f);
         optionGrid(PERFORMANCE, std::size(PERFORMANCE), top);
@@ -7333,6 +11938,99 @@ private:
         note("Gap and stabilizer limits are in Settings (spam-min-gap, spam-stabilizer-cap, in frames).", y - 24.f, m_muted);
     }
 
+    void pagePerformance() {
+        heading("Performance", s_perfSub == 0 ? "Prediction time, latency and optimisation." : (s_perfSub == 1 ? "FPS stability engine: it cuts only the mod's optional work." : "Stutter history, benchmark and device profiles."));
+        button(m_pageMenu, "Basic", menu_selector(BufferMenu::onPerfSub), { W - 146.f, pageTop() }, 52.f, s_perfSub == 0, 0, 16.f);
+        button(m_pageMenu, "FPS", menu_selector(BufferMenu::onPerfSub), { W - 88.f, pageTop() }, 52.f, s_perfSub == 1, 1, 16.f);
+        button(m_pageMenu, "Tools", menu_selector(BufferMenu::onPerfSub), { W - 30.f, pageTop() }, 52.f, s_perfSub == 2, 2, 16.f);
+        if (s_perfSub == 0) {
+            pagePerformanceBasic();
+            return;
+        }
+        float top = pageTop() - 38.f;
+        if (s_perfSub == 1) {
+            card(top + 11.f, 24.f);
+            label(m_page, "Optimisation mode", 0.5f, m_muted, { SIDE + 20.f, top }, { 0.f, 0.5f });
+            button(m_pageMenu, Mod::get()->getSettingValue<std::string>("fps-mode"), menu_selector(BufferMenu::onFpsMode), { W - 70.f, top }, 110.f, true, 0, 16.f);
+            float y = top - 26.f;
+            card(y + 12.f, 3 * ROW + 4.f);
+            optionGrid(FPS_OPTS, std::size(FPS_OPTS), y);
+            y -= 3 * ROW + 6.f;
+            for (int i = 0; i < 3; ++i) {
+                m_fpsLines[i] = label(m_page, "", 0.42f, i == 0 ? m_hi : m_text, { SIDE + 14.f, y - i * 12.f }, { 0.f, 0.5f });
+            }
+            refreshFpsLines();
+            note("Performance cuts optional visuals early, Balanced on clear drops, Maximum stability earliest and longest.", y - 40.f, m_muted);
+            note("It only pauses the mod's own extras (ghost icons, branching, future vision). Thermal and battery state", y - 52.f, m_muted);
+            note("need Android system calls this mod does not make, so they are not shown.", y - 63.f, m_muted);
+            return;
+        }
+        label(m_page, "Stutter history: the last 30 s of frame times, saved when a stutter hits", 0.42f, m_muted, { SIDE + 14.f, top + 4.f }, { 0.f, 0.5f });
+        float y = top - 16.f;
+        button(m_pageMenu, "Open folder", menu_selector(BufferMenu::onFpsFolder), { SIDE + 52.f, y }, 84.f, false, 0, 16.f);
+        y -= 28.f;
+        card(y + 11.f, 24.f);
+        label(m_page, "Stability benchmark (60 s of play)", 0.5f, m_muted, { SIDE + 20.f, y }, { 0.f, 0.5f });
+        button(m_pageMenu, benchRunning ? "Running" : "Start", menu_selector(BufferMenu::onBench), { W - 44.f, y }, 62.f, true, 0, 16.f);
+        for (size_t i = 0; i < benchLines.size() && i < 2; ++i) {
+            note(benchLines[i], y - 18.f - i * 12.f, m_text);
+        }
+        y -= 52.f;
+        label(m_page, "Performance profiles (save for this device, load later)", 0.42f, m_muted, { SIDE + 14.f, y }, { 0.f, 0.5f });
+        y -= 18.f;
+        for (int i = 1; i <= 3; ++i) {
+            button(m_pageMenu, fmt::format("Save {}", i), menu_selector(BufferMenu::onProfile), { SIDE + 40.f + (i - 1) * 62.f, y }, 56.f, false, i, 16.f);
+            button(m_pageMenu, fmt::format("Load {}", i), menu_selector(BufferMenu::onProfile), { SIDE + 40.f + (i - 1) * 62.f, y - 20.f }, 56.f, false, -i, 16.f);
+        }
+    }
+
+    void refreshFpsLines() {
+        if (!m_fpsLines[0]) {
+            return;
+        }
+        m_fpsLines[0]->setString(fmt::format("{:.0f} FPS  |  {:.1f} ms  |  stable {:.0f}%  |  1% low {:.0f}", fpsNow, fpsMs, fpsStab, fpsLow).c_str());
+        m_fpsLines[1]->setString(fmt::format("Mod cost {:.2f} ms per frame  |  display ~{:.0f} Hz  |  spikes {}  |  fx level {}", modCostEma, fpsHz, fpsSpikes, buf.fxLevel).c_str());
+        std::string heavy;
+        heavy += buf.hitboxView ? "hitboxes, " : "";
+        heavy += buf.futureSeconds > 0 ? "future vision, " : "";
+        heavy += buf.ghostIcon && buf.showPath ? "ghost icons, " : "";
+        heavy += buf.branching ? "branching, " : "";
+        m_fpsLines[2]->setString(heavy.empty() ? "Visual load: light" : ("Visual load: " + heavy.substr(0, heavy.size() - 2)).c_str());
+    }
+
+    void pageDifficulty() {
+        heading("Difficulty", "Practice-mode assists that make a level easier. Never legitimate.");
+        float y = pageTop() - 38.f;
+        card(y + 11.f, 24.f);
+        label(m_page, "Target difficulty", 0.5f, m_muted, { SIDE + 20.f, y }, { 0.f, 0.5f });
+        button(m_pageMenu, Mod::get()->getSettingValue<std::string>("nerf-preset"), menu_selector(BufferMenu::onNerfPreset), { W - 80.f, y }, 130.f, true, 0, 16.f);
+        auto stepper = [&](char const* name, std::string value, int tagBase) {
+            y -= 24.f;
+            card(y + 11.f, 22.f);
+            label(m_page, name, 0.5f, m_muted, { SIDE + 20.f, y }, { 0.f, 0.5f });
+            button(m_pageMenu, "-", menu_selector(BufferMenu::onNerfStep), { W - 92.f, y }, 20.f, false, tagBase, 16.f);
+            button(m_pageMenu, "+", menu_selector(BufferMenu::onNerfStep), { W - 30.f, y }, 20.f, false, tagBase + 1, 16.f);
+            label(m_page, value, 0.5f, m_text, { W - 61.f, y });
+        };
+        stepper("Collision forgiveness (units)", fmt::format("{:g}", buf.nerfMargin), 0);
+        stepper("Game speed", fmt::format("{:.0f}%", buf.nerfSpeed * 100.f), 2);
+        stepper("Portal grace (frames)", fmt::format("{:g}", buf.nerfGrace), 4);
+        y -= 24.f;
+        card(y + 11.f, ROW + 2.f);
+        optionGrid(NERF_OPTS, std::size(NERF_OPTS), y - 1.f);
+        y -= ROW + 10.f;
+        label(m_page, fmt::format("Nerf strength {:.0f}%", nerfStrength()), 0.5f, m_hi, { SIDE + 14.f, y }, { 0.f, 0.5f });
+        button(m_pageMenu, "Reset", menu_selector(BufferMenu::onNerfReset), { W - 44.f, y }, 62.f, false, 0, 16.f);
+        y -= 20.f;
+        for (int i = 1; i <= 3; ++i) {
+            button(m_pageMenu, fmt::format("Save {}", i), menu_selector(BufferMenu::onNerfCustom), { SIDE + 36.f + (i - 1) * 54.f, y }, 50.f, false, i, 14.f);
+            button(m_pageMenu, fmt::format("Load {}", i), menu_selector(BufferMenu::onNerfCustom), { SIDE + 36.f + (i + 2) * 54.f, y }, 50.f, false, -i, 14.f);
+        }
+        note(fmt::format("Original: forgiveness 0, speed 100%, grace 0. Now: {:g}, {:.0f}%, {:g}f. Presets are rough, not calibrated.", buf.nerfMargin, buf.nerfSpeed * 100.f, buf.nerfGrace),
+            y - 16.f, m_muted, 0.38f);
+        note("Practice mode only, checked every tick; a small DIFFICULTY NERF tag shows. Per-mode strength is in Settings.", y - 27.f, m_t.warn, 0.38f);
+    }
+
     void pageVision() {
         heading("Vision", s_visSub == 0 ? "Live hitboxes for the player and the objects around you." : "Predicted contact, future path, near misses and frame advance.");
         button(m_pageMenu, "View", menu_selector(BufferMenu::onVisSub), { W - 88.f, pageTop() }, 52.f, s_visSub == 0, 0, 16.f);
@@ -7403,13 +12101,14 @@ private:
         card(top + 12.f, ROW + 4.f);
         optionGrid(ROUTE_OPTS, std::size(ROUTE_OPTS), top);
         float y = top - ROW - 14.f;
-        std::string state = analyze.running
+        std::string state = ai.active ? fmt::format("AI running: attempt {}/{}, best {:.0f}%, {} spots learned", ai.attempts, buf.analyzeLimit, ai.best, aiMem.size())
+            : analyze.running
             ? fmt::format("Running: best {:.0f}%, attempt {}/{}, routes saved {}", analyze.best, analyze.attempts, buf.analyzeLimit, analyze.routes)
             : (analyze.attempts > 0 ? fmt::format("Stopped: best {:.0f}% in {} attempts, routes saved {}", analyze.best, analyze.attempts, analyze.routes)
                                     : std::string("Idle. Open a level in practice mode, then start."));
         label(m_page, state, 0.44f, m_hi, { SIDE + 14.f, y }, { 0.f, 0.5f })->limitLabelWidth(W - SIDE - 28.f, 0.44f, 0.15f);
         y -= 22.f;
-        button(m_pageMenu, "Start auto-analyze", menu_selector(BufferMenu::onAnalyzeStart), { SIDE + 80.f, y }, 136.f, true, 0, 16.f);
+        button(m_pageMenu, "Start AI autopilot", menu_selector(BufferMenu::onAiStart), { SIDE + 80.f, y }, 136.f, true, 0, 16.f);
         button(m_pageMenu, "Stop", menu_selector(BufferMenu::onAnalyzeStop), { SIDE + 172.f, y }, 44.f, false, 0, 16.f);
         button(m_pageMenu, "Clear route", menu_selector(BufferMenu::onRouteClear), { SIDE + 244.f, y }, 84.f, false, 0, 16.f);
         y -= 24.f;
@@ -7419,10 +12118,10 @@ private:
         button(m_pageMenu, "+", menu_selector(BufferMenu::onAnaLimit), { W - 30.f, y }, 22.f, false, 1);
         label(m_page, fmt::format("{}", buf.analyzeLimit), 0.55f, m_text, { W - 61.f, y });
         y -= 22.f;
-        note("Practice mode only, enforced every tick. A big BOT tag shows while inputs are sent; it can't be turned off.", y, m_t.warn, 0.4f);
-        note("Auto-analyze turns on auto-click and auto-release, restarts the level and keeps trying until a run", y - 13.f, m_muted);
-        note("completes it or the limit is reached. Progress is the best percent reached, not a timer.", y - 24.f, m_muted);
-        note("It can't hold ship or wave sections, so those levels may never finish.", y - 35.f, m_muted);
+        note("Practice mode only, enforced every tick. A small tag shows in the corner while it plays; it can't be turned off.", y, m_t.warn, 0.4f);
+        note("The AI simulates keep vs. press a few ticks ahead and takes the safe one, then learns from every", y - 13.f, m_muted);
+        note("death (the decisions before it are marked bad) and every clear. Your presses are ignored while it plays.", y - 24.f, m_muted);
+        note("It stops on a clear, at the attempt limit or on Stop. Long timed sections may take many attempts.", y - 35.f, m_muted);
         note(routeSaved.valid ? fmt::format("Saved route: {} inputs, {:.1f}s. Replay sends them from the level start; your clicks are ignored.",
                                     routeSaved.inputs.size(), routeSaved.inputs.back().tick * TICK / 60.f)
                               : std::string("No saved route. A practice run that completes the level from its start is saved."),
@@ -7562,6 +12261,7 @@ private:
         m_stage = m_status = m_tpsLabel = nullptr;
         m_perModeSwitch = nullptr;
         m_memLabel = m_budgetLabel = nullptr;
+        m_fpsLines[0] = m_fpsLines[1] = m_fpsLines[2] = nullptr;
         m_modeValues.fill(nullptr);
         m_sliders.clear();
         m_dragSlider = -1;
@@ -7588,7 +12288,8 @@ private:
             case 9: pageAnalyzer(); break;
             case 10: pageVision(); break;
             case 11: pageTiming(); break;
-            case 12: pageAbout(); break;
+            case 12: pageDifficulty(); break;
+            case 13: pageAbout(); break;
             default: pageOverview(); break;
         }
         buildTabs();
@@ -7673,6 +12374,7 @@ private:
                 return;
             }
             refreshInfo();
+            refreshFpsLines();
         }
     }
 
@@ -7754,6 +12456,132 @@ private:
         rebuildPage();
     }
 
+    void onPerfSub(CCObject* sender) {
+        s_perfSub = sender->getTag();
+        rebuildPage();
+    }
+
+    void onFpsMode(CCObject*) {
+        cycleSetting("fps-mode", { "Performance", "Balanced", "Maximum stability", "Custom" });
+    }
+
+    void onFpsFolder(CCObject*) {
+        std::error_code ec;
+        auto dir = Mod::get()->getSaveDir() / "stutters";
+        std::filesystem::create_directories(dir, ec);
+        geode::utils::file::openFolder(dir);
+    }
+
+    void onBench(CCObject*) {
+        if (!benchRunning) {
+            benchRunning = true;
+            benchStart = nowSeconds();
+            benchSpikeBase = fpsSpikes;
+            benchSamples.clear();
+            benchLines.clear();
+            say("stability benchmark started: play for 60 seconds");
+            keyBackClicked();
+        }
+    }
+
+    // profiles: slot 1-3, tag > 0 saves and tag < 0 loads
+    void onProfile(CCObject* sender) {
+        int tag = sender->getTag();
+        auto key = fmt::format("fps-profile-{}", std::abs(tag));
+        auto* mod = Mod::get();
+        char const* bools[] = { "performance-mode", "low-latency", "auto-budget", "no-hitch-searches", "fps-overlay", "fps-graph", "fps-spike-killer", "fps-overload", "fps-dynamic" };
+        if (tag > 0) {
+            std::string value;
+            for (auto* k : bools) {
+                value += mod->getSettingValue<bool>(k) ? '1' : '0';
+            }
+            value += fmt::format(",{:g},{}", mod->getSettingValue<double>("sim-budget-ms"), mod->getSettingValue<std::string>("fps-mode"));
+            mod->setSavedValue<std::string>(key, value);
+            say("performance profile {} saved", tag);
+        }
+        else {
+            auto value = mod->getSavedValue<std::string>(key, "");
+            if (value.size() < 12) {
+                say("performance profile {} is empty", -tag);
+                return;
+            }
+            for (size_t i = 0; i < std::size(bools); ++i) {
+                mod->setSettingValue<bool>(bools[i], value[i] == '1');
+            }
+            double budget = 8.0;
+            char modeName[40] = "Balanced";
+            std::sscanf(value.c_str() + std::size(bools) + 1, "%lf,%39[^\n]", &budget, modeName);
+            mod->setSettingValue<double>("sim-budget-ms", budget);
+            mod->setSettingValue<std::string>("fps-mode", modeName);
+            readSettings();
+            say("performance profile {} loaded", -tag);
+        }
+        rebuildPage();
+    }
+
+    void applyNerf(double margin, double speed, double grace, char const* preset) {
+        auto* mod = Mod::get();
+        mod->setSettingValue<double>("nerf-margin", margin);
+        mod->setSettingValue<double>("nerf-speed", speed);
+        mod->setSettingValue<double>("nerf-grace", grace);
+        mod->setSettingValue<std::string>("nerf-preset", preset);
+        readSettings();
+        saveNerfLevel();
+        rebuildPage();
+    }
+
+    void onNerfPreset(CCObject*) {
+        auto cur = Mod::get()->getSettingValue<std::string>("nerf-preset");
+        size_t idx = 0;
+        for (size_t i = 0; i < std::size(NERF_PRESETS); ++i) {
+            if (cur == NERF_PRESETS[i].name) {
+                idx = i;
+            }
+        }
+        if (cur == "Custom") {
+            idx = std::size(NERF_PRESETS) - 1;
+        }
+        auto const& next = NERF_PRESETS[(idx + 1) % std::size(NERF_PRESETS)];
+        applyNerf(next.margin, next.speed, next.grace, next.name);
+    }
+
+    void onNerfStep(CCObject* sender) {
+        int tag = sender->getTag();
+        auto* mod = Mod::get();
+        double margin = mod->getSettingValue<double>("nerf-margin"), speed = mod->getSettingValue<double>("nerf-speed"), grace = mod->getSettingValue<double>("nerf-grace");
+        double dir = tag % 2 ? 1.0 : -1.0;
+        switch (tag / 2) {
+            case 0: margin = std::clamp(margin + dir, 0.0, 20.0); break;
+            case 1: speed = std::clamp(speed + dir * 5.0, 50.0, 100.0); break;
+            default: grace = std::clamp(grace + dir * 2.0, 0.0, 30.0); break;
+        }
+        applyNerf(margin, speed, grace, "Custom");
+    }
+
+    void onNerfReset(CCObject*) {
+        applyNerf(0.0, 100.0, 0.0, "Original");
+    }
+
+    // custom presets: slot 1-3, tag > 0 saves and tag < 0 loads
+    void onNerfCustom(CCObject* sender) {
+        int tag = sender->getTag();
+        auto key = fmt::format("nerf-custom-{}", std::abs(tag));
+        auto* mod = Mod::get();
+        if (tag > 0) {
+            mod->setSavedValue<std::string>(key, fmt::format("{},{},{}", mod->getSettingValue<double>("nerf-margin"), mod->getSettingValue<double>("nerf-speed"),
+                mod->getSettingValue<double>("nerf-grace")));
+            say("custom difficulty {} saved", tag);
+            return;
+        }
+        double margin = 0, speed = 100, grace = 0;
+        if (std::sscanf(mod->getSavedValue<std::string>(key, "").c_str(), "%lf,%lf,%lf", &margin, &speed, &grace) == 3) {
+            applyNerf(margin, speed, grace, "Custom");
+        }
+        else {
+            say("custom difficulty {} is empty", -tag);
+        }
+    }
+
     void onVisSub(CCObject* sender) {
         s_visSub = sender->getTag();
         rebuildPage();
@@ -7828,7 +12656,19 @@ private:
         }
     }
 
+    void onAiStart(CCObject*) {
+        auto* layer = GameManager::get()->m_playLayer;
+        if (aiStart(layer)) {
+            keyBackClicked();  // close the menu so the level runs
+            layer->resetLevel();
+        }
+        else {
+            rebuildPage();
+        }
+    }
+
     void onAnalyzeStop(CCObject*) {
+        aiStop(GameManager::get()->m_playLayer, "stopped by you");
         analyzeStop("stopped by you");
         rebuildPage();
     }
@@ -8122,6 +12962,11 @@ protected:
         if (s_moved) {
             m_mainLayer->setPosition(s_pos);
         }
+        {  // the window eases open
+            float target = m_mainLayer->getScale();
+            m_mainLayer->setScale(target * 0.97f);
+            m_mainLayer->runAction(CCEaseSineOut::create(CCScaleTo::create(0.2f, target)));
+        }
         s_open = this;
         buildFrame();
         rebuildPage();
@@ -8244,6 +13089,14 @@ namespace {
             }
             return;
         }
+        if (buf.fxLevel >= 2) {  // the FPS engine is cutting optional drawing
+            if (buf.hitDrawn) {
+                buf.hitNode->clear();
+                buf.hitDrawn = false;
+            }
+            return;
+        }
+        CostTimer cost;
         auto* p1 = layer->m_player1;
         if (!p1) {
             return;
@@ -8395,7 +13248,7 @@ namespace {
         if (curRec.size() < 40000) {
             curRec.push_back({ p1->getPositionX(), p1->getPositionY() });
         }
-        if (!buf.timeGhost || attempts.empty() || !buf.hitNode) {
+        if (!buf.timeGhost || attempts.empty() || !buf.hitNode || buf.fxLevel >= 1) {
             if (buf.timeIcon) {
                 buf.timeIcon->setVisible(false);
             }
@@ -8561,6 +13414,556 @@ namespace {
     }
 }
 
+// ---------- v3.14 FPS stability engine and adaptive difficulty engine ----------
+namespace {
+    struct FrameSample {
+        float ms;
+        double wall;
+    };
+    std::deque<FrameSample> fpsHist;  // the last 30 seconds of frame times
+    double fpsComputedAt = 0.0, fxHoldUntil = 0.0, fxGoodSince = 0.0, stutterDumpedAt = -100.0;
+    double fpsNow = 0.0, fpsMs = 0.0, fpsStab = 100.0, fpsLow = 0.0, fpsHz = 0.0, modCostEma = 0.0;
+    int fpsSpikes = 0, graphTick = 0, stutterFile = 0;
+    double bucketStart = 0.0, bucketSum = 0.0;
+    int bucketN = 0;
+    std::vector<double> sessionBuckets;
+    bool benchRunning = false;
+    double benchStart = 0.0;
+    int benchSpikeBase = 0;
+    std::vector<float> benchSamples;
+    std::vector<std::string> benchLines;
+
+    float fpsMedian(size_t n) {
+        std::vector<float> v;
+        for (size_t i = fpsHist.size() > n ? fpsHist.size() - n : 0; i < fpsHist.size(); ++i) {
+            v.push_back(fpsHist[i].ms);
+        }
+        if (v.empty()) {
+            return 0.f;
+        }
+        std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+        return v[v.size() / 2];
+    }
+
+    // saves the last 30 seconds of frame times when a stutter happens (ten files, oldest overwritten)
+    void stutterDump() {
+        std::error_code ec;
+        auto dir = Mod::get()->getSaveDir() / "stutters";
+        std::filesystem::create_directories(dir, ec);
+        std::ofstream out(dir / fmt::format("stutter_{}.csv", stutterFile++ % 10), std::ios::trunc);
+        out << "seconds_ago,frame_ms\n";
+        double now = nowSeconds();
+        for (auto const& s : fpsHist) {
+            out << fmt::format("{:.3f},{:.2f}\n", now - s.wall, s.ms);
+        }
+    }
+
+    void fpsThresholds(double& hold, double& cut1, double& factor) {
+        switch (buf.fpsMode) {
+            case 0: hold = 2.0; cut1 = 0.7; factor = 1.8; break;                       // performance: cut optional work early
+            case 2: hold = 5.0; cut1 = 0.8; factor = 1.5; break;                       // maximum stability: earliest, longest
+            case 3: hold = 2.0; cut1 = buf.fpsLowRatio; factor = buf.fpsSpikeFactor; break;
+            default: hold = 1.5; cut1 = 0.6; factor = 2.2; break;                      // balanced
+        }
+    }
+
+    void fpsCompute(double wall) {
+        if (fpsHist.size() < 20) {
+            return;
+        }
+        double sum = 0.0;
+        int n = 0;
+        for (auto it = fpsHist.rbegin(); it != fpsHist.rend() && wall - it->wall <= 1.0; ++it) {
+            sum += it->ms;
+            ++n;
+        }
+        fpsMs = n ? sum / n : 0.0;
+        fpsNow = fpsMs > 0.0 ? 1000.0 / fpsMs : 0.0;
+        // 1% low: the average of the slowest 1% of the last 600 frames
+        std::vector<float> recent;
+        for (size_t i = fpsHist.size() > 600 ? fpsHist.size() - 600 : 0; i < fpsHist.size(); ++i) {
+            recent.push_back(fpsHist[i].ms);
+        }
+        std::sort(recent.rbegin(), recent.rend());
+        size_t worst = std::max<size_t>(1, recent.size() / 100);
+        double worstSum = 0.0;
+        for (size_t i = 0; i < worst; ++i) {
+            worstSum += recent[i];
+        }
+        fpsLow = worstSum > 0.0 ? 1000.0 * worst / worstSum : 0.0;
+        // stability: how even the last two seconds of frame times are
+        double mean = 0.0, var = 0.0;
+        int count = 0;
+        for (auto it = fpsHist.rbegin(); it != fpsHist.rend() && wall - it->wall <= 2.0; ++it) {
+            mean += it->ms;
+            ++count;
+        }
+        mean /= std::max(1, count);
+        for (auto it = fpsHist.rbegin(); it != fpsHist.rend() && wall - it->wall <= 2.0; ++it) {
+            var += (it->ms - mean) * (it->ms - mean);
+        }
+        double cv = mean > 0.0 ? std::sqrt(var / std::max(1, count)) / mean : 0.0;
+        fpsStab = 100.0 * (1.0 - std::clamp(cv / 0.5, 0.0, 1.0));
+        // refresh rate matcher: the display rate the frame times point to
+        float med = fpsMedian(120);
+        constexpr double RATES[] = { 30, 45, 60, 72, 90, 120, 144, 165, 240 };
+        fpsHz = RATES[0];
+        for (double r : RATES) {
+            if (med > 0.f && std::abs(r - 1000.0 / med) < std::abs(fpsHz - 1000.0 / med)) {
+                fpsHz = r;
+            }
+        }
+        // what to cut: optional visuals and predictions, never the buffer itself
+        double hold = 0.0, cut1 = 0.0, factor = 0.0;
+        fpsThresholds(hold, cut1, factor);
+        double ratio = fpsNow > 0.0 ? fpsLow / fpsNow : 1.0;
+        int want = 0;
+        if (buf.fpsDynamic) {
+            want = ratio < cut1 * 0.7 ? 2 : (ratio < cut1 ? 1 : 0);
+        }
+        if (buf.fpsSpikeKiller && wall < fxHoldUntil) {
+            want = std::max(want, 1);
+        }
+        if (buf.fpsOverload && modCostEma > 0.35 * fpsMs) {
+            want = std::max(want, 1);
+        }
+        if (want > buf.fxLevel) {
+            buf.fxLevel = want;
+            fxGoodSince = wall;
+        }
+        else if (want < buf.fxLevel && wall - fxGoodSince > 3.0) {
+            buf.fxLevel = want;
+            fxGoodSince = wall;
+        }
+        else if (want == buf.fxLevel) {
+            fxGoodSince = wall;
+        }
+        // long session stabilizer: five-minute averages
+        bucketSum += fpsNow;
+        ++bucketN;
+        if (bucketStart == 0.0) {
+            bucketStart = wall;
+        }
+        if (wall - bucketStart >= 300.0) {
+            sessionBuckets.push_back(bucketSum / std::max(1, bucketN));
+            bucketStart = wall;
+            bucketSum = 0.0;
+            bucketN = 0;
+        }
+        if (buf.fpsOverlay) {
+            std::string text = fmt::format("FPS {:.0f} | {:.1f} ms | stable {:.0f}% | 1% low {:.0f} | mod {:.1f} ms | fx {} | {:.0f} Hz", fpsNow, fpsMs,
+                fpsStab, fpsLow, modCostEma, buf.fxLevel, fpsHz);
+            if (buf.fpsLong && sessionBuckets.size() >= 3 && sessionBuckets.back() < 0.85 * sessionBuckets.front()) {
+                text += fmt::format(" | session down {:.0f}%", 100.0 * (1.0 - sessionBuckets.back() / sessionBuckets.front()));
+            }
+            if (benchRunning) {
+                text += fmt::format(" | benchmark {:.0f}s left", std::max(0.0, 60.0 - (wall - benchStart)));
+            }
+            buf.hudFps = text;
+        }
+        else {
+            buf.hudFps.clear();
+        }
+        updateHud();
+    }
+
+    void benchFinish() {
+        benchRunning = false;
+        benchLines.clear();
+        if (benchSamples.size() < 30) {
+            benchLines.push_back("Benchmark ended too early to measure.");
+            return;
+        }
+        double sum = 0.0;
+        for (float v : benchSamples) {
+            sum += v;
+        }
+        double mean = sum / benchSamples.size(), var = 0.0;
+        for (float v : benchSamples) {
+            var += (v - mean) * (v - mean);
+        }
+        auto sorted = benchSamples;
+        std::sort(sorted.rbegin(), sorted.rend());
+        size_t worst = std::max<size_t>(1, sorted.size() / 100);
+        double worstSum = 0.0;
+        for (size_t i = 0; i < worst; ++i) {
+            worstSum += sorted[i];
+        }
+        double cv = std::sqrt(var / benchSamples.size()) / mean;
+        benchLines.push_back(fmt::format("Average {:.1f} FPS, 1% low {:.1f} FPS", 1000.0 / mean, 1000.0 * worst / worstSum));
+        benchLines.push_back(fmt::format("Stability {:.0f}%, {} spikes in 60 s", 100.0 * (1.0 - std::clamp(cv / 0.5, 0.0, 1.0)), fpsSpikes - benchSpikeBase));
+        say("benchmark: {} / {}", benchLines[0], benchLines[1]);
+    }
+
+    void fpsFrameTick(PlayLayer* layer, float dt) {
+        double wall = nowSeconds();
+        float ms = dt * 1000.f;
+        if (ms <= 0.f || ms > 1000.f || layer->m_isPaused) {
+            return;
+        }
+        fpsHist.push_back({ ms, wall });
+        while (!fpsHist.empty() && wall - fpsHist.front().wall > 30.0) {
+            fpsHist.pop_front();
+        }
+        if (benchRunning) {
+            benchSamples.push_back(ms);
+            if (wall - benchStart >= 60.0) {
+                benchFinish();
+            }
+        }
+        modCostEma = modCostEma * 0.95 + modCostMs * 0.05;
+        modCostMs = 0.0;
+        if (fpsHist.size() > 30) {
+            double hold = 0.0, cut1 = 0.0, factor = 0.0;
+            fpsThresholds(hold, cut1, factor);
+            if (ms > std::max(factor * fpsMedian(120), 12.0)) {  // spike killer
+                ++fpsSpikes;
+                if (buf.fpsSpikeKiller) {
+                    fxHoldUntil = wall + hold;
+                }
+                if (wall - stutterDumpedAt > 20.0) {
+                    stutterDumpedAt = wall;
+                    stutterDump();
+                }
+            }
+        }
+        if (wall - fpsComputedAt >= 0.25) {
+            fpsComputedAt = wall;
+            fpsCompute(wall);
+        }
+        // frame-time graph: the last 120 frames, green normal, yellow slow, red a spike
+        if (buf.graphNode && ++graphTick % 3 == 0) {
+            buf.graphNode->clear();
+            if (buf.fpsGraph && fpsHist.size() > 2) {
+                float med = std::max(1.f, fpsMedian(120));
+                size_t from = fpsHist.size() > 120 ? fpsHist.size() - 120 : 0;
+                for (size_t i = from; i < fpsHist.size(); ++i) {
+                    float h = std::min(36.f, fpsHist[i].ms * 0.9f);
+                    float r = fpsHist[i].ms / med;
+                    ccColor4F c = r > 2.f ? ccColor4F { 1.f, 0.3f, 0.3f, 0.9f } : (r > 1.3f ? ccColor4F { 1.f, 0.8f, 0.3f, 0.9f } : ccColor4F { 0.4f, 1.f, 0.6f, 0.7f });
+                    float x = static_cast<float>(i - from);
+                    buf.graphNode->drawSegment({ x, 0.f }, { x, h }, 0.5f, c);
+                }
+                buf.graphNode->drawSegment({ 0.f, 15.f }, { 120.f, 15.f }, 0.3f, { 1.f, 1.f, 1.f, 0.25f });  // 60 FPS line
+            }
+        }
+    }
+
+    // ---------- adaptive difficulty engine (practice mode only) ----------
+    // Client-side assists, never a real change to the level or its record: forgiving collisions,
+    // slower game speed and a grace time after portals. Practice mode only; a tag shows.
+    int nerfPortalIdx = -1;
+    int lastPortalTick = -100000;
+
+    bool nerfOn() {
+        return buf.nerfMargin > 0.f || buf.nerfSpeed < 0.999f || buf.nerfGrace > 0.f;
+    }
+
+    bool nerfActive(PlayLayer* layer) {
+        return layer && layer->m_isPracticeMode && !layer->m_isPlatformer && nerfOn();
+    }
+
+    int modeIndex(PlayerObject* p) {
+        if (p->m_isShip) return 1;
+        if (p->m_isBall) return 2;
+        if (p->m_isBird) return 3;
+        if (p->m_isDart) return 4;
+        if (p->m_isRobot) return 5;
+        if (p->m_isSpider) return 6;
+        if (p->m_isSwing) return 7;
+        return 0;
+    }
+
+    float nerfStrength() {
+        return 100.f * (0.5f * std::min(buf.nerfMargin / 16.f, 1.f) + 0.3f * std::min((1.f - buf.nerfSpeed) / 0.4f, 1.f) + 0.2f * std::min(buf.nerfGrace / 20.f, 1.f));
+    }
+
+    // the three hardest-looking tenths of the level, from the level scan
+    bool inHardSection(PlayLayer* layer, PlayerObject* p) {
+        if (!buf.nerfHard || !scan.valid) {
+            return false;
+        }
+        int bin = std::clamp(static_cast<int>(sectionPercent(layer, p) / 10.f), 0, 9);
+        int higher = 0;
+        for (float v : scan.score) {
+            higher += v > scan.score[bin] ? 1 : 0;
+        }
+        return scan.score[bin] > 0.f && higher < 3;
+    }
+
+    void nerfTick(PlayLayer* layer) {
+        if (!nerfActive(layer) || buf.nerfGrace <= 0.f || !layer->m_player1) {
+            return;
+        }
+        if (!portalCacheValid) {
+            portalXs.clear();
+            if (layer->m_objects) {
+                for (auto* o : CCArrayExt<GameObject*>(layer->m_objects)) {
+                    if (o && isPortalId(o->m_objectID)) {
+                        portalXs.push_back(o->getPositionX());
+                    }
+                }
+            }
+            std::sort(portalXs.begin(), portalXs.end());
+            portalCacheValid = true;
+        }
+        int idx = static_cast<int>(std::upper_bound(portalXs.begin(), portalXs.end(), layer->m_player1->getPositionX()) - portalXs.begin());
+        if (nerfPortalIdx >= 0 && idx > nerfPortalIdx) {
+            lastPortalTick = tickCount;  // just passed a portal
+        }
+        nerfPortalIdx = idx;
+    }
+
+    // true = ignore this death: the touch was within the forgiven margin, or just after a portal
+    bool nerfForgives(PlayLayer* layer, PlayerObject* player, GameObject* object) {
+        if (!nerfActive(layer) || !object || !player) {  // the floor, ceiling and level edge are never forgiven
+            return false;
+        }
+        if (object->m_objectType != GameObjectType::Hazard && object->m_objectType != GameObjectType::Solid && object->m_objectType != GameObjectType::Slope) {
+            return false;
+        }
+        if (buf.nerfGrace > 0.f && tickCount - lastPortalTick < static_cast<int>(std::lround(buf.nerfGrace / (buf.tickLength > 0.001f ? buf.tickLength : TICK)))) {
+            return true;
+        }
+        float m = buf.nerfMargin * buf.nerfMult[modeIndex(player)] * (inHardSection(layer, player) ? 1.5f : 1.f);
+        if (m <= 0.f) {
+            return false;
+        }
+        auto pr = player->getObjectRect();
+        CCRect shrunk(pr.getMinX() + m, pr.getMinY() + m, std::max(0.f, pr.size.width - 2.f * m), std::max(0.f, pr.size.height - 2.f * m));
+        return !shrunk.intersectsRect(object->getObjectRect());
+    }
+
+    std::filesystem::path nerfFile() {
+        return Mod::get()->getSaveDir() / "memory" / (memoryKey + "_difficulty.txt");
+    }
+
+    void saveNerfLevel() {
+        if (memoryKey.empty() || !Mod::get()->getSettingValue<bool>("nerf-per-level")) {
+            return;
+        }
+        std::error_code ec;
+        std::filesystem::create_directories(nerfFile().parent_path(), ec);
+        std::ofstream out(nerfFile(), std::ios::trunc);
+        out << buf.nerfMargin << ' ' << buf.nerfSpeed * 100.f << ' ' << buf.nerfGrace << '\n';
+    }
+
+    void loadNerfLevel() {
+        if (memoryKey.empty() || !Mod::get()->getSettingValue<bool>("nerf-per-level")) {
+            return;
+        }
+        std::ifstream in(nerfFile());
+        double margin = 0, speed = 100, grace = 0;
+        if (in >> margin >> speed >> grace) {
+            auto* mod = Mod::get();
+            mod->setSettingValue<double>("nerf-margin", margin);
+            mod->setSettingValue<double>("nerf-speed", speed);
+            mod->setSettingValue<double>("nerf-grace", grace);
+            mod->setSettingValue<std::string>("nerf-preset", "Custom");
+            readSettings();
+        }
+    }
+}
+
+// ---------- v3.15 AI autopilot (practice mode only) ----------
+// A planner that learns the level. Every few ticks it simulates two futures with the prediction
+// engine: keep the button as it is, or toggle it (press, or let go). It takes the one that does
+// not crash; when both are safe it follows what it has learned about this part of the level.
+// A death marks the decisions just before it as bad, a clear marks them all as good, and the
+// knowledge is saved per level, so each attempt starts smarter. It checks for practice mode on
+// every tick, and a tag shows in the corner of the screen while it plays.
+namespace {
+    struct AiStep {
+        int slice;
+        int action;  // 0 keep, 1 toggle
+    };
+    std::vector<AiStep> aiTrail;
+    int aiReleaseAt = -1;
+    bool aiHeld = false;
+    bool aiMemDirty = false;
+
+    bool aiRunning() {
+        return ai.active;
+    }
+
+    std::filesystem::path aiFile() {
+        return Mod::get()->getSaveDir() / "memory" / (memoryKey + "_ai.txt");
+    }
+
+    void loadAi() {
+        aiMem.clear();
+        aiTrail.clear();
+        aiMemDirty = false;
+        aiReleaseAt = -1;
+        aiHeld = false;
+        if (memoryKey.empty()) {
+            return;
+        }
+        std::ifstream in(aiFile());
+        int slice = 0;
+        std::array<int, 4> v {};
+        while (in >> slice >> v[0] >> v[1] >> v[2] >> v[3]) {
+            aiMem[slice] = v;
+        }
+    }
+
+    void saveAi() {
+        if (!aiMemDirty || memoryKey.empty()) {
+            return;
+        }
+        std::error_code ec;
+        std::filesystem::create_directories(aiFile().parent_path(), ec);
+        std::ofstream out(aiFile(), std::ios::trunc);
+        for (auto const& [slice, v] : aiMem) {
+            out << slice << ' ' << v[0] << ' ' << v[1] << ' ' << v[2] << ' ' << v[3] << '\n';
+        }
+        aiMemDirty = false;
+    }
+
+    void aiHud() {
+        buf.hudAi = ai.active ? fmt::format("AI autopilot: attempt {}/{}, best {:.0f}%, {} spots learned", ai.attempts, buf.analyzeLimit, ai.best, aiMem.size())
+                              : std::string();
+        updateHud();
+    }
+
+    void aiStop(PlayLayer* layer, char const* why) {
+        if (!ai.active) {
+            return;
+        }
+        ai.active = false;
+        if (aiHeld && layer) {
+            buf.realInput = false;
+            sendButton(layer, false);
+        }
+        aiHeld = false;
+        aiReleaseAt = -1;
+        saveAi();
+        say("AI autopilot stopped ({}): best {:.0f}% in {} attempts, {} clear(s), {} spots learned", why, ai.best, ai.attempts, ai.completions, aiMem.size());
+        aiHud();
+        refreshBotTag();
+    }
+
+    bool aiStart(PlayLayer* layer) {
+        if (!layer || !layer->m_isPracticeMode || layer->m_isPlatformer) {
+            say("AI autopilot needs a level in practice mode");
+            return false;
+        }
+        int done = ai.completions;
+        ai = {};
+        ai.completions = done;
+        ai.active = true;
+        aiTrail.clear();
+        say("AI autopilot started: up to {} attempts, practice mode", buf.analyzeLimit);
+        aiHud();
+        refreshBotTag();
+        return true;
+    }
+
+    void aiTick(PlayLayer* layer) {
+        if (!ai.active) {
+            return;
+        }
+        if (!spamPractice(layer)) {  // practice mode, every tick
+            aiStop(layer, "left practice mode");
+            return;
+        }
+        auto* p1 = layer->m_player1;
+        if (p1->m_isDead || buf.simulating) {
+            return;
+        }
+        if (aiHeld && aiReleaseAt >= 0 && tickCount >= aiReleaseAt) {  // a click's release
+            buf.realInput = false;
+            buf.autoReleased = false;
+            sendButton(layer, false);
+            aiHeld = false;
+            aiReleaseAt = -1;
+        }
+        if (tickCount % (buf.fxLevel >= 1 ? st(8) : st(4)) != 0) {
+            return;
+        }
+        CostTimer cost;
+        bool twoPlayer = layer->m_level && layer->m_level->m_twoPlayerMode;
+        bool dual = !twoPlayer && layer->m_gameState.m_isDualMode && layer->m_player2;
+        auto* p2 = dual ? layer->m_player2 : nullptr;
+        bool wave = p1->m_isDart || (p2 && p2->m_isDart);
+        bool ship = p1->m_isShip || (p2 && p2->m_isShip);
+        bool flyer = isFlying(p1) || (p2 && isFlying(p2));
+        bool mini = (p1->m_isDart && p1->m_vehicleSize < 1.f) || (p2 && p2->m_isDart && p2->m_vehicleSize < 1.f);
+        int horizon = wave ? fullWaveHorizon(mini) : st(flyer ? 48 : std::clamp(buf.groundHorizon, 48, 240));
+        bool down = !buf.appliedInput;
+        int releaseAfter = down && !wave && !ship ? holdEstimate() : -1;
+
+        bool keepDied = false;
+        buf.skipPress = true;
+        auto keep = recordRun(layer, p1, p2, dual, 0, down, horizon, -1, &keepDied);
+        buf.skipPress = false;
+        bool toggleDied = false;
+        auto toggle = recordRun(layer, p1, p2, dual, 0, down, horizon, releaseAfter, &toggleDied);
+
+        int slice = sliceOf(p1);
+        auto& mem = aiMem[slice];
+        int choose = 0;
+        if (keepDied != toggleDied) {
+            choose = keepDied ? 1 : 0;                              // only one future survives
+        }
+        else if (keepDied && toggleDied) {
+            choose = toggle.size() > keep.size() ? 1 : 0;           // both crash: the one that lasts longer
+        }
+        else {
+            choose = (mem[2] - 2 * mem[3]) > (mem[0] - 2 * mem[1]) ? 1 : 0;  // both safe: what was learned here
+        }
+        if (!wave && !ship && aiHeld) {
+            choose = 0;  // a click is already being held for its release
+        }
+        aiTrail.push_back({ slice, choose });
+        if (aiTrail.size() > 400) {
+            aiTrail.erase(aiTrail.begin());
+        }
+        if (choose == 1) {
+            buf.realInput = down;  // the game is now held by the planner, so the buffer does not undo it
+            buf.autoReleased = false;
+            sendButton(layer, down);
+            aiHeld = down;
+            aiReleaseAt = down && !wave && !ship ? tickCount + std::max(2, releaseAfter) : -1;
+        }
+    }
+
+    // a death: the last decisions are marked bad, the earlier ones (which survived) good
+    void aiOnDeath(PlayLayer* layer, PlayerObject* player) {
+        if (!ai.active) {
+            return;
+        }
+        for (size_t i = 0; i < aiTrail.size(); ++i) {
+            bool recent = i + 12 >= aiTrail.size();
+            ++aiMem[aiTrail[i].slice][aiTrail[i].action * 2 + (recent ? 1 : 0)];
+        }
+        aiMemDirty = true;
+        aiTrail.clear();
+        aiHeld = false;
+        aiReleaseAt = -1;
+        ++ai.attempts;
+        ai.best = std::max(ai.best, sectionPercent(layer, player));
+        saveAi();
+        aiHud();
+        if (ai.attempts >= buf.analyzeLimit) {
+            aiStop(layer, "attempt limit reached");
+        }
+    }
+
+    void aiOnComplete(PlayLayer* layer) {
+        if (!ai.active) {
+            return;
+        }
+        for (auto const& step : aiTrail) {
+            ++aiMem[step.slice][step.action * 2];
+        }
+        aiMemDirty = true;
+        ++ai.completions;
+        ai.best = 100.f;
+        aiStop(layer, "level cleared");
+    }
+}
+
 class $modify(BufEndLevelLayer, EndLevelLayer) {
     void customSetup() {
         EndLevelLayer::customSetup();
@@ -8572,24 +13975,38 @@ class $modify(BufEndLevelLayer, EndLevelLayer) {
 
 // v2.94: the pause menu has a button for the menu again (v2.92 had dropped it, so on phones,
 // with no menu key, there was no way to open it inside a level)
+// v2.99.4: the pause menu button is added by one function, from two places. On iOS the game
+// builds the pause menu with its setup inlined, so the customSetup hook alone never ran there;
+// PlayLayer::pauseGame (below) adds it after the pause menu is shown. Never added twice.
+static void addPauseButton(CCNode* pause) {
+    if (!pause || pause->getChildByID("alious-buffer-menu"_spr)) {
+        return;
+    }
+    // v3.0: can be switched off in the menu's Settings (the menu key still opens it)
+    if (!Mod::get()->getSavedValue<bool>("pause-button", true)) {
+        return;
+    }
+    // test 91: the CBF icon (was a heart on a purple circle)
+    auto* sprite = cbfIcon(42.f);
+    if (!sprite) {
+        return;
+    }
+    auto* button = CCMenuItemExt::createSpriteExtra(sprite, [](CCMenuItemSpriteExtra*) {
+        BufferMenu::open();
+    });
+    button->setID("alious-buffer-button"_spr);
+    auto* menu = CCMenu::create();
+    menu->addChild(button);
+    auto win = CCDirector::get()->getWinSize();
+    menu->setPosition({ win.width - 40.f, 40.f });
+    menu->setID("alious-buffer-menu"_spr);
+    pause->addChild(menu, 10);
+}
+
 class $modify(BufPauseLayer, PauseLayer) {
     void customSetup() {
         PauseLayer::customSetup();
-        auto* top = CCSprite::create("alious-buffer-icon.png"_spr);
-        top->setScale(24.f / top->getContentSize().height);
-        auto* sprite = CircleButtonSprite::create(top, CircleBaseColor::Blue, CircleBaseSize::Medium);
-        auto* button = CCMenuItemSpriteExtra::create(sprite, this, menu_selector(BufPauseLayer::onBufferMenu));
-        button->setID("alious-buffer-button"_spr);
-        auto* menu = CCMenu::create();
-        menu->addChild(button);
-        auto win = CCDirector::get()->getWinSize();
-        menu->setPosition({ win.width - 40.f, 40.f });
-        menu->setID("alious-buffer-menu"_spr);
-        this->addChild(menu, 10);
-    }
-
-    void onBufferMenu(CCObject*) {
-        BufferMenu::open();
+        addPauseButton(this);
     }
 };
 
@@ -8635,11 +14052,12 @@ $on_mod(Loaded) {
 #endif
     if (Loader::get()->isModLoaded("syzzi.click_between_frames")) {
         say("Click Between Frames detected: mid-tick sync {}", buf.cbfSync ? "on" : "off");
+        cbfRestore();  // test 78: if the game closed while a macro had it off
     }
     if (Loader::get()->isModLoaded("square3ang.cbfextrapolate")) {
         say("CBF Extrapolate detected: visual only, predictions unaffected");
     }
-    say("v2.99.1 loaded. Stage key cycles: 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom -> off");
+    say("Aliou's Buffer loaded. Stage key cycles: 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom -> off");
 }
 
 class $modify(BufPlayLayer, PlayLayer) {
@@ -8650,6 +14068,7 @@ class $modify(BufPlayLayer, PlayLayer) {
 
     void postUpdate(float dt) {
         PlayLayer::postUpdate(dt);
+        fpsFrameTick(this, dt);  // v3.14
         if (!buf.simulating) {
             hitboxFrame(this);  // v3.12
             timeFrame(this);
@@ -8657,6 +14076,53 @@ class $modify(BufPlayLayer, PlayLayer) {
     }
 
     void destroyPlayer(PlayerObject* player, GameObject* object) {
+        if (!buf.simulating && nerfForgives(this, player, object)) {
+            return;  // v3.14 difficulty engine (practice only)
+        }
+        // (v3.0 test 9: the game "kills" you with its hidden anticheat spike in the first ticks of
+        // every attempt; that isn't a death, and it made autoplay learn nothing)
+        // test 76: player 2 dying in a dual part is a death too (tests 27-75 didn't see it: no log, and a
+        // macro that died there was never planned around)
+        bool p2Dual = player == m_player2 && m_gameState.m_isDualMode && m_player1 && !m_player1->m_isDead;
+        if (autoplay.active && !buf.simulating && (player == m_player1 || p2Dual) && !player->m_isDead && object != m_anticheatSpike &&
+            !autoplay.diedThisAttempt) {
+            int at = autoplay.attemptTick;
+            bool replaying = !m_isPracticeMode && autoplay.knownUntil > 0 && at <= autoplay.knownUntil;
+            bool expected = autoplay.planSafeUntil > at + 2;
+            say("autoplay died at {:.1f}% as {} (tick {}): {}", getCurrentPercent(), MODE_NAMES[modeIndex(m_player1, m_gameState.m_isDualMode ? m_player2 : nullptr)], at,
+                replaying ? "while replaying what it learned (the replay went differently)"
+                          : expected ? fmt::format("the ghost expected to survive {} more ticks (prediction was wrong here)",
+                                           autoplay.planSafeUntil - at)
+                                     : "no safe route was found in time (search)");
+            // v3.0 test 18: what killed you, next to what the ghost thought would
+            say("  you hit object {} (type {}) at x {:.0f} y {:.0f} when at x {:.0f} y {:.0f} | {}", object ? object->m_objectID : 0,
+                object ? static_cast<int>(object->m_objectType) : -1, object ? object->getPositionX() : 0.f, object ? object->getPositionY() : 0.f,
+                player->getPositionX(), player->getPositionY(), autoplay.killer.empty() ? "no ghost report" : autoplay.killer);
+            if (p2Dual) {
+                say("  (that was player 2, in a dual part)");
+            }
+            if (route.active) {
+                say("  route: planned {} ticks past you{}; {} tests so far, {:.2f} ms each", route.end - tickCount,
+                    route.stuck ? " (stuck)"
+                    : route.sprinting ? fmt::format(" (looking for a way past tick {}: at {}, down to {}{})", route.death - route.origin,
+                                            route.cand - route.origin, route.lower - route.origin, route.fine ? ", tick by tick" : "")
+                                      : "",
+                    routeSimCount, routeSimCount ? routeSimMs / routeSimCount : 0.0);
+                say("  off-screen objects the route's ghost was given: {} ({} of them after the check)", buf.offscreenAdded,
+                    buf.offscreenFallback);
+            }
+            // v3.0 test 26: the ghost didn't see what killed you: where you died is avoided from now on
+            if (expected && !replaying) {
+                auto r = player->getObjectRect();
+                float w = r.size.width * 0.6f, h = r.size.height * 0.6f;
+                // (test 59 also marked what killed you and grew a spot you died at again: in
+                // Aquamarine's 48% wave two grown marks closed the gap between them, and every route
+                // there was "stuck". Test 60: back to the spot where you died only)
+                buf.autoDangers.push_back(CCRect(r.getMidX() - w / 2.f, r.getMidY() - h / 2.f, w, h));
+                say("  the ghost didn't see this: the spot is marked, autoplay keeps out of it ({} marked)", buf.autoDangers.size());
+            }
+            autoplay.diedThisAttempt = true;
+        }
         if (buf.simulating && isGhost(player)) {
             buf.ghostDied = true;
             // v2.30 diagnostics: remember the first thing that kills the press-now ghost
@@ -8702,6 +14168,7 @@ class $modify(BufPlayLayer, PlayLayer) {
         forgetPress();
         explainDeath(this, player, object);
         analyzeOnDeath(this, player);
+        aiOnDeath(this, player);
         spamLearnDeath();
         showReview();
         memoryDeath();
@@ -8712,6 +14179,14 @@ class $modify(BufPlayLayer, PlayLayer) {
     }
 
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
+        // v2.99.6: the last level was replaced without being quit (seen with Versus, which
+        // opens levels on its own). Its nodes are already freed, and the new level can even
+        // be created at the same address, so `buf.owner == this` matched during loading and
+        // resetLevel touched the old level's freed nodes (crash reading 0xFFFFFFFFFFFFFFFF).
+        // Forget all of it before the game starts loading, without touching any of it.
+        if (buf.owner) {
+            forgetLeftLevel();
+        }
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) {
             return false;
         }
@@ -8851,7 +14326,7 @@ class $modify(BufPlayLayer, PlayLayer) {
 
         // v3.7: the big tag while a route plays or auto-analyze runs (practice mode only)
         buf.botTag = CCLabelBMFont::create("BOT ROUTE REPLAY | PRACTICE ONLY", "bigFont.fnt");
-        buf.botTag->setScale(0.26f);
+        buf.botTag->setScale(0.3f);
         buf.botTag->setColor({ 255, 70, 70 });
         buf.botTag->setOpacity(210);
         buf.botTag->setAnchorPoint({ 1.f, 1.f });
@@ -8892,6 +14367,9 @@ class $modify(BufPlayLayer, PlayLayer) {
         pathParent->addChild(buf.hitNode, 9997);
         buf.futureNode = CCDrawNode::create();
         pathParent->addChild(buf.futureNode, 9996);
+        buf.graphNode = CCDrawNode::create();  // v3.14 frame-time graph, bottom left of the screen
+        buf.graphNode->setPosition({ 8.f, 8.f });
+        (m_uiLayer ? static_cast<CCNode*>(m_uiLayer) : static_cast<CCNode*>(this))->addChild(buf.graphNode, 100);
         buf.timeIcon = nullptr;
         buf.hitDrawn = false;
         hbFor = nullptr;
@@ -8921,11 +14399,31 @@ class $modify(BufPlayLayer, PlayLayer) {
 
     void levelComplete() {
         routeFinish(this);  // v3.7
+        aiOnComplete(this);
         PlayLayer::levelComplete();
+    }
+
+    // v2.99.6: a level that went away without onQuit. Its nodes may be freed, so they're only
+    // forgotten (never touched). The ghosts are let go of the same way (like Android): they
+    // still point at the old level, so deleting them isn't safe.
+    static void forgetLeftLevel() {
+        benchFinish();
+        benchRecording = false;
+        saveMemory();
+        restoreGlobals();
+        memoryKey.clear();
+        buf.hintLabel = nullptr;
+        buf.heatNode = nullptr;
+        buf.ghost1 = nullptr;
+        buf.ghost2 = nullptr;
+        buf.ghostLayer = nullptr;
+        dropGhosts();  // with the ghosts gone this only clears pointers and state
+        forgetAutoplay();
     }
 
     void onQuit() {
         analyzeStop("left the level");
+        aiStop(this, "left the level");
         routeReplaying = false;
         benchFinish();
         benchFlush();
@@ -8935,19 +14433,53 @@ class $modify(BufPlayLayer, PlayLayer) {
         buf.hintLabel = nullptr;
         buf.heatNode = nullptr;
         memoryKey.clear();
+        stopAutoplay("");
+        dropSnaps(true);
         dropGhosts();
         PlayLayer::onQuit();
+    }
+
+    void levelComplete() {
+        bool wasGenerating = autoplay.active && autoplay.layer == this && autoplay.generating;
+        autoplayFinished(this);
+        if (wasGenerating) {
+            return;  // the hidden run reached the end: no end screen, the shown run starts next frame
+        }
+        PlayLayer::levelComplete();
+    }
+
+    // v3.0 test 25: while the path is made a death restarts at once (the game's own restart a
+    // second later would cut into the next attempt)
+    void delayedResetLevel() {
+        if (autoplay.active && autoplay.layer == this) {
+            double since = std::chrono::duration<double>(std::chrono::steady_clock::now() - autoplay.genEnded).count();
+            bool justEnded = autoplay.genEnded.time_since_epoch().count() != 0 && since < 1.5 && !(m_player1 && m_player1->m_isDead);
+            if (autoplay.generating || justEnded) {
+                return;
+            }
+        }
+        PlayLayer::delayedResetLevel();
     }
 
     void resetLevel() {
         sectionBlockEnd = -1;  // v3.1
         timeReset(this);  // v3.12
+        nerfPortalIdx = -1;
+        aiTrail.clear();
+        aiHeld = false;
+        aiReleaseAt = -1;
         nearMin.clear();
         buf.autoYield = false;
         buf.hudDeath.clear();  // v3.6
         buf.hudBranches.clear();
         buf.hudForecast.clear();
         updateHud();
+        // v3.0 test 9: an attempt that ended in a real death (the game restarts with you dead)
+        // test 81: or player 2 died in a dual part (player 1 isn't dead then)
+        bool p2Died = m_gameState.m_isDualMode && m_player2 && m_player2->m_isDead;
+        if (autoplay.active && autoplay.layer == this && ((m_player1 && m_player1->m_isDead) || p2Died || autoplay.diedThisAttempt)) {
+            autoplayDied(this);
+        }
         triggerChecks.clear();  // v2.84
         attemptStartTick = tickCount;  // v2.84.3
         benchFinish();
@@ -8962,7 +14494,7 @@ class $modify(BufPlayLayer, PlayLayer) {
             PlayLayer::resetLevel();
             return;
         }
-        if (buf.appliedInput && !buf.realInput) {
+        if (buf.appliedInput && !buf.realInput && !(autoplay.active && m_isPracticeMode)) {
             sendButton(this, false);
         }
         resetPending();
@@ -8981,11 +14513,27 @@ class $modify(BufPlayLayer, PlayLayer) {
         // pressed for you as the attempt started (the cube jumped by itself until you clicked).
         // Now the mod only presses when you press.
         syncHeld(this);
+        if (autoplay.active) {
+            autoplayAttemptStart(this);
+        }
+    }
+
+    // v2.99.4: see addPauseButton (iOS never ran the PauseLayer::customSetup hook)
+    void pauseGame(bool unfocused) {
+        PlayLayer::pauseGame(unfocused);
+        if (auto* scene = CCDirector::get()->getRunningScene()) {
+            for (auto* child : CCArrayExt<CCNode*>(scene->getChildren())) {
+                if (typeinfo_cast<PauseLayer*>(child)) {
+                    addPauseButton(child);
+                }
+            }
+        }
     }
 
     void togglePracticeMode(bool practiceMode) {
         if (!practiceMode) {
             analyzeStop("practice mode off");
+            aiStop(this, "practice mode off");
             routeStopReplay(this);
         }
         PlayLayer::togglePracticeMode(practiceMode);
@@ -9113,12 +14661,16 @@ class $modify(BufRingObject, RingObject) {
     }
 
     // v2.78.3: the activation call itself too (orbs and dash orbs still animated early)
+    // v2.99.3: not on iOS/macOS. There it is a 12-byte stub that jumps into powerOnObject
+    // (hooked above anyway), too short for an arm64 hook, which overwrote powerOnObject's start.
+#if !defined(GEODE_IS_IOS) && !defined(GEODE_IS_MACOS)
     void triggerActivated(float xPosition) {
         if (buf.simulating) {
             return;
         }
         RingObject::triggerActivated(xPosition);
     }
+#endif
 };
 
 class $modify(BufPlayerObject, PlayerObject) {
@@ -9129,6 +14681,21 @@ class $modify(BufPlayerObject, PlayerObject) {
         (void)self.setHookPriority("PlayerObject::update", HOOK_PRIORITY);
         (void)self.setHookPriority("PlayerObject::incrementJumps", HOOK_PRIORITY);
         (void)self.setHookPriority("PlayerObject::ringJump", HOOK_PRIORITY);
+    }
+
+    // v3.0 test 27: a hidden player past the screen: GD has no objects for it out there, so the
+    // level index adds the ones near it, inside GD's collision step (before it settles landing),
+    // leaving out the ones GD did give it this step
+    void postCollision(float dt, bool betweenSteps) {
+        if (buf.simulating && buf.inCheck && isGhost(this)) {
+            buf.postCollisionSeen = true;
+            if (buf.offscreenFill && !buf.objIndex.empty()) {
+                if (auto* layer = GameManager::get()->m_playLayer) {
+                    injectOffscreen(layer, this, dt);
+                }
+            }
+        }
+        PlayerObject::postCollision(dt, betweenSteps);
     }
 
     // Runs 240x/sec per player. Ghost steps (during a simulation) skip straight to
@@ -9148,8 +14715,11 @@ class $modify(BufPlayerObject, PlayerObject) {
             if (buf.enabled) {
                 buf.usedThisAttempt = true;
             }
-            if (buf.panelDirty) {
+            // test 93: at most 10 times a second (a busy log redrew every label every physics step)
+            static int lastPanel = -1000;
+            if (buf.panelDirty && (tickCount - lastPanel >= 24 || tickCount < lastPanel)) {
                 buf.panelDirty = false;
+                lastPanel = tickCount;
                 refreshPanel();
             }
             if (benchNeedStart) {
@@ -9170,7 +14740,12 @@ class $modify(BufPlayerObject, PlayerObject) {
             }
             spamLearnTick(layer);
             latencyTick();
-            if (buf.enabled) {
+            nerfTick(layer);
+            aiTick(layer);
+            if (autoplay.active) {
+                autoplayTick(layer, this);
+            }
+            else if (buf.enabled) {
                 deliverPending(layer, this);
                 livePath(layer, this);
             }
@@ -9237,6 +14812,10 @@ class $modify(BufPlayerObject, PlayerObject) {
         if (!ghostEffect()) PlayerObject::playBumpEffect(objectType, object);
     }
 
+    // v2.99.5: these 8 only hide ghost visuals (spawn flash, trails, spider run, rotations).
+    // Together they crash the iOS launcher without JIT on the loading screen (Geode's
+    // pre-patched helper), so iOS leaves them out; the buffer doesn't depend on them.
+#ifndef GEODE_IS_IOS
     void playSpawnEffect() {
         if (!ghostEffect()) PlayerObject::playSpawnEffect();
     }
@@ -9268,6 +14847,7 @@ class $modify(BufPlayerObject, PlayerObject) {
     void runNormalRotation(bool notNormalMode, float speed) {
         if (!ghostEffect()) PlayerObject::runNormalRotation(notNormalMode, speed);
     }
+#endif
 
     void toggleGhostEffect(GhostType type) {
         if (!ghostEffect()) PlayerObject::toggleGhostEffect(type);
@@ -9399,6 +14979,8 @@ namespace {
     constexpr char const* RELEASE_API = "https://api.github.com/repos/Zeptoreal1/-predictive-input-buffer/releases/latest";
     bool updating = false;
     std::string latestAssetUrl;  // v2.98: the .geode of the release the popup is about
+    std::string latestNotes;     // test 90: what's new, from the CBF site
+    bool updateAnywhere = false; // test 90: a check from the window shows its popup wherever you are
 
     // v2.98: the newest GitHub release and its .geode download (empty url if it has none)
     std::string releaseAsset(matjson::Value const& release) {
@@ -9461,7 +15043,7 @@ namespace {
             if (url.empty()) {
                 auto res = web::WebRequest()
                     .timeout(std::chrono::seconds(15))
-                    .userAgent("ClickBeforeFrames")
+                    .userAgent("AliousBuffer")
                     .header("Accept", "application/vnd.github+json")
                     .getSync(RELEASE_API);
                 if (!res.ok()) {
@@ -9478,7 +15060,7 @@ namespace {
             }
             auto file = web::WebRequest()
                 .timeout(std::chrono::seconds(120))
-                .userAgent("ClickBeforeFrames")
+                .userAgent("AliousBuffer")
                 .followRedirects(true)
                 .getSync(url);
             if (!file.ok()) {
@@ -9509,8 +15091,8 @@ namespace {
         }
         updateShown = true;
         say("update: {} is out (you have {})", latestVersion, Mod::get()->getVersion().toVString());
-        createQuickPopup("Aliou's Buffer", fmt::format("<cp>{}</c> is out! You have {}.", latestVersion,
-            Mod::get()->getVersion().toVString()), "Later", INSTALL_UPDATES ? "Update now" : "Open page", [](FLAlertLayer*, bool yes) {
+        createQuickPopup("Aliou's Buffer", fmt::format("<cp>{}</c> is out! You have {}.{}", latestVersion,
+            Mod::get()->getVersion().toVString(), latestNotes.empty() ? std::string() : "\n\n" + latestNotes), "Later", INSTALL_UPDATES ? "Update now" : "Open page", [](FLAlertLayer*, bool yes) {
                 if (!yes) {
                     return;
                 }
@@ -9523,8 +15105,37 @@ namespace {
             });
     }
 
+    void checkForUpdate();
+
+    // test 90: the window's Updates button
+    bool updateAvailable() {
+        return !latestVersion.empty() && !latestAssetUrl.empty();
+    }
+
+    std::string updateButtonText() {
+        if (updating) {
+            return "Updating...";
+        }
+        return updateAvailable() ? "Update to " + latestVersion : std::string("Check for Updates");
+    }
+
+    void manualUpdate() {
+        if (updating) {
+            return;
+        }
+        if (updateAvailable()) {
+            installUpdate();
+            return;
+        }
+        updateAnywhere = true;
+        updateChecked = false;
+        updateShown = false;
+        say("update: checking...");
+        checkForUpdate();
+    }
+
     void checkForUpdate() {
-        if (updateChecked || !Mod::get()->getSettingValue<bool>("check-updates")) {
+        if (updateChecked || (!updateAnywhere && !Mod::get()->getSettingValue<bool>("check-updates"))) {
             return;
         }
         updateChecked = true;
@@ -9532,9 +15143,42 @@ namespace {
         // (it used to read the code's version, which could be ahead of the newest release: the
         // popup said "v2.97 is out" and the install then found only v2.95)
         std::thread([] {
+            // test 90: the version uploaded on the CBF site's admin page comes first (GitHub otherwise)
+            if (!std::string_view(online::URL).empty()) {
+                auto site = web::WebRequest().timeout(std::chrono::seconds(10)).userAgent("AliousBuffer")
+                    .getSync(std::string(online::URL) + "/api/latest");
+                if (site.ok()) {
+                    if (auto j = site.json(); j.isOk()) {
+                        auto v = j.unwrap();
+                        auto ver = VersionInfo::parse(v["version"].asString().unwrapOr(""));
+                        if (ver.isOk() && ver.unwrap() > Mod::get()->getVersion()) {
+                            std::string name = ver.unwrap().toVString();
+                            std::string url = std::string(online::URL) + "/download/latest";
+                            std::string notes = v["notes"].asString().unwrapOr("");
+                            queueInMainThread([name, url, notes] {
+                                latestVersion = name;
+                                latestAssetUrl = url;
+                                latestNotes = notes;
+                                say("update: {} is on the CBF site{}", name, notes.empty() ? "" : ": " + notes);
+                                auto* scene = CCScene::get();
+                                if (updateAnywhere || (scene && scene->getChildByID("MenuLayer"))) {
+                                    showUpdatePopup();
+                                }
+                            });
+                            return;
+                        }
+                        if (ver.isOk()) {
+                            if (updateAnywhere) {
+                                queueInMainThread([] { say("update: you have the newest version ({})", Mod::get()->getVersion().toVString()); });
+                            }
+                            return;  // the site has nothing newer: that's the newest
+                        }
+                    }
+                }
+            }
             auto res = web::WebRequest()
                 .timeout(std::chrono::seconds(10))
-                .userAgent("ClickBeforeFrames")
+                .userAgent("AliousBuffer")
                 .header("Accept", "application/vnd.github+json")
                 .getSync(RELEASE_API);
             if (!res.ok()) {
@@ -9557,7 +15201,7 @@ namespace {
                 // a release named something else: the version inside its .geode decides
                 auto file = web::WebRequest()
                     .timeout(std::chrono::seconds(60))
-                    .userAgent("ClickBeforeFrames")
+                    .userAgent("AliousBuffer")
                     .followRedirects(true)
                     .getSync(url);
                 if (!file.ok()) {
@@ -9585,7 +15229,11 @@ namespace {
 $on_mod(Loaded) {
     AB_STEP("loaded: keybinds");
     setupKeybinds();
+    online::start();
+    account::refresh();  // test 92: is this game linked (autoplay and updates need it)
     AB_STEP("loaded: keybinds done");
+    // v2.99.3: shows in the log whether the game reaches its first frame (iOS start crash hunt)
+    queueInMainThread([] { AB_STEP("first frame"); });
 }
 
 // the main menu: a logo button that opens the menu (with the other buttons at the bottom),
@@ -9597,14 +15245,11 @@ class $modify(BufMenuLayer, MenuLayer) {
             return false;
         }
         AB_STEP("main menu: logo button");
-        auto* top = CCSprite::create("alious-buffer-icon.png"_spr);
-        if (!top) {
-            geode::log::error("alious-buffer-icon.png missing, no menu button");
+        auto* sprite = cbfIcon(46.f);
+        if (!sprite) {
+            geode::log::error("cbf-icon.png missing, no menu button");
             return true;
         }
-        top->setScale(24.f / top->getContentSize().height);
-        top->setColor({ 255, 255, 255 });
-        auto* sprite = CircleButtonSprite::create(top, CircleBaseColor::Blue, CircleBaseSize::Medium);
         auto* item = CCMenuItemSpriteExtra::create(sprite, this, menu_selector(BufMenuLayer::onBufferMenu));
         item->setID("alious-buffer-button"_spr);
         if (auto* bottom = this->getChildByID("bottom-menu")) {
@@ -9632,6 +15277,14 @@ static bool tpsDriving = false;
 static double tpsCarry = 0.0;
 
 class $modify(BufBaseGameLayer, GJBaseGameLayer) {
+    // test 72: macro inputs go in here, at the start of the step, the way bots press them
+    void processCommands(float dt, bool isHalfTick, bool isLastTick) {
+        if (autoplay.active && !buf.simulating && static_cast<GJBaseGameLayer*>(autoplay.layer) == static_cast<GJBaseGameLayer*>(this)) {
+            macroStep(autoplay.layer);
+        }
+        GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
+    }
+
     void update(float dt) {
         if (buf.frozen && typeinfo_cast<PlayLayer*>(this)) {  // v3.12 frame advance
             if (buf.stepFrames > 0) {
@@ -9642,15 +15295,74 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
                 return;
             }
         }
-        int tps = static_cast<int>(Mod::get()->getSettingValue<int64_t>("tps"));
-        if (tps <= 240 || tpsDriving || !typeinfo_cast<PlayLayer*>(this)) {
+        if (buf.nerfSpeed < 0.999f) {  // v3.14 difficulty engine: slower game speed, practice only
+            if (auto* pl = typeinfo_cast<PlayLayer*>(this); pl && nerfActive(pl) && !pl->m_isPaused) {
+                dt *= buf.nerfSpeed;
+            }
+        }
+        // test 93: the setting is read twice a second, not every frame
+        static int tps = 240;
+        static int tpsAge = 1000;
+        if (++tpsAge > 30) {
+            tpsAge = 0;
+            tps = static_cast<int>(Mod::get()->getSettingValue<int64_t>("tps"));
+        }
+        // v3.0 test 14: while autoplay plays, physics steps are exactly 1/240 s even at the normal
+        // 240 TPS. The game's own steps are frame time / step count, so the same inputs moved
+        // you a little differently each attempt (replays went differently, the ghost guessed wrong)
+        bool fixedStep = autoplay.active && static_cast<GJBaseGameLayer*>(autoplay.layer) == static_cast<GJBaseGameLayer*>(this);
+        if ((tps <= 240 && !fixedStep) || tpsDriving || !typeinfo_cast<PlayLayer*>(this)) {
             GJBaseGameLayer::update(dt);
             return;
         }
-        double step = 1.0 / tps;
+        double step = 1.0 / std::max(tps, 240);
+        if (fixedStep) {
+            auto* pl = static_cast<PlayLayer*>(static_cast<GJBaseGameLayer*>(this));
+            if (autoplay.needRestart) {
+                autoplay.needRestart = false;
+                tpsCarry = 0.0;
+                pl->resetLevel();
+                return;
+            }
+            if (autoplay.generating) {
+                // v3.0 test 25: the hidden run, as many steps as fit in ~30 ms of this frame
+                auto begin = std::chrono::steady_clock::now();
+                tpsDriving = true;
+                int steps = 0;
+                while (autoplay.generating && steps < 20000 &&
+                       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count() < 30.0) {
+                    GJBaseGameLayer::update(static_cast<float>(step));
+                    ++steps;
+                    if (!autoplay.generating || !autoplay.active) {
+                        break;
+                    }
+                    if (pl->m_player1 && pl->m_player1->m_isDead) {
+                        updateGenText(pl);
+                        ++autoplay.genAttempts;
+                        tpsDriving = false;
+                        pl->resetLevel();
+                        tpsDriving = true;
+                        if (autoplay.sameDeaths >= 40) {
+                            endGenerating("stuck at one spot, plays what it has");
+                        }
+                    }
+                }
+                tpsDriving = false;
+                tpsCarry = 0.0;
+                if (autoplay.generating) {
+                    updateGenText(pl);
+                    FMODAudioEngine::sharedEngine()->pauseAllAudio();
+                }
+                if (autoplay.needRestart) {
+                    autoplay.needRestart = false;
+                    pl->resetLevel();
+                }
+                return;
+            }
+        }
         tpsCarry += dt;
         int steps = static_cast<int>(tpsCarry / step);
-        int cap = std::max(1, tps / 15);  // after a lag spike, catch up at most 1/15 s
+        int cap = std::max(1, std::max(tps, 240) / 15);  // after a lag spike, catch up at most 1/15 s
         if (steps > cap) {
             steps = cap;
             tpsCarry = 0.0;
@@ -9730,10 +15442,14 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
         bool haveRect = false;
         CCRect ghostRect;
         auto& list = *objects;
+        bool noteSeen = buf.offscreenFill;
         for (int i = 0; i < objectCount; ++i) {
             auto* object = list[i];
             if (!object) {
                 continue;
+            }
+            if (noteSeen) {
+                buf.seenThisCheck.insert(object);
             }
             auto type = static_cast<unsigned>(object->m_objectType);
             uint64_t bit = type < 64 ? (1ull << type) : 0;
@@ -9797,7 +15513,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
                     // v2.79: mode portals ahead are taken by the ghost (once per run)
                     // v2.84: teleport and solo portals too
                     if (buf.portalPredict && isGhost(player) &&
-                        (ghostTakePortal(player, object->m_objectType) || ghostTeleport(player, object) || ghostSoloPortal(object) ||
+                        (ghostTakePortal(player, object) || ghostTeleport(player, object) || ghostSoloPortal(object) ||
                             ghostDualPortal(player, object))) {
                         buf.harmless.insert(object);
                         continue;
@@ -9810,7 +15526,11 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
                         player->togglePlayerScale(mini, true);
                     }
                 }
-                else {
+                else if (player->m_playerSpeed != speed) {
+                    // v3.0 test 52: the game's own speed change (no effects), not just the speed
+                    // number: with only the number, the ghost after a speed portal moved at a slightly
+                    // wrong speed and the route fell behind you
+                    player->updateTimeMod(speed, true);
                     player->m_playerSpeed = speed;
                 }
             }
@@ -9842,8 +15562,19 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
     }
 
     void handleButton(bool down, int button, bool isPlayer1) {
-        if (routeReplaying && !buf.simulating && !buf.injecting && button == 1) {
+        if ((routeReplaying || ai.active) && !buf.simulating && !buf.injecting && button == 1) {
             return;  // v3.7: while a saved route plays (practice only) it is in control
+        }
+        // v3.0: while autoplay plays, your own clicks don't reach the game (Take Over: they do,
+        // and the bot steps back for a moment after each one)
+        if (autoplay.active && !buf.simulating && !buf.injecting) {
+            if (!autoplay.takeOver) {
+                return;
+            }
+            autoplay.userUntil = tickCount + st(down ? 90 : 60);
+            autoplay.userTouched = true;
+            autoplay.plan.clear();
+            autoplay.verifyAt = -1;
         }
         if (!buf.simulating && button == 1 && !buf.injecting) {
             auto* p1 = this->m_player1;
@@ -9906,6 +15637,22 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
         // v2.2 calculation mode: assume you click every orb you touch, on time. Without
         // this the ghost (which only has the one click being tested) misses the next orb in a
         // chain, falls, and the mod thinks a perfectly good click is a death.
+        if (buf.simulating && buf.plan && player == buf.ghost1) {
+            bool seen = false;
+            for (size_t i = 0; i < buf.orbTouches.size(); ++i) {
+                if (buf.orbTouches[i].first == ring) {
+                    seen = true;
+                    if (i < buf.orbTouchLast.size()) {
+                        buf.orbTouchLast[i] = buf.simTick;
+                    }
+                }
+            }
+            if (!seen) {
+                buf.orbTouches.push_back({ ring, buf.simTick });
+                buf.orbTouchLast.resize(buf.orbTouches.size() - 1);
+                buf.orbTouchLast.push_back(buf.simTick);
+            }
+        }
         bool autoOrb = buf.orbClick || (buf.orbAfterFirst && buf.orbUsedTick >= 0 && !buf.orbsUsed.contains(ring));
         if (buf.simulating && autoOrb) {
             bool first = player == buf.ghost1;
@@ -10014,5 +15761,14 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
             return;
         }
         GJBaseGameLayer::playerWillSwitchMode(player, object);
+        // v3.0 test 50: the corridor the game really made, next to the ghost's guess (export)
+        if (autoplay.active && object && buf.portalLogs < 12 && boundedMode(object->m_objectType)) {
+            ++buf.portalLogs;
+            float lo = 0.f, hi = 0.f;
+            corridorFor(object->getPositionY(), corridorHeight(this, object->m_objectType), lo, hi);
+            say("portal check: {} portal at y {:.0f}: game corridor {:.0f}-{:.0f} (free {}), ghost corridor {:.0f}-{:.0f}",
+                static_cast<int>(object->m_objectType), object->getPositionY(), getMinPortalY(), getMaxPortalY(), portalIsFree(this, object), lo,
+                hi);
+        }
     }
 };
