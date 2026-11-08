@@ -10847,6 +10847,26 @@ namespace online {
     }
 }
 
+// FPS metrics and stability-benchmark state must precede the dashboard that reads them.
+namespace {
+    struct FrameSample {
+        float ms;
+        double wall;
+    };
+    std::deque<FrameSample> fpsHist;  // the last 30 seconds of frame times
+    double fpsComputedAt = 0.0, fxHoldUntil = 0.0, fxGoodSince = 0.0, stutterDumpedAt = -100.0;
+    double fpsNow = 0.0, fpsMs = 0.0, fpsStab = 100.0, fpsLow = 0.0, fpsHz = 0.0, modCostEma = 0.0;
+    int fpsSpikes = 0, graphTick = 0, stutterFile = 0;
+    double bucketStart = 0.0, bucketSum = 0.0;
+    int bucketN = 0;
+    std::vector<double> sessionBuckets;
+    bool benchRunning = false;
+    double benchStartWall = 0.0;
+    int benchSpikeBase = 0;
+    std::vector<float> benchSamples;
+    std::vector<std::string> benchLines;
+}
+
 // v3.0 menu: a draggable dashboard window in the Aliou's Buffer colours: a sidebar with an icon
 // for each of ten sections (Overview, Prediction, Game Modes, Automation, Memory, Sections,
 // Performance, Visuals, Tools, About), the page in the middle and a live status panel on the right. Opens
@@ -12689,7 +12709,7 @@ private:
     void onBench(CCObject*) {
         if (!benchRunning) {
             benchRunning = true;
-            benchStart = nowSeconds();
+            benchStartWall = nowSeconds();
             benchSpikeBase = fpsSpikes;
             benchSamples.clear();
             benchLines.clear();
@@ -13157,7 +13177,7 @@ private:
     }
 
 protected:
-    bool init() {
+    bool init() override {
         if (!Popup::init(WIN_W, H, "GJ_square04.png")) {
             return false;
         }
@@ -13635,22 +13655,6 @@ namespace {
 
 // ---------- v3.14 FPS stability engine and adaptive difficulty engine ----------
 namespace {
-    struct FrameSample {
-        float ms;
-        double wall;
-    };
-    std::deque<FrameSample> fpsHist;  // the last 30 seconds of frame times
-    double fpsComputedAt = 0.0, fxHoldUntil = 0.0, fxGoodSince = 0.0, stutterDumpedAt = -100.0;
-    double fpsNow = 0.0, fpsMs = 0.0, fpsStab = 100.0, fpsLow = 0.0, fpsHz = 0.0, modCostEma = 0.0;
-    int fpsSpikes = 0, graphTick = 0, stutterFile = 0;
-    double bucketStart = 0.0, bucketSum = 0.0;
-    int bucketN = 0;
-    std::vector<double> sessionBuckets;
-    bool benchRunning = false;
-    double benchStart = 0.0;
-    int benchSpikeBase = 0;
-    std::vector<float> benchSamples;
-    std::vector<std::string> benchLines;
 
     float fpsMedian(size_t n) {
         std::vector<float> v;
@@ -13776,7 +13780,7 @@ namespace {
                 text += fmt::format(" | session down {:.0f}%", 100.0 * (1.0 - sessionBuckets.back() / sessionBuckets.front()));
             }
             if (benchRunning) {
-                text += fmt::format(" | benchmark {:.0f}s left", std::max(0.0, 60.0 - (wall - benchStart)));
+                text += fmt::format(" | benchmark {:.0f}s left", std::max(0.0, 60.0 - (wall - benchStartWall)));
             }
             buf.hudFps = text;
         }
@@ -13826,7 +13830,7 @@ namespace {
         }
         if (benchRunning) {
             benchSamples.push_back(ms);
-            if (wall - benchStart >= 60.0) {
+            if (wall - benchStartWall >= 60.0) {
                 benchFinish();
             }
         }
