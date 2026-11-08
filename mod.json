@@ -6,7 +6,7 @@
 		"mac": "2.2081",
 		"ios": "2.2081"
 	},
-	"version": "v3.12.0",
+	"version": "v3.15.0",
 	"id": "aliou.aliousbuffer",
 	"name": "Aliou's Buffer",
 	"developer": "Aliou",
@@ -345,6 +345,185 @@
 			"description": "Measures how long a click waits between the mod seeing it and the next game tick, keeps a profile, and shows it on screen; says when it changes.",
 			"default": false
 		},
+		"fps-mode": {
+			"type": "string",
+			"name": "FPS optimisation mode",
+			"description": "Performance cuts the mod's optional work at the first sign of trouble, Balanced only on clear drops, Maximum stability earliest and for longest, Custom uses the two numbers below.",
+			"default": "Balanced",
+			"one-of": [
+				"Performance",
+				"Balanced",
+				"Maximum stability",
+				"Custom"
+			]
+		},
+		"fps-overlay": {
+			"type": "bool",
+			"name": "FPS overlay",
+			"description": "Shows FPS, frame time, stability, 1% low, the mod's own cost per frame, the display rate and the engine's level on screen.",
+			"default": false
+		},
+		"fps-graph": {
+			"type": "bool",
+			"name": "Frame-time graph",
+			"description": "Draws the last 120 frame times bottom left: green normal, yellow slow, red a spike.",
+			"default": false
+		},
+		"fps-spike-killer": {
+			"type": "bool",
+			"name": "Spike killer",
+			"description": "When a frame takes far longer than usual, pauses the mod's optional work (ghost icons, branching, future vision) for a moment and saves the last 30 seconds of frame times.",
+			"default": true
+		},
+		"fps-overload": {
+			"type": "bool",
+			"name": "Prediction overload protection",
+			"description": "Pauses optional predictions when the mod itself would use over a third of the frame.",
+			"default": true
+		},
+		"fps-dynamic": {
+			"type": "bool",
+			"name": "Dynamic rendering quality",
+			"description": "Lowers the mod's optional visuals when the slowest 1% of frames fall well below the average.",
+			"default": true
+		},
+		"fps-long-session": {
+			"type": "bool",
+			"name": "Long-session monitor",
+			"description": "Warns when performance has dropped over a long session (five-minute averages).",
+			"default": false
+		},
+		"fps-spike-factor": {
+			"type": "float",
+			"name": "Custom mode: spike factor",
+			"description": "A frame this many times the usual frame time counts as a spike.",
+			"default": 2.2,
+			"min": 1.2,
+			"max": 5.0
+		},
+		"fps-low-ratio": {
+			"type": "float",
+			"name": "Custom mode: 1% low ratio",
+			"description": "Optional work is cut when the 1% low FPS falls below this share of the average FPS.",
+			"default": 0.6,
+			"min": 0.3,
+			"max": 0.95
+		},
+		"nerf-preset": {
+			"type": "string",
+			"name": "Target difficulty",
+			"description": "A rough starting point for the assists below (practice mode only). Presets are not calibrated against real Demon ratings.",
+			"default": "Original",
+			"one-of": [
+				"Original",
+				"Insane Demon",
+				"Hard Demon",
+				"Medium Demon",
+				"Easy Demon",
+				"Normal",
+				"Custom"
+			]
+		},
+		"nerf-margin": {
+			"type": "float",
+			"name": "Collision forgiveness (units)",
+			"description": "Practice mode only. A touch that overlaps the hazard or block by less than this is ignored. 0 = off.",
+			"default": 0.0,
+			"min": 0.0,
+			"max": 20.0
+		},
+		"nerf-speed": {
+			"type": "float",
+			"name": "Game speed (%)",
+			"description": "Practice mode only. Slows the game down. 100 = normal.",
+			"default": 100.0,
+			"min": 50.0,
+			"max": 100.0
+		},
+		"nerf-grace": {
+			"type": "float",
+			"name": "Portal grace (frames)",
+			"description": "Practice mode only. Deaths this soon after passing a portal are ignored. 0 = off.",
+			"default": 0.0,
+			"min": 0.0,
+			"max": 30.0
+		},
+		"nerf-hard-sections": {
+			"type": "bool",
+			"name": "Stronger in hard parts",
+			"description": "Multiplies the forgiveness by 1.5 in the three hardest-looking tenths of the level (scan the level first, in the Analyzer).",
+			"default": false
+		},
+		"nerf-per-level": {
+			"type": "bool",
+			"name": "Remember difficulty per level",
+			"description": "Saves and restores the three values above for each level.",
+			"default": false
+		},
+		"nerf-mult-cube": {
+			"type": "float",
+			"name": "Forgiveness strength: cube",
+			"description": "Multiplies the collision forgiveness while you are in this mode (practice mode only).",
+			"default": 1.0,
+			"min": 0.0,
+			"max": 2.0
+		},
+		"nerf-mult-ship": {
+			"type": "float",
+			"name": "Forgiveness strength: ship",
+			"description": "Multiplies the collision forgiveness while you are in this mode (practice mode only).",
+			"default": 1.0,
+			"min": 0.0,
+			"max": 2.0
+		},
+		"nerf-mult-ball": {
+			"type": "float",
+			"name": "Forgiveness strength: ball",
+			"description": "Multiplies the collision forgiveness while you are in this mode (practice mode only).",
+			"default": 1.0,
+			"min": 0.0,
+			"max": 2.0
+		},
+		"nerf-mult-ufo": {
+			"type": "float",
+			"name": "Forgiveness strength: ufo",
+			"description": "Multiplies the collision forgiveness while you are in this mode (practice mode only).",
+			"default": 1.0,
+			"min": 0.0,
+			"max": 2.0
+		},
+		"nerf-mult-wave": {
+			"type": "float",
+			"name": "Forgiveness strength: wave",
+			"description": "Multiplies the collision forgiveness while you are in this mode (practice mode only).",
+			"default": 1.0,
+			"min": 0.0,
+			"max": 2.0
+		},
+		"nerf-mult-robot": {
+			"type": "float",
+			"name": "Forgiveness strength: robot",
+			"description": "Multiplies the collision forgiveness while you are in this mode (practice mode only).",
+			"default": 1.0,
+			"min": 0.0,
+			"max": 2.0
+		},
+		"nerf-mult-spider": {
+			"type": "float",
+			"name": "Forgiveness strength: spider",
+			"description": "Multiplies the collision forgiveness while you are in this mode (practice mode only).",
+			"default": 1.0,
+			"min": 0.0,
+			"max": 2.0
+		},
+		"nerf-mult-swing": {
+			"type": "float",
+			"name": "Forgiveness strength: swing",
+			"description": "Multiplies the collision forgiveness while you are in this mode (practice mode only).",
+			"default": 1.0,
+			"min": 0.0,
+			"max": 2.0
+		},
 		"death-explain": {
 			"type": "bool",
 			"name": "Death explanation",
@@ -672,8 +851,8 @@
 		"menu-theme": {
 			"type": "string",
 			"name": "Menu theme",
-			"description": "Menu colours: AMOLED (pure black), Light (white, dark text), Graphite, Midnight, Ocean, Forest, Rose, Paper, or Custom to use your own colours below. Changes at once.",
-			"default": "AMOLED",
+			"description": "Menu colours: Graphite (clean dark default), AMOLED (pure black), Light, Midnight, Ocean, Forest, Rose, Paper or Custom. Changes immediately.",
+			"default": "Graphite",
 			"one-of": [
 				"AMOLED",
 				"Light",
@@ -816,6 +995,54 @@
 			"default": [
 				"F7"
 			]
+		},
+		"online-macros": {
+			"type": "bool",
+			"name": "Online Macros (Hyperbolus)",
+			"description": "Used only by autoplay (which is off in this build): would download a macro from Hyperbolus when you have none. Off by default.",
+			"default": false
+		},
+		"macro-fixes": {
+			"type": "bool",
+			"name": "Macro Position Fixes",
+			"description": "When a macro has the bot's position records (xdBot macros do), autoplay keeps you on the macro's path: a small difference in height or angle is set back to the recorded one each step, as xdBot does when it plays its macros. Off: the macro's inputs only.",
+			"default": true
+		},
+		"macro-offset": {
+			"type": "int",
+			"name": "Macro Timing Offset (steps)",
+			"description": "Moves every macro input this many physics steps earlier (+) or later (-). Leave at 0 unless a macro that should work dies early on: try 1 or -1.",
+			"default": 0,
+			"min": -5,
+			"max": 5
+		},
+		"autoplay-trail": {
+			"type": "bool",
+			"name": "Show Autoplay Trail",
+			"description": "Draws the path autoplay plans (and its inputs) on the level. Off for clean showcase recordings; autoplay plays the same either way.",
+			"default": false
+		},
+		"autoplay-label": {
+			"type": "string",
+			"name": "Autoplay Label",
+			"description": "The AUTOPLAY label is always on screen while autoplay plays, so a recording can't pass as a real run. Big: at the top. Small: a small see-through label in the bottom corner, for showcases.",
+			"default": "Big",
+			"one-of": [
+				"Big",
+				"Small"
+			]
+		},
+		"global-brain": {
+			"type": "bool",
+			"name": "Global Brain",
+			"description": "Not connected in Aliou's Buffer: this build sends nothing to any server, so this setting does nothing.",
+			"default": false
+		},
+		"online-players": {
+			"type": "bool",
+			"name": "Show Online Players",
+			"description": "Not connected in Aliou's Buffer: this build sends nothing to any server, so this setting does nothing.",
+			"default": false
 		}
 	},
 	"resources": {

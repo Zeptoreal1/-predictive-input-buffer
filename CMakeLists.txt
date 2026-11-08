@@ -7,7 +7,7 @@ endif()
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-project(AliousBuffer VERSION 3.12.0)
+project(AliousBuffer VERSION 3.15.0)
 
 file(GLOB SOURCES CONFIGURE_DEPENDS src/*.cpp)
 add_library(${PROJECT_NAME} SHARED ${SOURCES})
@@ -25,3 +25,11 @@ if (("${CMAKE_SYSTEM_NAME}" STREQUAL "iOS" OR IOS) AND TARGET GeodeBindings)
 endif()
 
 setup_geode_mod(${PROJECT_NAME})
+
+# iOS: the mod's dylib has to carry a code signature or some iOS launchers refuse to load it
+# ("missing code signature"); sign it ad-hoc right after it's built, before it's packaged
+if ("${CMAKE_SYSTEM_NAME}" STREQUAL "iOS" OR IOS)
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND codesign --force --sign - $<TARGET_FILE:${PROJECT_NAME}>
+        COMMENT "Signing the iOS dylib (ad-hoc)")
+endif()
